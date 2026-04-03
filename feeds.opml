@@ -1,59 +1,37 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <opml version="1.0">
   <head>
-    <title>LLM / Agents / MCP / Infra / Research</title>
+    <title>ollama-khonliang focused feeds</title>
   </head>
   <body>
+    <outline text="Core LLM + agent design">
+      <outline text="Anthropic Engineering" type="rss" xmlUrl="https://www.anthropic.com/engineering/rss.xml" htmlUrl="https://www.anthropic.com/engineering" />
+      <outline text="OpenAI Developer Blog" type="rss" xmlUrl="https://developers.openai.com/blog/rss.xml" htmlUrl="https://developers.openai.com/blog/" />
+      <outline text="Model Context Protocol Blog" type="rss" xmlUrl="https://blog.modelcontextprotocol.io/rss.xml" htmlUrl="https://blog.modelcontextprotocol.io/" />
+      <outline text="LangChain Blog" type="rss" xmlUrl="https://blog.langchain.com/rss/" htmlUrl="https://blog.langchain.com/" />
+    </outline>
 
-    <!-- Core Agents / LLM -->
-    <outline text="Anthropic Engineering" type="rss"
-      xmlUrl="https://www.anthropic.com/engineering/rss.xml" />
-    <outline text="OpenAI Blog" type="rss"
-      xmlUrl="https://openai.com/blog/rss.xml" />
-    <outline text="OpenAI Developers" type="rss"
-      xmlUrl="https://developers.openai.com/blog/rss.xml" />
-    <outline text="Model Context Protocol" type="rss"
-      xmlUrl="https://blog.modelcontextprotocol.io/rss.xml" />
+    <outline text="Local LLM runtime + inference serving">
+      <outline text="Ollama Blog" type="rss" xmlUrl="https://ollama.com/blog/rss.xml" htmlUrl="https://ollama.com/blog" />
+      <outline text="vLLM Blog" type="rss" xmlUrl="https://vllm.ai/blog/rss.xml" htmlUrl="https://vllm.ai/blog" />
+      <outline text="NVIDIA Developer Blog" type="rss" xmlUrl="https://developer.nvidia.com/blog/feed/" htmlUrl="https://developer.nvidia.com/blog" />
+      <outline text="Hugging Face Blog" type="rss" xmlUrl="https://huggingface.co/blog/feed.xml" htmlUrl="https://huggingface.co/blog" />
+    </outline>
 
-    <!-- Agent Frameworks -->
-    <outline text="LangChain Blog" type="rss"
-      xmlUrl="https://blog.langchain.com/rss/" />
-    <outline text="Microsoft DevBlogs (AI)" type="rss"
-      xmlUrl="https://devblogs.microsoft.com/feed/" />
+    <outline text="Open model + developer ecosystem">
+      <outline text="GitHub Blog AI" type="rss" xmlUrl="https://github.blog/ai-and-ml/feed/" htmlUrl="https://github.blog/ai-and-ml/" />
+      <outline text="Simon Willison Weblog" type="rss" xmlUrl="https://simonwillison.net/atom/everything/" htmlUrl="https://simonwillison.net/" />
+      <outline text="LlamaIndex Blog" type="rss" xmlUrl="https://www.llamaindex.ai/blog/rss.xml" htmlUrl="https://www.llamaindex.ai/blog" />
+      <outline text="Microsoft DevBlogs AI" type="rss" xmlUrl="https://devblogs.microsoft.com/feed/" htmlUrl="https://devblogs.microsoft.com/" />
+    </outline>
 
-    <!-- Local + Open Model Stack -->
-    <outline text="Ollama Blog" type="rss"
-      xmlUrl="https://ollama.com/blog/rss.xml" />
-    <outline text="Hugging Face Blog" type="rss"
-      xmlUrl="https://huggingface.co/blog/feed.xml" />
-
-    <!-- Inference / Serving / GPU -->
-    <outline text="vLLM Blog" type="rss"
-      xmlUrl="https://vllm.ai/blog/rss.xml" />
-    <outline text="NVIDIA Developer Blog" type="rss"
-      xmlUrl="https://developer.nvidia.com/blog/feed/" />
-
-    <!-- Research (High Signal) -->
-    <outline text="arXiv AI (cs.AI)" type="rss"
-      xmlUrl="https://export.arxiv.org/rss/cs.AI" />
-    <outline text="arXiv ML (cs.LG)" type="rss"
-      xmlUrl="https://export.arxiv.org/rss/cs.LG" />
-    <outline text="Papers With Code" type="rss"
-      xmlUrl="https://paperswithcode.com/rss" />
-
-    <!-- GitHub / Dev Signal -->
-    <outline text="GitHub Trending (AI)" type="rss"
-      xmlUrl="https://github.com/trending?since=daily&amp;spoken_language_code=en&amp;rss=1" />
-    <outline text="GitHub Trending (Python)" type="rss"
-      xmlUrl="https://github.com/trending/python?since=daily&amp;rss=1" />
-
-    <!-- Real-World Signal -->
-    <outline text="Hacker News" type="rss"
-      xmlUrl="https://hnrss.org/frontpage" />
-    <outline text="Reddit - LocalLLaMA" type="rss"
-      xmlUrl="https://www.reddit.com/r/LocalLLaMA/.rss" />
-    <outline text="Reddit - MachineLearning" type="rss"
-      xmlUrl="https://www.reddit.com/r/MachineLearning/.rss" />
-
+    <outline text="Research + trend radar">
+      <outline text="Papers with Code" type="rss" xmlUrl="https://paperswithcode.com/rss" htmlUrl="https://paperswithcode.com/" />
+      <outline text="arXiv cs.AI" type="rss" xmlUrl="https://export.arxiv.org/rss/cs.AI" htmlUrl="https://arxiv.org/list/cs.AI/recent" />
+      <outline text="arXiv cs.LG" type="rss" xmlUrl="https://export.arxiv.org/rss/cs.LG" htmlUrl="https://arxiv.org/list/cs.LG/recent" />
+      <outline text="Hacker News front page" type="rss" xmlUrl="https://hnrss.org/frontpage" htmlUrl="https://news.ycombinator.com/" />
+      <outline text="Reddit LocalLLaMA" type="rss" xmlUrl="https://www.reddit.com/r/LocalLLaMA/.rss" htmlUrl="https://www.reddit.com/r/LocalLLaMA/" />
+      <outline text="Reddit MachineLearning" type="rss" xmlUrl="https://www.reddit.com/r/MachineLearning/.rss" htmlUrl="https://www.reddit.com/r/MachineLearning/" />
+    </outline>
   </body>
 </opml>

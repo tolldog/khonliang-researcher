@@ -105,7 +105,7 @@ DEFAULT_FEEDS: Dict[str, FeedConfig] = {
 
 
 def load_opml(path: str) -> Dict[str, FeedConfig]:
-    """Load feeds from an OPML file, merges with defaults."""
+    """Load feeds from an OPML file. Handles nested category outlines."""
     import xml.etree.ElementTree as ET
     from pathlib import Path
 
@@ -121,7 +121,16 @@ def load_opml(path: str) -> Dict[str, FeedConfig]:
         url = outline.get("xmlUrl", "")
         name = outline.get("text", "")
         if url and name:
-            key = name.lower().replace(" ", "_").replace("/", "_")[:30]
+            # Find parent category if nested
+            category = ""
+            for parent in root.iter("outline"):
+                if outline in list(parent):
+                    cat = parent.get("text", "")
+                    if cat and not parent.get("xmlUrl"):
+                        category = cat
+                        break
+
+            key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:30]
             feeds[key] = FeedConfig(name=name, url=url, source=key)
 
     return feeds
