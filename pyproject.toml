@@ -1,0 +1,23 @@
+[project]
+name = "khonliang-researcher"
+version = "0.1.0"
+description = "Research paper ingestion and distillation pipeline powered by khonliang"
+requires-python = ">=3.11"
+dependencies = [
+    "ollama-khonliang @ git+https://github.com/tolldog/ollama-khonliang.git@main",
+    "aiohttp>=3.9",
+    "beautifulsoup4>=4.12",
+    "click>=8.0",
+    "pyyaml>=6.0",
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+khonliang-researcher = "researcher.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["researcher*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,22 @@
+models:
+  summarizer: qwen2.5:7b
+  extractor: llama3.2:3b
+  assessor: llama3.2:3b
+
+ollama_url: http://localhost:11434
+
+db_path: data/researcher.db
+
+projects:
+  autostock:
+    description: >
+      Multi-agent trading system using khonliang for orchestration.
+      6 specialist agents (quant, risk, macro, sentiment, compliance, execution)
+      with consensus voting, blackboard coordination, and triple-store knowledge.
+      Trades volatile stocks with 5-10% swings using mean reversion.
+    scope: trading
+  khonliang:
+    description: >
+      Multi-agent LLM orchestration library with roles, routing, consensus,
+      knowledge stores, triple stores, digest synthesis, and MCP server.
+    scope: library
