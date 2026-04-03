@@ -187,36 +187,51 @@ class ResearchPipeline:
     # ------------------------------------------------------------------
 
     async def distill(self, entry_id: str) -> DistillResult:
-        """Run full distillation pipeline on a stored paper."""
+        """Run full distillation pipeline on a stored paper.
+
+        Step 1: Summarize (7B model, sequential — needs raw paper)
+        Step 2: Extract + Assess in parallel (3B model — both use summary)
+        """
         entry = self.knowledge.get(entry_id)
         if not entry:
             return DistillResult(entry_id=entry_id, title="NOT FOUND")
 
         result = DistillResult(entry_id=entry_id, title=entry.title)
 
-        # Step 1: Summarize
+        # Step 1: Summarize (must complete before extraction/assessment)
         summary_resp = await self.summarizer.handle(entry.content)
-        if summary_resp.get("success"):
-            result.summary = summary_resp["summary"]
-        else:
+        if not summary_resp.get("success"):
             logger.warning("Summarization failed for %s", entry_id)
             return result
+        result.summary = summary_resp["summary"]
 
-        # Step 2: Extract triples from summary
+        # Step 2: Extract triples + assess all projects in parallel
         summary_text = json.dumps(result.summary, indent=2)
-        extract_resp = await self.extractor.handle(summary_text)
-        if extract_resp.get("success"):
-            result.triples = extract_resp["triples"]
-
-        # Step 3: Assess applicability per project
         projects = self.config.get("projects", {})
-        for project_name, project_cfg in projects.items():
-            assess_resp = await self.assessor.handle(
+
+        async def _extract():
+            resp = await self.extractor.handle(summary_text)
+            return resp.get("triples", []) if resp.get("success") else []
+
+        async def _assess(name, cfg):
+            resp = await self.assessor.handle(
                 summary_text,
-                context={"project_description": project_cfg.get("description", "")},
+                context={"project_description": cfg.get("description", "")},
             )
-            if assess_resp.get("success"):
-                result.assessments[project_name] = assess_resp["assessment"]
+            return name, resp.get("assessment") if resp.get("success") else None
+
+        # Fan out: 1 extraction + N assessments concurrently
+        tasks = [_extract()]
+        for proj_name, proj_cfg in projects.items():
+            tasks.append(_assess(proj_name, proj_cfg))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Collect results
+        result.triples = results[0] if not isinstance(results[0], Exception) else []
+        for r in results[1:]:
+            if isinstance(r, tuple) and r[1] is not None:
+                result.assessments[r[0]] = r[1]
 
         # Store results
         self._store_distillation(entry, result)
