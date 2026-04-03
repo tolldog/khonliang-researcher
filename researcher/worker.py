@@ -40,12 +40,15 @@ class DistillWorker:
         pause_between: float = 2.0,
         idle_poll: float = 30.0,
         max_failures: int = 3,
+        max_retries_per_paper: int = 2,
     ):
         self.pipeline = pipeline
         self.pause_between = pause_between  # seconds between papers
         self.idle_poll = idle_poll  # seconds between empty-queue checks
-        self.max_failures = max_failures  # consecutive failures before skipping
+        self.max_failures = max_failures  # consecutive failures before pausing
+        self.max_retries_per_paper = max_retries_per_paper
         self._running = False
+        self._failed_ids: dict[str, int] = {}  # entry_id -> retry count
         self._stats = {
             "processed": 0,
             "failed": 0,
@@ -69,10 +72,12 @@ class DistillWorker:
         )
 
     def _get_next(self):
-        """Get next undistilled paper, or None."""
+        """Get next undistilled paper, skipping papers that failed too many times."""
         for entry in self.pipeline.knowledge.get_by_tier(Tier.IMPORTED):
             if "undistilled" in (entry.tags or []):
-                return entry
+                retries = self._failed_ids.get(entry.id, 0)
+                if retries < self.max_retries_per_paper:
+                    return entry
         return None
 
     async def run(self):
@@ -113,14 +118,24 @@ class DistillWorker:
                         list(result.assessments.keys()),
                     )
                 else:
-                    self._stats["failed"] += 1
-                    consecutive_failures += 1
-                    logger.warning("  FAILED: %s", entry.title[:60])
+                    self._failed_ids[entry.id] = self._failed_ids.get(entry.id, 0) + 1
+                    if self._failed_ids[entry.id] >= self.max_retries_per_paper:
+                        self._stats["skipped"] += 1
+                        logger.warning("  SKIPPED (max retries): %s", entry.title[:60])
+                    else:
+                        self._stats["failed"] += 1
+                        consecutive_failures += 1
+                        logger.warning("  FAILED (retry %d): %s", self._failed_ids[entry.id], entry.title[:60])
 
             except Exception as e:
-                self._stats["failed"] += 1
-                consecutive_failures += 1
-                logger.error("  ERROR: %s — %s", entry.title[:60], e)
+                self._failed_ids[entry.id] = self._failed_ids.get(entry.id, 0) + 1
+                if self._failed_ids[entry.id] >= self.max_retries_per_paper:
+                    self._stats["skipped"] += 1
+                    logger.warning("  SKIPPED (max retries): %s — %s", entry.title[:60], e)
+                else:
+                    self._stats["failed"] += 1
+                    consecutive_failures += 1
+                    logger.error("  ERROR (retry %d): %s — %s", self._failed_ids[entry.id], entry.title[:60], e)
 
             # Skip paper if too many consecutive failures (model may be down)
             if consecutive_failures >= self.max_failures:
@@ -169,10 +184,20 @@ class DistillWorker:
                 if result.success:
                     self._stats["processed"] += 1
                 else:
-                    self._stats["failed"] += 1
+                    self._failed_ids[entry.id] = self._failed_ids.get(entry.id, 0) + 1
+                    if self._failed_ids[entry.id] >= self.max_retries_per_paper:
+                        self._stats["skipped"] += 1
+                        logger.warning("  SKIPPED: %s", entry.title[:60])
+                    else:
+                        self._stats["failed"] += 1
             except Exception as e:
-                self._stats["failed"] += 1
-                logger.error("  ERROR: %s", e)
+                self._failed_ids[entry.id] = self._failed_ids.get(entry.id, 0) + 1
+                if self._failed_ids[entry.id] >= self.max_retries_per_paper:
+                    self._stats["skipped"] += 1
+                    logger.warning("  SKIPPED: %s — %s", entry.title[:60], e)
+                else:
+                    self._stats["failed"] += 1
+                    logger.error("  ERROR: %s", e)
 
             if self._running and count < target:
                 await asyncio.sleep(self.pause_between)
