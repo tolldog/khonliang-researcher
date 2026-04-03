@@ -229,6 +229,48 @@ def create_research_server(pipeline: ResearchPipeline):
         return "\n".join(lines)
 
     @mcp.tool()
+    async def browse_feeds(query: str = "", feeds: str = "") -> str:
+        """Browse AI research blog RSS feeds for recent posts.
+
+        Fetches RSS/Atom feeds from: Anthropic, OpenAI, DeepMind, HuggingFace,
+        Ollama, LangChain, LlamaIndex, Cohere, Mistral.
+
+        If query is provided, filters entries by keyword match.
+        Pass comma-separated feed names to limit sources.
+        Use fetch_paper(url) to ingest any interesting posts.
+        """
+        from researcher.rss import fetch_all_feeds
+
+        feed_list = [f.strip() for f in feeds.split(",") if f.strip()] or None
+        entries = await fetch_all_feeds(feed_list)
+
+        if query:
+            keywords = query.lower().split()
+            entries = [
+                e for e in entries
+                if any(kw in f"{e.title} {e.content}".lower() for kw in keywords)
+            ]
+
+        if not entries:
+            return f"No feed entries found{f' for: {query}' if query else ''}."
+
+        lines = [f"Found {len(entries)} posts{f' matching \"{query}\"' if query else ''}:\n"]
+        for i, e in enumerate(entries[:30], 1):
+            pub = e.metadata.get("published", "")[:10]
+            lines.append(f"{i}. [{e.source}] {e.title}")
+            if pub:
+                lines.append(f"   {pub}")
+            if e.content:
+                lines.append(f"   {e.content[:150]}...")
+            lines.append(f"   {e.url}")
+            lines.append("")
+
+        if len(entries) > 30:
+            lines.append(f"... and {len(entries) - 30} more")
+
+        return "\n".join(lines)
+
+    @mcp.tool()
     def find_relevant(query: str, project: str = "") -> str:
         """Search papers by topic. Optionally filter by project relevance.
 

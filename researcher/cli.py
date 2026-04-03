@@ -188,6 +188,50 @@ def find_papers(ctx, query, max_results, sort_by):
     _run(_search())
 
 
+@cli.command("feeds")
+@click.option("--query", "-q", default="", help="Filter by keywords")
+@click.option("--feeds", "-f", default="", help="Comma-separated feed names")
+@click.option("--ingest", is_flag=True, help="Auto-ingest all matching posts")
+@click.pass_context
+def browse_feeds(ctx, query, feeds, ingest):
+    """Browse AI research blog RSS feeds."""
+    from researcher.rss import fetch_all_feeds, DEFAULT_FEEDS
+
+    pipeline = _get_pipeline(ctx)
+    feed_list = [f.strip() for f in feeds.split(",") if f.strip()] or None
+
+    async def _browse():
+        entries = await fetch_all_feeds(feed_list)
+
+        if query:
+            keywords = query.lower().split()
+            entries = [
+                e for e in entries
+                if any(kw in f"{e.title} {e.content}".lower() for kw in keywords)
+            ]
+
+        if not entries:
+            click.echo("No entries found.")
+            return
+
+        click.echo(f"Found {len(entries)} posts:\n")
+        for i, e in enumerate(entries[:50], 1):
+            pub = e.metadata.get("published", "")[:10]
+            click.echo(f"  {i:3d}. [{e.source}] {e.title}")
+            if pub:
+                click.echo(f"       {pub}")
+            click.echo(f"       {e.url}")
+
+        if ingest:
+            click.echo(f"\nIngesting {len(entries)} posts...")
+            from researcher.parser import PaperReference
+            refs = [PaperReference(title=e.title, url=e.url) for e in entries if e.url]
+            ids = await pipeline.ingest_papers_from_list(refs, max_concurrent=3)
+            click.echo(f"Ingested {len(ids)} posts.")
+
+    _run(_browse())
+
+
 @cli.command("list")
 @click.pass_context
 def reading_list(ctx):

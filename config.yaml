@@ -5,6 +5,8 @@ models:
 
 ollama_url: http://localhost:11434
 
+feeds_opml: feeds.opml
+
 db_path: data/researcher.db
 
 projects:

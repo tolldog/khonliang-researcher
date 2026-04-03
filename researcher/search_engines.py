@@ -152,10 +152,16 @@ class SemanticScholarEngine(BaseEngine):
 # - DDGEngine: DuckDuckGo instant answers for broader web search
 # - PapersWithCodeEngine: paperswithcode.com API for papers with implementations
 
+# Import RSS engine
+from researcher.rss import RSSEngine
+
 # Registry of available engines
+# RSS engine loads from feeds.opml if present
+_opml = "feeds.opml" if __import__("pathlib").Path("feeds.opml").exists() else None
 ENGINES: Dict[str, BaseEngine] = {
     "arxiv": ArxivEngine(),
     "semantic_scholar": SemanticScholarEngine(),
+    "rss": RSSEngine(opml_path=_opml),
 }
 
 
