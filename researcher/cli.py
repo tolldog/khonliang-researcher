@@ -162,6 +162,32 @@ def search(ctx, query, limit):
         click.echo()
 
 
+@cli.command("find")
+@click.argument("query")
+@click.option("--max", "max_results", default=20, help="Max results")
+@click.option("--sort", "sort_by", default="relevance", help="Sort: relevance, lastUpdatedDate, submittedDate")
+@click.pass_context
+def find_papers(ctx, query, max_results, sort_by):
+    """Search arxiv for papers matching keywords."""
+    from researcher.fetcher import search_arxiv
+
+    async def _search():
+        results = await search_arxiv(query, max_results=max_results, sort_by=sort_by)
+        if not results:
+            click.echo(f"No papers found for: {query}")
+            return
+
+        click.echo(f"Found {len(results)} papers:\n")
+        for i, r in enumerate(results, 1):
+            authors = ", ".join(r.authors[:3])
+            click.echo(f"  {i:3d}. {r.title}")
+            click.echo(f"       {authors}")
+            click.echo(f"       {r.url}")
+            click.echo()
+
+    _run(_search())
+
+
 @cli.command("list")
 @click.pass_context
 def reading_list(ctx):

@@ -30,7 +30,6 @@ def create_research_server(pipeline: ResearchPipeline):
         triple_store=pipeline.triples,
     )
     mcp = base.create_app()
-    mcp.name = "khonliang-researcher"
 
     # ------------------------------------------------------------------
     # Custom research tools
@@ -148,6 +147,40 @@ def create_research_server(pipeline: ResearchPipeline):
         for r in results:
             status = "ok" if r.success else "FAILED"
             lines.append(f"  [{status}] {r.title}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def find_papers(query: str, max_results: int = 20, engines: str = "") -> str:
+        """Search for research papers across multiple sources.
+
+        Searches arxiv and Semantic Scholar in parallel, deduplicates results.
+        Pass comma-separated engine names to filter: "arxiv", "semantic_scholar"
+        Use fetch_paper(url) to ingest any interesting results.
+        """
+        from researcher.search_engines import search_papers
+
+        engine_list = [e.strip() for e in engines.split(",") if e.strip()] or None
+        try:
+            results = await search_papers(query, engines=engine_list, max_results=max_results)
+        except Exception as e:
+            return f"Search failed: {e}"
+
+        if not results:
+            return f"No papers found for: {query}"
+
+        lines = [f"Found {len(results)} papers for '{query}':\n"]
+        for i, r in enumerate(results, 1):
+            authors = ", ".join(r.metadata.get("authors", [])[:3])
+            if len(r.metadata.get("authors", [])) > 3:
+                authors += f" +{len(r.metadata['authors']) - 3} more"
+            lines.append(f"{i}. **{r.title}** [{r.source}]")
+            if authors:
+                lines.append(f"   {authors}")
+            if r.content:
+                lines.append(f"   {r.content[:200]}...")
+            lines.append(f"   {r.url}")
+            lines.append("")
+
         return "\n".join(lines)
 
     @mcp.tool()

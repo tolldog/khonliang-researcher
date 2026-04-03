@@ -123,6 +123,72 @@ async def fetch_arxiv(arxiv_id_or_url: str) -> FetchResult:
     )
 
 
+@dataclass
+class SearchResult:
+    arxiv_id: str
+    title: str
+    authors: list
+    abstract: str
+    url: str
+
+
+async def search_arxiv(
+    query: str, max_results: int = 20, sort_by: str = "relevance"
+) -> list[SearchResult]:
+    """Search arxiv for papers matching keywords.
+
+    Uses the arxiv API (Atom feed). Returns structured results.
+    sort_by: "relevance" or "lastUpdatedDate" or "submittedDate"
+    """
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+
+    params = {
+        "search_query": f"all:{query}",
+        "start": 0,
+        "max_results": max_results,
+        "sortBy": sort_by,
+        "sortOrder": "descending",
+    }
+    api_url = f"https://export.arxiv.org/api/query?{urllib.parse.urlencode(params)}"
+
+    async with aiohttp.ClientSession(headers=_HEADERS) as session:
+        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            resp.raise_for_status()
+            xml_text = await resp.text()
+
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    root = ET.fromstring(xml_text)
+    results = []
+
+    for entry in root.findall("atom:entry", ns):
+        title_el = entry.find("atom:title", ns)
+        summary_el = entry.find("atom:summary", ns)
+        id_el = entry.find("atom:id", ns)
+
+        title = title_el.text.strip().replace("\n", " ") if title_el is not None else ""
+        abstract = summary_el.text.strip().replace("\n", " ") if summary_el is not None else ""
+        entry_url = id_el.text.strip() if id_el is not None else ""
+
+        authors = []
+        for author_el in entry.findall("atom:author", ns):
+            name_el = author_el.find("atom:name", ns)
+            if name_el is not None:
+                authors.append(name_el.text.strip())
+
+        arxiv_id = extract_arxiv_id(entry_url) or ""
+
+        results.append(SearchResult(
+            arxiv_id=arxiv_id,
+            title=title,
+            authors=authors,
+            abstract=abstract,
+            url=f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else entry_url,
+        ))
+
+    return results
+
+
 async def fetch_raw(url: str, timeout: int = 30) -> str:
     """Fetch raw text content from a URL (for markdown files, READMEs, etc.)."""
     async with aiohttp.ClientSession(headers=_HEADERS) as session:
