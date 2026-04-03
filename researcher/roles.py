@@ -1,15 +1,21 @@
 """LLM distillation roles for research papers.
 
 Three BaseRole subclasses:
-  - SummarizerRole: structured paper summary
+  - SummarizerRole: structured paper summary (model selected by paper size)
   - ExtractorRole: relationship triple extraction
   - AssessorRole: project applicability scoring
+
+Model selection for summarization:
+  tiny/small  (<15k chars): llama3.2:3b  — fast, fits in context, no truncation
+  medium      (15k-50k):    qwen2.5:7b   — more capacity, truncated to 12k
+  large/huge  (50k+):       qwen2.5:7b   — same, same truncation
+  retry:                    deepseek-r1:14b — fallback for papers that fail on 7B
 """
 
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from khonliang.roles.base import BaseRole
 
@@ -17,9 +23,32 @@ logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
+# Size thresholds and model tiers for summarization
+MODEL_TIERS: List[Tuple[int, str, int]] = [
+    # (max_chars, model, context_limit)
+    (15_000, "llama3.2:3b", 15_000),    # tiny/small: fast model, no truncation
+    (50_000, "qwen2.5:7b", 12_000),     # medium: 7B with truncation
+    (999_999_999, "qwen2.5:7b", 12_000), # large/huge: same
+]
+
+# Fallback model for retries after failure
+FALLBACK_MODEL = "deepseek-r1:14b"
+FALLBACK_CONTEXT_LIMIT = 16_000
+
+
+def _select_model(content_length: int) -> Tuple[str, int]:
+    """Select model and context limit based on paper size."""
+    for max_chars, model, ctx_limit in MODEL_TIERS:
+        if content_length <= max_chars:
+            return model, ctx_limit
+    return MODEL_TIERS[-1][1], MODEL_TIERS[-1][2]
+
 
 class SummarizerRole(BaseRole):
-    """Produce a structured JSON summary of a research paper."""
+    """Produce a structured JSON summary of a research paper.
+
+    Model is selected based on paper size. Falls back to larger model on failure.
+    """
 
     def __init__(self, model_pool, **kwargs):
         super().__init__(
@@ -32,20 +61,46 @@ class SummarizerRole(BaseRole):
     async def handle(
         self, message: str, session_id: str = "", context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        # Truncate to fit model context (keep ~12k chars for 7B model)
-        text = message[:12000] if len(message) > 12000 else message
+        content_length = len(message)
+        model, ctx_limit = _select_model(content_length)
+        is_retry = context.get("retry", False) if context else False
+
+        if is_retry:
+            model = FALLBACK_MODEL
+            ctx_limit = FALLBACK_CONTEXT_LIMIT
+            logger.info("Retry with fallback model %s", model)
+
+        text = message[:ctx_limit] if content_length > ctx_limit else message
+        text = _clean_for_json(text)
         prompt = f"Summarize this research paper:\n\n{text}"
+
+        logger.debug(
+            "Summarizing %d chars with %s (truncated to %d)",
+            content_length, model, min(content_length, ctx_limit),
+        )
+
         try:
             result = await self.client.generate_json(
                 prompt=prompt,
                 system=self.system_prompt,
                 temperature=0.2,
                 max_tokens=4000,
+                model=model,
+                constrained=is_retry,  # Use Ollama native JSON mode on retry
             )
-            return {"summary": result, "success": True}
+            return {"summary": result, "success": True, "model_used": model}
         except Exception as e:
-            logger.error("Summarization failed: %s", e)
-            return {"summary": None, "success": False, "error": str(e)}
+            logger.error("Summarization failed with %s: %s", model, e)
+
+            # Auto-retry with fallback model + constrained JSON if not already retrying
+            if not is_retry and model != FALLBACK_MODEL:
+                logger.info("Auto-retrying with %s", FALLBACK_MODEL)
+                return await self.handle(
+                    message, session_id,
+                    context={**(context or {}), "retry": True},
+                )
+
+            return {"summary": None, "success": False, "error": str(e), "model_used": model}
 
 
 class ExtractorRole(BaseRole):
@@ -118,6 +173,27 @@ class AssessorRole(BaseRole):
         except Exception as e:
             logger.error("Assessment failed: %s", e)
             return {"assessment": None, "success": False, "error": str(e)}
+
+
+def _clean_for_json(text: str) -> str:
+    """Strip content that confuses LLM JSON generation.
+
+    Removes: math notation, LaTeX, unicode math symbols, excessive whitespace.
+    Keeps: readable English text, numbers, basic punctuation.
+    """
+    import re
+    # Remove LaTeX math blocks
+    text = re.sub(r"\$\$.*?\$\$", "[math]", text, flags=re.DOTALL)
+    text = re.sub(r"\$[^$]+\$", "[math]", text)
+    # Remove LaTeX commands
+    text = re.sub(r"\\[a-zA-Z]+\{[^}]*\}", "", text)
+    text = re.sub(r"\\[a-zA-Z]+", "", text)
+    # Remove unicode math symbols that break JSON encoding
+    text = re.sub(r"[^\x00-\x7F]+", " ", text)
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _load_prompt(filename: str) -> str:
