@@ -637,34 +637,290 @@ RESEARCHER:
   RR-5 (export reports) ← presentation layer
 ```
 
+---
+
+## Genealogy Feature Requests
+
+### GN-1: Knowledge Graph for Family Relationships
+
+**Papers**: RAG-KG-IL (KG + RAG reduces hallucinations), GAAMA (concept-mediated KG with episode/fact/reflection nodes), Agentic Deep Graph Reasoning
+
+**Where**: `genealogy_agent/` — extends existing TripleStore usage
+
+**What**: Use khonliang's TripleStore as the backbone for family relationship storage. Persons are subjects, relationships are predicates (`parent_of`, `spouse_of`, `sibling_of`, `born_in`, `died_in`), with confidence scores for uncertain records.
+
+**API**:
+```python
+triples.add("Timothy Toll", "parent_of", "Roger Toll", confidence=0.95, source="gedcom:tree1")
+triples.add("Timothy Toll", "born_in", "Maryland", confidence=0.8, source="census:1790")
+# Query: who are Timothy's children?
+children = triples.get(subject="Timothy Toll", predicate="parent_of")
+# Build context for LLM: compact family summary
+ctx = triples.build_context(subjects=["Timothy Toll"], max_triples=20)
+```
+
+**Why**: GAAMA showed a 78.9% mean reward using a concept-mediated KG with episodes, facts, reflections, and concepts. Genealogy has the same structure — events (birth, marriage, death), facts (name, date, place), reflections (analysis of conflicting records), concepts (family groups, migration patterns). RAG-KG-IL confirmed that structured KGs reduce hallucination — critical when genealogy agents assert family connections.
+
+**Depends on**: KH-10 (predicate normalization) — genealogy predicates need aliases (`father_of` = `parent_of`, `child_of` = inverse of `parent_of`)
+
+---
+
+### GN-2: Multi-Agent Record Verification
+
+**Papers**: Improving Factuality through Multiagent Debate, Chain-of-Verification, CRITIC, D3
+
+**Where**: `genealogy_agent/consensus.py`, `self_eval.py`
+
+**What**: When the FactCheckerRole identifies a questionable record (conflicting dates, unlikely ages, duplicate names), trigger a multi-agent debate between Researcher, FactChecker, and Skeptic personas. Each agent argues from different source evidence. Debate resolves when agents converge or after max rounds.
+
+**Sketch**:
+```python
+# FactChecker flags: "Birth date 1750 conflicts with parent born 1780"
+if self_eval.severity >= "high":
+    debate_result = await debate_orchestrator.run_debate(
+        votes=[researcher_vote, factchecker_vote, skeptic_vote],
+        subject="Timothy Toll birth date conflict",
+        context=tree_context,
+    )
+    # Debate produces: resolved date, confidence, cited sources
+```
+
+**Why**: The Multiagent Debate paper showed significant improvement in factual reasoning. D3 adds cost-aware stopping — important since genealogy debates can go in circles. The genealogy project already has DebateOrchestrator wired but not triggered from the verification pipeline.
+
+---
+
+### GN-3: Cross-Tree Entity Resolution via Embeddings
+
+**Papers**: Communicating Activations (27% improvement via embeddings), Federation of Agents (VCVs for capability matching), SCoOP (semantic opinion pooling)
+
+**Where**: `genealogy_agent/cross_matcher.py`
+
+**What**: When matching persons across trees, compute embedding vectors for person records (name + dates + places + relationships). Match by cosine similarity instead of (or in addition to) heuristic string matching. Use khonliang's embedding infrastructure (FastEmbed, CPU).
+
+**Sketch**:
+```python
+# Embed person records
+embedding_a = embed(f"Timothy Toll, born 1755 Maryland, married Sarah, children: Roger, James")
+embedding_b = embed(f"Tim Tolle, b. ~1755 MD, wife Sarah, son Roger")
+similarity = cosine(embedding_a, embedding_b)  # → 0.92 (likely match)
+```
+
+**Why**: Current cross-matcher uses heuristic name/date/place comparison. Embedding similarity captures semantic equivalence that heuristics miss (abbreviations, spelling variants, incomplete records). The Communicating Activations paper showed 27% improvement over text-based comparison.
+
+**Depends on**: KH-7 (embedding-aware Blackboard) provides the embedding infrastructure, but this can use FastEmbed directly without waiting.
+
+---
+
+### GN-4: Long-Document Research with Agent Segments
+
+**Papers**: Chain of Agents (segment long context across workers), LongAgent (inter-member communication for 128k+ context), MAIN-RAG (multi-agent filtering)
+
+**Where**: `genealogy_agent/researchers.py`
+
+**What**: When researching a person, the WebSearchResearcher often finds long documents (census records, probate records, church registers). Instead of truncating, split the document into segments and assign each to a worker agent. Workers extract person mentions and evidence, then a manager agent synthesizes.
+
+**Sketch**:
+```python
+# Long probate record (50k chars)
+segments = split_by_sections(probate_text, max_chars=8000)
+# Fan out to worker agents
+results = await asyncio.gather(*[
+    worker.extract_person_mentions(seg, target_person="Timothy Toll")
+    for seg in segments
+])
+# Manager synthesizes
+synthesis = await manager.synthesize(results, question="What does this record tell us about Timothy?")
+```
+
+**Why**: LongAgent achieved effective processing of documents exceeding 100k tokens by splitting across agents. Genealogy primary sources (probate inventories, land records, county histories) are often 20-100+ pages. Current approach truncates and loses evidence.
+
+---
+
+### GN-5: Hierarchical Memory for Research Sessions
+
+**Papers**: MIRIX (6 specialized memory components), G-Memory (hierarchical insight/query/interaction graphs), LiCoMemory (CogniGraph for lightweight indexing), Nemori (self-organizing memory), MemFactory
+
+**Where**: `genealogy_agent/server.py` (session context via contextvars)
+
+**What**: Replace the simple session contextvars with a hierarchical memory system:
+- **Episodic**: What we searched, what we found, what we asked (per session)
+- **Semantic**: Known facts about this family (persisted across sessions)
+- **Procedural**: What research strategies worked (e.g., "searching probate records in Maryland courts was productive")
+
+**Sketch**:
+```python
+memory = HierarchicalMemory(
+    episodic=SessionStore(),           # This session's searches and findings
+    semantic=TripleStore(db_path),     # Persistent family facts
+    procedural=HeuristicPool(db_path), # Learned research strategies
+)
+# After a successful research query:
+memory.episodic.record("Searched WikiTree for Timothy Toll → found match")
+memory.semantic.add("Timothy Toll", "born_in", "Frederick County MD", confidence=0.9)
+memory.procedural.record_outcome(strategy="wikitree_search", query_type="person", outcome=1.0)
+```
+
+**Why**: MIRIX showed that 6 specialized memory types outperform single-store approaches. G-Memory improved knowledge QA accuracy by up to 15%. Genealogy research is inherently multi-session — a researcher builds knowledge over weeks/months. Current session context is lost on restart.
+
+**Depends on**: KH-4 (HeuristicPool) for the procedural component, KH-5 (Blackboard persistence) for episodic, existing TripleStore for semantic.
+
+---
+
+### GN-6: Agentic RAG for Historical Sources
+
+**Papers**: Agentic RAG Survey, MAIN-RAG (multi-agent filtering), MA-RAG (collaborative chain-of-thought), Experience as a Compass (HERA)
+
+**Where**: `genealogy_agent/researchers.py`, `genealogy_agent/rag/`
+
+**What**: Replace simple FTS5 search with agentic RAG — the retriever decides what to search, evaluates results, and iteratively refines queries. For genealogy, this means:
+1. Parse user question → identify target person/family/event
+2. Search tree data + knowledge store + web sources in parallel
+3. Filter results by relevance (MAIN-RAG's multi-agent filtering)
+4. If insufficient, reformulate query and search again
+5. Synthesize answer with citations
+
+**Why**: The Agentic RAG survey defines this as the state of the art for complex retrieval. MAIN-RAG showed that multi-agent filtering with adaptive thresholds significantly improves relevance. Genealogy queries often need iterative refinement ("who was Timothy's father" → search fails → try "Toll family Frederick County 1740s" → success).
+
+---
+
+### GN-7: Blackboard-Based Research Coordination
+
+**Papers**: LLM-based Multi-Agent Blackboard System (57% improvement), OrgAgent (organize like a company), Experience as a Compass
+
+**Where**: `genealogy_agent/server.py` — already has Blackboard integration
+
+**What**: Expand Blackboard usage from simple context sharing to full research coordination. Agents post research tasks, findings, and hypotheses. Other agents read and react:
+
+```python
+# Researcher posts a finding
+board.post("researcher", "findings", "timothy_toll_birth", {
+    "person": "Timothy Toll",
+    "finding": "Born ~1755 based on age 45 in 1800 census",
+    "confidence": 0.7,
+    "source": "US Census 1800, Frederick County MD",
+})
+
+# FactChecker reads and validates
+findings = board.read("findings")
+for key, finding in findings.items():
+    if finding["confidence"] < 0.8:
+        # Schedule verification task
+        board.post("factchecker", "tasks", f"verify_{key}", {
+            "action": "cross_reference",
+            "finding": finding,
+        })
+```
+
+**Why**: The Blackboard paper showed 57% improvement over baselines. OrgAgent showed that organizing agents like a company (with departments posting to shared boards) improves coordination. The genealogy project already has Blackboard wired but uses it minimally — mostly for vote sharing.
+
+---
+
+### GN-8: Research-Informed Prompts from Corpus
+
+**Papers**: Experiential Reflective Learning, MemFactory
+
+**Where**: `genealogy_agent/roles.py` — system prompts
+
+**What**: Use khonliang-researcher's knowledge corpus to enhance genealogy agent prompts. When the Researcher role gets a query about colonial-era records, inject relevant research context about best practices for that type of research.
+
+**Sketch**:
+```python
+# In ResearcherRole.build_context():
+research_ctx = researcher_pipeline.get_paper_context(
+    "genealogy entity resolution historical records"
+)
+# Append to system prompt context
+```
+
+**Why**: The 227-paper corpus contains papers on entity resolution, record linkage, knowledge graphs, and verification — all directly applicable to genealogy. Injecting this context helps the LLM reason about matching strategies and source evaluation.
+
+**Depends on**: khonliang-researcher accessible from genealogy (shared DB or MCP)
+
+---
+
+## Updated Dependency Graph
+
+```
+KHONLIANG CORE:
+  KH-1 (outcome feedback) → KH-2 (weight learning) → KH-4 (heuristic pool)
+  KH-3 (group sampling)
+  KH-5 (blackboard persistence)
+  KH-6 (vote validation)
+  KH-7 (embedding blackboard) → KH-8 (capability discovery)
+  KH-9 (debate on disagreement)
+  KH-10 (predicate normalization) ← independent, all projects benefit
+  KH-11 (status field) ← independent
+  KH-12 (smart context extraction) ← independent
+  KH-13 (constrained JSON) ← independent
+  KH-14 (feed health) ← researcher
+  KH-15 (URL dedup) ← researcher
+
+AUTOSTOCK:
+  AS-1 (outcome loop) → AS-2 (weight review) → AS-6 (knowledge)
+  AS-3 (triple patterns) → AS-4 (dynamic activation), AS-8 (belief shifts)
+  AS-5 (group sampling), AS-7 (debate)
+  AS-9 (training data) → AS-11 (MCP tools)
+  AS-10 (embedding votes)
+  AS-12 (feed monitoring) → AS-13 (research prompts)
+  AS-14 (model selection), AS-15 (assessor), AS-16 (re-distill)
+  AS-17 (cross-project triples)
+
+GENEALOGY:
+  GN-1 (family KG) ← KH-10
+  GN-2 (record verification debate) ← KH-9
+  GN-3 (cross-tree embeddings) ← KH-7 or standalone FastEmbed
+  GN-4 (long-doc segments) ← KH-12
+  GN-5 (hierarchical memory) ← KH-4 + KH-5
+  GN-6 (agentic RAG) ← independent
+  GN-7 (blackboard coordination) ← KH-5
+  GN-8 (research-informed prompts) ← researcher MCP
+
+RESEARCHER:
+  RR-1 (scheduled polling) → RR-2 (relevance filter)
+  RR-3 (re-assessment) ← AS-15
+  RR-4 (similarity graph) ← KH-7
+  RR-5 (export reports)
+```
+
 ## Updated Implementation Priority
 
-**Phase 1 — Close the feedback loop** (unchanged):
+**Phase 1 — Feedback loop** (autostock):
   KH-1 → AS-1 → AS-3 → KH-6
 
-**Phase 1b — Fix data quality** (new, high value, no dependencies):
+**Phase 1b — Data quality** (all projects benefit):
   KH-10 (predicate normalization)
+  KH-11 (status field)
   KH-13 (constrained JSON default)
-  AS-15 (assessor upgrade) → AS-16 (re-distill) → RR-3 (re-assess)
+  AS-15 + AS-16 + RR-3 (assessor upgrade + re-distill)
 
-**Phase 2 — Learn from outcomes** (unchanged):
+**Phase 2 — Learn from outcomes** (autostock):
   KH-2 → AS-2 → KH-4 → AS-6
 
-**Phase 3 — Improve consensus quality** (unchanged):
-  KH-3 → AS-5 → KH-9 → AS-7
+**Phase 2b — Genealogy quick wins** (use existing infrastructure):
+  GN-1 (family KG via TripleStore — already available)
+  GN-7 (blackboard coordination — already wired)
+  GN-6 (agentic RAG — extend existing ScopedRetriever)
 
-**Phase 3b — Autonomous research** (new):
-  RR-1 (scheduled polling) → RR-2 (relevance filter) → AS-12 (autostock monitoring)
+**Phase 3 — Consensus + debate** (autostock + genealogy):
+  KH-3 → AS-5
+  KH-9 → AS-7 + GN-2
 
-**Phase 4 — Semantic communication** (unchanged + additions):
+**Phase 3b — Autonomous research** (researcher):
+  RR-1 → RR-2 → AS-12
+
+**Phase 4 — Semantic communication** (all projects):
   KH-7 → KH-8 → AS-10 → AS-4
+  GN-3 (cross-tree embeddings)
   RR-4 (paper similarity graph)
 
-**Phase 5 — Training + integration** (unchanged + additions):
+**Phase 4b — Memory + persistence** (genealogy + khonliang):
+  KH-5 → GN-5 + GN-7
+  KH-12 → GN-4
+
+**Phase 5 — Training + integration** (all):
   AS-9 → AS-11
-  AS-13 (research-informed prompts)
+  AS-13 + GN-8 (research-informed prompts)
   AS-17 (cross-project triples)
-  KH-12 (smart context extraction)
   RR-5 (export reports)
 
 ```
