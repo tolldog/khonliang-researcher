@@ -336,7 +336,336 @@ class AgentVote:
 
 ---
 
-## Dependency Graph
+---
+
+## Additional Khonliang Feature Requests (from building khonliang-researcher)
+
+### KH-10: Triple Predicate Normalization
+
+**Discovered**: Building researcher — LLM generates `applies_to`, `is_applicable_to`, `is applicable to` as separate predicates meaning the same thing. 1,486 triples with 259 "unique" predicates, many are duplicates.
+
+**What**: Predicate alias system in TripleStore. Normalize on add, query by canonical form.
+
+**API**:
+```python
+ts = TripleStore(db_path, predicate_aliases={
+    "is_applicable_to": "applies_to",
+    "is applicable to": "applies_to",
+    "used_for": "uses_method",
+    "uses": "uses_method",
+    "achieves": "outperforms",
+})
+# Or auto-normalize: strip "is_", replace spaces with "_", lowercase
+ts.add("X", "Is Applicable To", "Y")  # stored as "applies_to"
+```
+
+**Why**: Without normalization, `build_context()` and `get(predicate=...)` miss relationships. The LLM extractor can't be constrained to exact predicate strings — it needs post-processing.
+
+---
+
+### KH-11: KnowledgeStore Status Field
+
+**Discovered**: Using tags ("undistilled"/"distilled") for workflow status is fragile — tags are lists, easy to get duplicate tags, no enum validation.
+
+**What**: Add `status` field to KnowledgeEntry with proper enum.
+
+**API**:
+```python
+class EntryStatus(str, Enum):
+    INGESTED = "ingested"
+    PROCESSING = "processing"
+    DISTILLED = "distilled"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+entry = KnowledgeEntry(id=..., tier=Tier.IMPORTED, status=EntryStatus.INGESTED, ...)
+ks.get_by_status(EntryStatus.INGESTED)  # replaces tag-based filtering
+```
+
+**Why**: Current workaround (`"undistilled" in (entry.tags or [])`) is scattered across pipeline, worker, and server code. A proper status field is cleaner and queryable.
+
+---
+
+### KH-12: Smart Context Extraction for Long Documents
+
+**Discovered**: Summarizer truncates papers to 12k chars from the start. Many papers have methodology/results buried deep. Important content gets cut.
+
+**Papers**: Chain of Agents (worker agents process segments), LongAgent (inter-member communication)
+
+**What**: Replace crude truncation with section-aware extraction: abstract + intro + conclusion + key figures. Use document structure (headings) to identify high-value sections.
+
+**API**:
+```python
+class SmartTruncator:
+    def extract(self, text: str, max_chars: int = 12000) -> str:
+        """Extract the most informative sections of a long document."""
+        # 1. Find abstract/intro/conclusion by heading patterns
+        # 2. Allocate budget: abstract=20%, intro=20%, methods=20%, results=20%, conclusion=20%
+        # 3. If no headings detected, fall back to first + last chunks
+```
+
+**Where in khonliang**: Extend `BaseRole.enforce_budget()` with a `strategy` parameter — `"truncate"` (current default) vs `"sections"` (new).
+
+---
+
+### KH-13: Constrained JSON as Default for generate_json
+
+**Discovered**: `generate_json()` fails frequently because small models produce invalid JSON. The `constrained=True` parameter (Ollama native JSON mode) works much better but isn't the default.
+
+**What**: Make `constrained=True` the default for `generate_json()`. The retry-based parsing becomes the fallback, not the primary path.
+
+**Why**: We had to add `constrained=is_retry` in the summarizer — it should just work out of the box. Every caller of `generate_json` benefits.
+
+---
+
+### KH-14: Feed Health Tracking
+
+**Discovered**: Several RSS feeds return 404 silently. No way to know which feeds are working without reading logs.
+
+**What**: Track feed fetch success/failure in the RSSEngine. Expose via `get_feed_health()`.
+
+**API**:
+```python
+engine = RSSEngine(opml_path="feeds.opml")
+health = engine.get_feed_health()
+# Returns: {"anthropic": {"status": "ok", "last_success": ..., "entries": 15},
+#           "mcp": {"status": "error", "last_error": "404", "since": ...}}
+```
+
+**Where**: This is a researcher feature, not khonliang core. But the pattern (health tracking per external source) could generalize into khonliang's BaseEngine.
+
+---
+
+### KH-15: URL-Aware Deduplication in KnowledgeStore
+
+**Discovered**: Same paper fetched from different URLs (HTML vs PDF vs abstract) creates duplicates. Current dedup is SHA256 of content, but content differs by format.
+
+**What**: Add `source_id` field to KnowledgeEntry. Dedup by source_id (e.g., arxiv ID) before content hash.
+
+**API**:
+```python
+entry = KnowledgeEntry(
+    id=...,
+    source_id="arxiv:2508.04652",  # canonical identifier
+    ...
+)
+existing = ks.get_by_source_id("arxiv:2508.04652")
+```
+
+---
+
+## Additional AutoStock Feature Requests
+
+### AS-12: Scheduled Feed Monitoring
+
+**Papers**: Agentic RAG Survey, MemFactory
+
+**Where**: New scheduler task in `src/agent/tasks.py`
+
+**What**: Daily task that fetches RSS feeds, filters for relevant posts (keyword match + embedding similarity to project description), auto-ingests high-relevance posts into khonliang-researcher, sends Mattermost digest of new finds.
+
+**Sketch**:
+```python
+# Daily at 07:00
+async def monitor_research_feeds(state):
+    entries = await fetch_all_feeds(opml_path="feeds.opml")
+    relevant = filter_by_relevance(entries, project="autostock", threshold=0.6)
+    for entry in relevant:
+        await pipeline.ingest_paper(entry.url)
+    notify_mattermost(f"Found {len(relevant)} new relevant papers/posts")
+```
+
+**Depends on**: khonliang-researcher MCP server running, or direct Python import
+
+---
+
+### AS-13: Research-Informed Agent Prompts
+
+**Papers**: Experiential Reflective Learning, MemFactory, Enhancing Reasoning with Collaboration and Memory
+
+**Where**: `src/agents/quant.py`, `risk.py`, etc. — agent system prompts
+
+**What**: Inject relevant research findings into agent system prompts via khonliang-researcher's `paper_context()`. Agents get "here's what the literature says about this type of analysis" as part of their context.
+
+**Sketch**:
+```python
+class QuantResearcher(BaseAgent):
+    async def analyze(self, context):
+        # Inject relevant research context
+        research_ctx = researcher.get_paper_context("technical analysis consensus voting")
+        prompt = f"{self.system_prompt}\n\nRelevant research:\n{research_ctx}"
+        ...
+```
+
+**Depends on**: khonliang-researcher accessible from autostock (MCP or direct import)
+
+---
+
+### AS-14: Model Selection from Research Benchmarks
+
+**Papers**: MALT, More Agents Is All You Need, Rethinking Mixture-of-Agents
+
+**Where**: `src/llm/roles/model_pool.py`
+
+**What**: Use research findings to inform model routing decisions. The researcher corpus has benchmark data — "qwen2.5:7b outperforms llama3.2:3b on X" — that should feed into model selection.
+
+**Sketch**: Triple store query → `qwen2.5:7b outperforms llama3.2:3b` on task type → route to better model for that task. Updated as new papers are distilled.
+
+**Depends on**: KH-10 (predicate normalization) for clean triple queries
+
+---
+
+### AS-15: Assessor Model Upgrade
+
+**Discovered**: The 3B assessor scored 0 papers at ≥0.5 for autostock. It's too conservative — can't map abstract research findings to concrete project applicability.
+
+**What**: Use qwen2.5:7b for assessment instead of llama3.2:3b. The assessor prompt is complex (needs to understand both the paper and the project) — 3B isn't enough.
+
+**Where**: `khonliang-researcher/config.yaml` model mapping + re-distill assessments
+
+---
+
+### AS-16: Re-Distill on Model Upgrade
+
+**Discovered**: When we improve models or prompts, existing distillations are stale. Need a way to re-run distillation on already-processed papers.
+
+**What**: `khonliang-researcher worker --re-distill` flag that processes all papers regardless of status. Also `distill_paper --force` MCP tool.
+
+**Where**: `researcher/worker.py` and `researcher/server.py`
+
+---
+
+### AS-17: Cross-Project Triple Sharing
+
+**Papers**: Federation of Agents (VCVs), Internet of Agents
+
+**Where**: khonliang MCP server + khonliang-researcher MCP server
+
+**What**: Triples learned by khonliang-researcher (e.g., "MAGRPO improves_on GRPO") should be queryable from autostock's khonliang MCP tools. Either share a DB or federate queries across MCP servers.
+
+**Sketch**: Both servers point at the same SQLite DB for triples, or autostock's khonliang MCP proxies to researcher's triple_query.
+
+**Depends on**: Architecture decision — shared DB vs MCP federation
+
+---
+
+## Researcher-Specific Feature Requests
+
+### RR-1: Scheduled Feed Polling
+
+**What**: Built-in cron-like scheduler that polls feeds at configurable intervals, auto-ingests relevant new posts, auto-distills them.
+
+**API**:
+```bash
+khonliang-researcher daemon --poll-interval 6h --auto-distill
+```
+
+**Why**: Currently manual — `feeds` then `fetch` then `worker`. Should be autonomous.
+
+---
+
+### RR-2: Relevance Scoring Before Distillation
+
+**What**: Before spending LLM calls on distillation, score paper relevance using embedding similarity to project descriptions. Only distill papers above threshold.
+
+**Why**: We distilled 227 papers but many are tangentially relevant (medical, robotics, etc.). A quick embedding check (CPU, <5ms) would filter before the expensive LLM calls.
+
+---
+
+### RR-3: Incremental Re-Assessment
+
+**What**: When project descriptions change or models improve, re-run just the assessment step (not full distillation) on existing summaries.
+
+**Why**: Assessment is the cheapest step (3B model, short prompt). Re-running it after improving the assessor model or project description is cheap and high-value.
+
+---
+
+### RR-4: Paper Similarity Graph
+
+**What**: Compute pairwise embedding similarity between paper summaries. Surface clusters and suggest related papers.
+
+**API**:
+```python
+similar = researcher.find_similar(entry_id="abc123", threshold=0.7)
+clusters = researcher.cluster_papers(n_clusters=10)
+```
+
+**Why**: 227 papers is too many to browse. Clustering surfaces thematic groups. "Papers similar to this one" helps discovery.
+
+---
+
+### RR-5: Export to Markdown/HTML Report
+
+**What**: Generate a formatted research report from synthesis results — publishable markdown or HTML with citations, triple graphs, and project recommendations.
+
+**API**:
+```bash
+khonliang-researcher report --project autostock --output report.md
+```
+
+**Why**: Synthesis output is ephemeral (printed to stdout). A persistent report format enables sharing and review.
+
+---
+
+## Updated Dependency Graph
+
+```
+EXISTING (KH-1 through KH-9, AS-1 through AS-11):
+  [see above — unchanged]
+
+NEW KHONLIANG:
+  KH-10 (predicate normalization) ← independent, high value
+  KH-11 (status field) ← independent, quality of life
+  KH-12 (smart context extraction) ← improves all roles
+  KH-13 (constrained JSON default) ← improves all generate_json callers
+  KH-14 (feed health tracking) ← researcher-specific
+  KH-15 (URL-aware dedup) ← researcher-specific
+
+NEW AUTOSTOCK:
+  AS-12 (scheduled feed monitoring) ← needs researcher running
+  AS-13 (research-informed prompts) ← needs researcher + paper_context
+  AS-14 (model selection from benchmarks) ← needs KH-10 + triple queries
+  AS-15 (assessor model upgrade) ← config change + re-distill
+  AS-16 (re-distill on model upgrade) ← researcher worker change
+  AS-17 (cross-project triple sharing) ← architecture decision
+
+RESEARCHER:
+  RR-1 (scheduled feed polling) ← autonomous operation
+  RR-2 (relevance scoring pre-distill) ← efficiency
+  RR-3 (incremental re-assessment) ← AS-15 enables this
+  RR-4 (paper similarity graph) ← uses existing embeddings
+  RR-5 (export reports) ← presentation layer
+```
+
+## Updated Implementation Priority
+
+**Phase 1 — Close the feedback loop** (unchanged):
+  KH-1 → AS-1 → AS-3 → KH-6
+
+**Phase 1b — Fix data quality** (new, high value, no dependencies):
+  KH-10 (predicate normalization)
+  KH-13 (constrained JSON default)
+  AS-15 (assessor upgrade) → AS-16 (re-distill) → RR-3 (re-assess)
+
+**Phase 2 — Learn from outcomes** (unchanged):
+  KH-2 → AS-2 → KH-4 → AS-6
+
+**Phase 3 — Improve consensus quality** (unchanged):
+  KH-3 → AS-5 → KH-9 → AS-7
+
+**Phase 3b — Autonomous research** (new):
+  RR-1 (scheduled polling) → RR-2 (relevance filter) → AS-12 (autostock monitoring)
+
+**Phase 4 — Semantic communication** (unchanged + additions):
+  KH-7 → KH-8 → AS-10 → AS-4
+  RR-4 (paper similarity graph)
+
+**Phase 5 — Training + integration** (unchanged + additions):
+  AS-9 → AS-11
+  AS-13 (research-informed prompts)
+  AS-17 (cross-project triples)
+  KH-12 (smart context extraction)
+  RR-5 (export reports)
 
 ```
 KH-1 (outcome recording)
