@@ -7,6 +7,7 @@
     <outline text="Core LLM + agent design">
       <outline text="Anthropic Engineering" type="rss" xmlUrl="https://www.anthropic.com/engineering/rss.xml" htmlUrl="https://www.anthropic.com/engineering" />
       <outline text="OpenAI Developer Blog" type="rss" xmlUrl="https://developers.openai.com/blog/rss.xml" htmlUrl="https://developers.openai.com/blog/" />
+      <outline text="OpenAI Blog" type="rss" xmlUrl="https://openai.com/blog/rss.xml" htmlUrl="https://openai.com/blog" />
       <outline text="Model Context Protocol Blog" type="rss" xmlUrl="https://blog.modelcontextprotocol.io/rss.xml" htmlUrl="https://blog.modelcontextprotocol.io/" />
       <outline text="LangChain Blog" type="rss" xmlUrl="https://blog.langchain.com/rss/" htmlUrl="https://blog.langchain.com/" />
     </outline>
@@ -23,6 +24,19 @@
       <outline text="Simon Willison Weblog" type="rss" xmlUrl="https://simonwillison.net/atom/everything/" htmlUrl="https://simonwillison.net/" />
       <outline text="LlamaIndex Blog" type="rss" xmlUrl="https://www.llamaindex.ai/blog/rss.xml" htmlUrl="https://www.llamaindex.ai/blog" />
       <outline text="Microsoft DevBlogs AI" type="rss" xmlUrl="https://devblogs.microsoft.com/feed/" htmlUrl="https://devblogs.microsoft.com/" />
+    </outline>
+
+    <outline text="GitHub releases + activity">
+      <outline text="Ollama Releases" type="rss" xmlUrl="https://github.com/ollama/ollama/releases.atom" htmlUrl="https://github.com/ollama/ollama/releases" />
+      <outline text="vLLM Releases" type="rss" xmlUrl="https://github.com/vllm-project/vllm/releases.atom" htmlUrl="https://github.com/vllm-project/vllm/releases" />
+      <outline text="awesome-mcp-servers" type="rss" xmlUrl="https://github.com/punkpeye/awesome-mcp-servers/commits/master.atom" htmlUrl="https://github.com/punkpeye/awesome-mcp-servers" />
+      <outline text="Microsoft Agent Framework" type="rss" xmlUrl="https://github.com/microsoft/agent-framework/commits/main.atom" htmlUrl="https://github.com/microsoft/agent-framework" />
+    </outline>
+
+    <outline text="GitHub topic discovery">
+      <outline text="Topic: mcp-agent" type="rss" xmlUrl="https://github.com/topics/mcp-agent.atom" htmlUrl="https://github.com/topics/mcp-agent" />
+      <outline text="Topic: ollama" type="rss" xmlUrl="https://github.com/topics/ollama.atom" htmlUrl="https://github.com/topics/ollama" />
+      <outline text="Topic: ai-agents" type="rss" xmlUrl="https://github.com/topics/ai-agents.atom" htmlUrl="https://github.com/topics/ai-agents" />
     </outline>
 
     <outline text="Research + trend radar">

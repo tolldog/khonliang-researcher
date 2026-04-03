@@ -1,0 +1,71 @@
+{
+  "version": "1.0",
+  "project": "ollama-khonliang-research-feeds",
+  "description": "High-signal feeds and source URLs for LLM, agents, MCP, Ollama, inference, and ecosystem tracking.",
+  "sources": {
+    "blogs": [
+      {"name": "Anthropic Engineering", "category": "agent_design", "url": "https://www.anthropic.com/engineering", "priority": "high", "tags": ["anthropic", "agents", "context-engineering", "llm"]},
+      {"name": "OpenAI Developers Blog", "category": "agent_design", "url": "https://developers.openai.com/blog", "priority": "high", "tags": ["openai", "agents", "developer", "api", "llm"]},
+      {"name": "OpenAI Blog", "category": "llm_platform", "url": "https://openai.com/blog", "priority": "medium", "tags": ["openai", "models", "product", "research"]},
+      {"name": "Ollama Blog", "category": "runtime", "url": "https://ollama.com/blog", "priority": "high", "tags": ["ollama", "local-llm", "runtime", "agents"]},
+      {"name": "Model Context Protocol Blog", "category": "mcp", "url": "https://blog.modelcontextprotocol.io", "priority": "high", "tags": ["mcp", "protocol", "tools", "agents"]},
+      {"name": "LangChain Blog", "category": "frameworks", "url": "https://blog.langchain.com", "priority": "medium", "tags": ["langchain", "langgraph", "agents", "orchestration"]},
+      {"name": "Hugging Face Blog", "category": "open_models", "url": "https://huggingface.co/blog", "priority": "medium", "tags": ["huggingface", "open-models", "llm", "agents"]},
+      {"name": "vLLM Blog", "category": "inference", "url": "https://vllm.ai/blog", "priority": "high", "tags": ["vllm", "inference", "serving", "performance"]},
+      {"name": "NVIDIA Developer Blog", "category": "inference", "url": "https://developer.nvidia.com/blog", "priority": "medium", "tags": ["nvidia", "gpu", "inference", "serving"]}
+    ],
+    "github_repos": [
+      {"name": "ollama", "category": "runtime", "url": "https://github.com/ollama/ollama", "priority": "high", "tags": ["ollama", "runtime", "local-llm"]},
+      {"name": "vllm", "category": "inference", "url": "https://github.com/vllm-project/vllm", "priority": "high", "tags": ["vllm", "inference", "serving"]},
+      {"name": "awesome-mcp-servers", "category": "mcp", "url": "https://github.com/punkpeye/awesome-mcp-servers", "priority": "high", "tags": ["mcp", "servers", "tooling", "discovery"]},
+      {"name": "ollama-mcp-bridge", "category": "mcp", "url": "https://github.com/jonigl/ollama-mcp-bridge", "priority": "high", "tags": ["ollama", "mcp", "bridge", "tools"]},
+      {"name": "microsoft-agent-framework", "category": "frameworks", "url": "https://github.com/microsoft/agent-framework", "priority": "high", "tags": ["microsoft", "agent-framework", "orchestration"]},
+      {"name": "Qwen-Agent", "category": "frameworks", "url": "https://github.com/QwenLM/Qwen-Agent", "priority": "medium", "tags": ["qwen", "agents", "planning", "tools"]},
+      {"name": "fast-agent", "category": "frameworks", "url": "https://github.com/evalstate/fast-agent", "priority": "medium", "tags": ["fast-agent", "mcp", "agents", "framework"]}
+    ],
+    "github_activity_feeds": [
+      {"name": "ollama releases", "category": "runtime", "url": "https://github.com/ollama/ollama/releases.atom", "priority": "high", "tags": ["ollama", "releases"]},
+      {"name": "vllm releases", "category": "inference", "url": "https://github.com/vllm-project/vllm/releases.atom", "priority": "high", "tags": ["vllm", "releases"]},
+      {"name": "awesome-mcp-servers commits", "category": "mcp", "url": "https://github.com/punkpeye/awesome-mcp-servers/commits/master.atom", "priority": "medium", "tags": ["mcp", "servers", "commits"]},
+      {"name": "microsoft agent framework commits", "category": "frameworks", "url": "https://github.com/microsoft/agent-framework/commits/main.atom", "priority": "medium", "tags": ["agent-framework", "commits"]}
+    ],
+    "topic_feeds": [
+      {"name": "GitHub topic: mcp-agent", "category": "discovery", "url": "https://github.com/topics/mcp-agent.atom", "priority": "high", "tags": ["mcp", "agents", "discovery"]},
+      {"name": "GitHub topic: ollama", "category": "discovery", "url": "https://github.com/topics/ollama.atom", "priority": "high", "tags": ["ollama", "discovery"]},
+      {"name": "GitHub topic: ai-agents", "category": "discovery", "url": "https://github.com/topics/ai-agents.atom", "priority": "medium", "tags": ["ai-agents", "discovery"]}
+    ]
+  },
+  "recommended_pipeline": {
+    "tier_1_high_frequency": [
+      "https://www.anthropic.com/engineering/rss.xml",
+      "https://developers.openai.com/blog/rss.xml",
+      "https://ollama.com/blog/rss.xml",
+      "https://blog.modelcontextprotocol.io/rss.xml"
+    ],
+    "tier_2_pattern_extraction": [
+      "https://blog.langchain.com/rss/",
+      "https://vllm.ai/blog/rss.xml",
+      "https://github.com/ollama/ollama",
+      "https://github.com/punkpeye/awesome-mcp-servers",
+      "https://github.com/microsoft/agent-framework"
+    ],
+    "tier_3_trend_detection": [
+      "https://export.arxiv.org/rss/cs.AI",
+      "https://paperswithcode.com/rss",
+      "https://hnrss.org/frontpage",
+      "https://www.reddit.com/r/LocalLLaMA/.rss"
+    ]
+  },
+  "extraction_hints": {
+    "patterns_to_extract": [
+      "tool use patterns",
+      "planning loops",
+      "memory strategies",
+      "MCP integration patterns",
+      "model routing approaches",
+      "RAG scoping patterns",
+      "multi-agent coordination",
+      "OpenAI-compatible API techniques"
+    ]
+  }
+}
