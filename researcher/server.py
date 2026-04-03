@@ -25,11 +25,17 @@ logger = logging.getLogger(__name__)
 
 def create_research_server(pipeline: ResearchPipeline):
     """Create MCP server with khonliang base tools + custom research tools."""
+    from researcher.synthesizer import Synthesizer
+    from researcher.worker import DistillWorker
+
     base = KhonliangMCPServer(
         knowledge_store=pipeline.knowledge,
         triple_store=pipeline.triples,
     )
     mcp = base.create_app()
+
+    synthesizer = Synthesizer(pipeline.knowledge, pipeline.triples, pipeline.pool)
+    worker = DistillWorker(pipeline)
 
     # ------------------------------------------------------------------
     # Custom research tools
@@ -289,6 +295,92 @@ def create_research_server(pipeline: ResearchPipeline):
             if entry.tags:
                 lines.append(f"  Tags: {', '.join(entry.tags)}")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Worker tools
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def start_distillation(batch_size: int = 0) -> str:
+        """Start processing the distillation queue.
+
+        Processes pending papers sequentially (summarize + extract + assess).
+        batch_size=0 means process all pending. Otherwise process N papers.
+        Returns progress when done.
+        """
+        pending = worker._count_pending()
+        if pending == 0:
+            return "No pending papers to distill."
+
+        limit = batch_size if batch_size > 0 else None
+        target = min(pending, batch_size) if batch_size > 0 else pending
+
+        stats = await worker.run_batch(limit=limit)
+        return (
+            f"Distillation complete.\n"
+            f"  Processed: {stats['processed']}\n"
+            f"  Failed: {stats['failed']}\n"
+            f"  Remaining: {worker._count_pending()}"
+        )
+
+    @mcp.tool()
+    def worker_status() -> str:
+        """Check distillation worker status and queue depth."""
+        s = worker.stats
+        return (
+            f"Worker running: {s['running']}\n"
+            f"Pending: {s['pending']}\n"
+            f"Processed: {s['processed']}\n"
+            f"Failed: {s['failed']}"
+        )
+
+    # ------------------------------------------------------------------
+    # Synthesis tools
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def synthesize_topic(topic: str) -> str:
+        """Generate a combined summary of papers related to a topic.
+
+        Searches distilled papers matching the topic and produces a
+        cross-paper analysis covering themes, methods, gaps, and connections.
+        """
+        result = await synthesizer.topic_summary(topic)
+        if not result.success:
+            return result.content
+        return f"# Topic: {topic} ({result.paper_count} papers)\n\n{result.content}"
+
+    @mcp.tool()
+    async def synthesize_project(project: str = "autostock") -> str:
+        """Generate an applicability brief for a project.
+
+        Analyzes all distilled papers and ranks them by relevance to the
+        specified project (from config.yaml). Returns prioritized recommendations.
+        """
+        projects = pipeline.config.get("projects", {})
+        if project not in projects:
+            available = ", ".join(projects.keys()) or "none configured"
+            return f"Project '{project}' not found. Available: {available}"
+
+        cfg = projects[project]
+        result = await synthesizer.project_brief(
+            project, cfg.get("description", "")
+        )
+        if not result.success:
+            return result.content
+        return f"# {project} Brief ({result.paper_count} papers)\n\n{result.content}"
+
+    @mcp.tool()
+    async def synthesize_landscape() -> str:
+        """Generate a research landscape overview across all distilled papers.
+
+        Maps major directions, emerging trends, consensus views,
+        contested areas, and gaps in the literature.
+        """
+        result = await synthesizer.landscape()
+        if not result.success:
+            return result.content
+        return f"# Research Landscape ({result.paper_count} papers)\n\n{result.content}"
 
     return mcp
 

@@ -213,6 +213,110 @@ def reading_list(ctx):
 
 
 @cli.command()
+@click.option("--batch", type=int, default=0, help="Process N papers (0=all)")
+@click.option("--pause", type=float, default=2.0, help="Seconds between papers")
+@click.pass_context
+def worker(ctx, batch, pause):
+    """Run the distillation worker on pending papers."""
+    from researcher.worker import DistillWorker
+
+    pipeline = _get_pipeline(ctx)
+    w = DistillWorker(pipeline, pause_between=pause)
+
+    pending = w._count_pending()
+    if pending == 0:
+        click.echo("No pending papers.")
+        return
+
+    target = min(pending, batch) if batch > 0 else pending
+    click.echo(f"Processing {target} papers...\n")
+
+    async def _run_worker():
+        limit = batch if batch > 0 else None
+        return await w.run_batch(limit=limit)
+
+    stats = _run(_run_worker())
+    click.echo(f"\nDone: {stats['processed']} processed, {stats['failed']} failed")
+    click.echo(f"Remaining: {w._count_pending()}")
+
+
+@cli.group()
+@click.pass_context
+def synthesize(ctx):
+    """Generate combined summaries across papers."""
+    pass
+
+
+@synthesize.command("topic")
+@click.argument("topic")
+@click.pass_context
+def synth_topic(ctx, topic):
+    """Synthesize papers around a topic."""
+    from researcher.synthesizer import Synthesizer
+
+    pipeline = _get_pipeline(ctx)
+    s = Synthesizer(pipeline.knowledge, pipeline.triples, pipeline.pool)
+
+    async def _synth():
+        result = await s.topic_summary(topic)
+        if result.success:
+            click.echo(f"# {topic} ({result.paper_count} papers)\n")
+            click.echo(result.content)
+        else:
+            click.echo(result.content, err=True)
+
+    _run(_synth())
+
+
+@synthesize.command("project")
+@click.argument("project", default="autostock")
+@click.pass_context
+def synth_project(ctx, project):
+    """Generate applicability brief for a project."""
+    from researcher.synthesizer import Synthesizer
+
+    pipeline = _get_pipeline(ctx)
+    projects = pipeline.config.get("projects", {})
+
+    if project not in projects:
+        click.echo(f"Project '{project}' not in config. Available: {', '.join(projects.keys())}", err=True)
+        return
+
+    s = Synthesizer(pipeline.knowledge, pipeline.triples, pipeline.pool)
+    cfg = projects[project]
+
+    async def _synth():
+        result = await s.project_brief(project, cfg.get("description", ""))
+        if result.success:
+            click.echo(f"# {project} Brief ({result.paper_count} papers)\n")
+            click.echo(result.content)
+        else:
+            click.echo(result.content, err=True)
+
+    _run(_synth())
+
+
+@synthesize.command("landscape")
+@click.pass_context
+def synth_landscape(ctx):
+    """Map the research landscape across all distilled papers."""
+    from researcher.synthesizer import Synthesizer
+
+    pipeline = _get_pipeline(ctx)
+    s = Synthesizer(pipeline.knowledge, pipeline.triples, pipeline.pool)
+
+    async def _synth():
+        result = await s.landscape()
+        if result.success:
+            click.echo(f"# Research Landscape ({result.paper_count} papers)\n")
+            click.echo(result.content)
+        else:
+            click.echo(result.content, err=True)
+
+    _run(_synth())
+
+
+@cli.command()
 @click.option("--transport", default="stdio", help="MCP transport")
 @click.pass_context
 def serve(ctx, transport):
