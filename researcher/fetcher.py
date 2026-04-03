@@ -1,12 +1,34 @@
-"""Fetch research papers and web content, convert HTML to clean text."""
+"""Fetch research papers and web content in multiple formats.
 
+Supported formats:
+  - HTML: stripped to clean text via BeautifulSoup
+  - PDF: text extraction via PyMuPDF (fitz)
+  - Markdown: preserved as-is (already text)
+  - Plain text: passed through
+
+Format is auto-detected from Content-Type header and URL extension.
+"""
+
+import io
+import logging
 import re
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+
+class ContentFormat(str, Enum):
+    HTML = "html"
+    PDF = "pdf"
+    MARKDOWN = "markdown"
+    TEXT = "text"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -14,8 +36,18 @@ class FetchResult:
     url: str
     title: str
     content: str
+    format: ContentFormat = ContentFormat.UNKNOWN
     metadata: dict = field(default_factory=dict)
     fetched_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class SearchResult:
+    arxiv_id: str
+    title: str
+    authors: list
+    abstract: str
+    url: str
 
 
 _ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?")
@@ -31,11 +63,50 @@ def extract_arxiv_id(url_or_id: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+# ---------------------------------------------------------------------------
+# Format detection
+# ---------------------------------------------------------------------------
+
+def _detect_format(url: str, content_type: str = "") -> ContentFormat:
+    """Detect content format from URL extension and Content-Type header.
+
+    URL extension wins for ambiguous content-types (e.g., text/plain for .md files).
+    """
+    ct = content_type.lower().split(";")[0].strip()
+    url_path = url.lower().split("?")[0].rstrip("/")
+
+    # URL extension is most reliable (servers often miscategorize)
+    if url_path.endswith(".pdf"):
+        return ContentFormat.PDF
+    if url_path.endswith(".md"):
+        return ContentFormat.MARKDOWN
+    if url_path.endswith((".html", ".htm")) or "/html/" in url_path:
+        return ContentFormat.HTML
+    if url_path.endswith(".txt"):
+        return ContentFormat.TEXT
+
+    # Content-Type for URLs without clear extensions
+    if "pdf" in ct:
+        return ContentFormat.PDF
+    if "html" in ct:
+        return ContentFormat.HTML
+    if "markdown" in ct or "text/x-markdown" in ct:
+        return ContentFormat.MARKDOWN
+    if ct == "text/plain":
+        return ContentFormat.TEXT
+
+    # Default to HTML (most web pages)
+    return ContentFormat.HTML
+
+
+# ---------------------------------------------------------------------------
+# Format-specific converters
+# ---------------------------------------------------------------------------
+
 def _html_to_text(html: str) -> tuple[str, str]:
     """Convert HTML to clean text. Returns (title, body_text)."""
     soup = BeautifulSoup(html, "html.parser")
 
-    # Remove script, style, nav, footer
     for tag in soup.find_all(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
 
@@ -44,21 +115,56 @@ def _html_to_text(html: str) -> tuple[str, str]:
     if title_tag:
         title = title_tag.get_text(strip=True)
 
-    # For arxiv, try to get the article body specifically
     article = soup.find("article") or soup.find("main") or soup.body or soup
     text = article.get_text(separator="\n", strip=True)
-
-    # Collapse excessive blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return title, text
 
 
-def _extract_arxiv_metadata(soup: BeautifulSoup, arxiv_id: str) -> dict:
+def _pdf_to_text(pdf_bytes: bytes) -> tuple[str, str]:
+    """Extract text from PDF bytes. Returns (title, body_text)."""
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    title = doc.metadata.get("title", "") or ""
+
+    pages = []
+    for page in doc:
+        text = page.get_text("text")
+        if text.strip():
+            pages.append(text)
+    doc.close()
+
+    body = "\n\n".join(pages)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+
+    # If no metadata title, try first line
+    if not title and body:
+        first_line = body.split("\n")[0].strip()
+        if len(first_line) < 200:
+            title = first_line
+
+    return title, body
+
+
+def _markdown_to_text(md: str) -> tuple[str, str]:
+    """Extract title and return markdown as-is (it's already readable text)."""
+    title = ""
+    for line in md.split("\n"):
+        line = line.strip()
+        if line.startswith("# "):
+            title = line[2:].strip()
+            break
+
+    return title, md
+
+
+def _extract_arxiv_metadata(html: str, arxiv_id: str) -> dict:
     """Extract metadata from arxiv HTML page."""
+    soup = BeautifulSoup(html, "html.parser")
     meta = {"arxiv_id": arxiv_id, "source": "arxiv"}
 
-    # Authors from meta tags
     authors = []
     for tag in soup.find_all("meta", attrs={"name": "citation_author"}):
         if tag.get("content"):
@@ -66,7 +172,6 @@ def _extract_arxiv_metadata(soup: BeautifulSoup, arxiv_id: str) -> dict:
     if authors:
         meta["authors"] = authors
 
-    # Date
     date_tag = soup.find("meta", attrs={"name": "citation_date"})
     if date_tag and date_tag.get("content"):
         meta["date"] = date_tag["content"]
@@ -74,72 +179,157 @@ def _extract_arxiv_metadata(soup: BeautifulSoup, arxiv_id: str) -> dict:
     return meta
 
 
-async def fetch_url(url: str, timeout: int = 30) -> FetchResult:
-    """Fetch a URL and return clean text content."""
+# ---------------------------------------------------------------------------
+# Convert raw response to text based on format
+# ---------------------------------------------------------------------------
+
+def _convert(raw: bytes, text: str, fmt: ContentFormat) -> tuple[str, str]:
+    """Convert fetched content to (title, text) based on detected format."""
+    if fmt == ContentFormat.PDF:
+        return _pdf_to_text(raw)
+    elif fmt == ContentFormat.HTML:
+        return _html_to_text(text)
+    elif fmt == ContentFormat.MARKDOWN:
+        return _markdown_to_text(text)
+    else:
+        # Plain text
+        title = ""
+        first_line = text.split("\n")[0].strip() if text else ""
+        if len(first_line) < 200:
+            title = first_line
+        return title, text
+
+
+# ---------------------------------------------------------------------------
+# Public fetch functions
+# ---------------------------------------------------------------------------
+
+async def fetch_url(url: str, timeout: int = 60) -> FetchResult:
+    """Fetch any URL, auto-detect format, return clean text.
+
+    Handles HTML, PDF, Markdown, and plain text automatically.
+    """
     async with aiohttp.ClientSession(headers=_HEADERS) as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             resp.raise_for_status()
-            html = await resp.text()
+            content_type = resp.headers.get("Content-Type", "")
+            fmt = _detect_format(url, content_type)
 
-    title, content = _html_to_text(html)
+            if fmt == ContentFormat.PDF:
+                raw = await resp.read()
+                text_content = ""
+            else:
+                raw = b""
+                text_content = await resp.text()
+
+    title, content = _convert(raw, text_content, fmt)
 
     return FetchResult(
         url=url,
         title=title,
         content=content,
-        metadata={"source": "web"},
+        format=fmt,
+        metadata={"source": "web", "content_type": content_type},
     )
 
 
 async def fetch_arxiv(arxiv_id_or_url: str) -> FetchResult:
-    """Fetch an arxiv paper by ID or URL. Prefers HTML version."""
+    """Fetch an arxiv paper by ID or URL.
+
+    Tries formats in order: HTML → PDF → abstract page.
+    """
     arxiv_id = extract_arxiv_id(arxiv_id_or_url)
     if not arxiv_id:
         raise ValueError(f"Cannot extract arxiv ID from: {arxiv_id_or_url}")
 
-    url = f"https://arxiv.org/html/{arxiv_id}"
-
     async with aiohttp.ClientSession(headers=_HEADERS) as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            if resp.status == 404:
-                # Fall back to abstract page
-                url = f"https://arxiv.org/abs/{arxiv_id}"
-                async with session.get(url) as abs_resp:
-                    abs_resp.raise_for_status()
-                    html = await abs_resp.text()
-            else:
-                resp.raise_for_status()
+        # Try HTML first
+        html_url = f"https://arxiv.org/html/{arxiv_id}"
+        async with session.get(html_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            if resp.status == 200:
                 html = await resp.text()
+                title, content = _html_to_text(html)
+                metadata = _extract_arxiv_metadata(html, arxiv_id)
+                metadata["format_used"] = "html"
+                return FetchResult(
+                    url=html_url, title=title, content=content,
+                    format=ContentFormat.HTML, metadata=metadata,
+                )
 
-    soup = BeautifulSoup(html, "html.parser")
-    title, content = _html_to_text(html)
-    metadata = _extract_arxiv_metadata(soup, arxiv_id)
+        # Fall back to PDF
+        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+        logger.info("No HTML for %s, trying PDF", arxiv_id)
+        async with session.get(pdf_url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            if resp.status == 200:
+                content_type = resp.headers.get("Content-Type", "")
+                if "pdf" in content_type.lower():
+                    pdf_bytes = await resp.read()
+                    title, content = _pdf_to_text(pdf_bytes)
+                    return FetchResult(
+                        url=pdf_url, title=title, content=content,
+                        format=ContentFormat.PDF,
+                        metadata={"arxiv_id": arxiv_id, "source": "arxiv", "format_used": "pdf"},
+                    )
+
+        # Last resort: abstract page
+        abs_url = f"https://arxiv.org/abs/{arxiv_id}"
+        logger.info("No PDF for %s, falling back to abstract", arxiv_id)
+        async with session.get(abs_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+            title, content = _html_to_text(html)
+            metadata = _extract_arxiv_metadata(html, arxiv_id)
+            metadata["format_used"] = "abstract"
+            return FetchResult(
+                url=abs_url, title=title, content=content,
+                format=ContentFormat.HTML, metadata=metadata,
+            )
+
+
+async def fetch_raw(url: str, timeout: int = 30) -> str:
+    """Fetch raw text content from a URL (for markdown files, READMEs, etc.)."""
+    async with aiohttp.ClientSession(headers=_HEADERS) as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            resp.raise_for_status()
+            return await resp.text()
+
+
+async def fetch_file(path: str) -> FetchResult:
+    """Read a local file (PDF, markdown, text, HTML)."""
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    fmt = _detect_format(path, "")
+
+    if fmt == ContentFormat.PDF:
+        raw = p.read_bytes()
+        text_content = ""
+    else:
+        raw = b""
+        text_content = p.read_text(errors="replace")
+
+    title, content = _convert(raw, text_content, fmt)
 
     return FetchResult(
-        url=url,
-        title=title,
+        url=f"file://{p.resolve()}",
+        title=title or p.stem,
         content=content,
-        metadata=metadata,
+        format=fmt,
+        metadata={"source": "file", "path": str(p.resolve())},
     )
 
 
-@dataclass
-class SearchResult:
-    arxiv_id: str
-    title: str
-    authors: list
-    abstract: str
-    url: str
-
+# ---------------------------------------------------------------------------
+# Arxiv search (kept for backward compat)
+# ---------------------------------------------------------------------------
 
 async def search_arxiv(
     query: str, max_results: int = 20, sort_by: str = "relevance"
 ) -> list[SearchResult]:
-    """Search arxiv for papers matching keywords.
-
-    Uses the arxiv API (Atom feed). Returns structured results.
-    sort_by: "relevance" or "lastUpdatedDate" or "submittedDate"
-    """
+    """Search arxiv for papers matching keywords."""
     import urllib.parse
     import xml.etree.ElementTree as ET
 
@@ -187,11 +377,3 @@ async def search_arxiv(
         ))
 
     return results
-
-
-async def fetch_raw(url: str, timeout: int = 30) -> str:
-    """Fetch raw text content from a URL (for markdown files, READMEs, etc.)."""
-    async with aiohttp.ClientSession(headers=_HEADERS) as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            resp.raise_for_status()
-            return await resp.text()

@@ -53,6 +53,45 @@ def create_research_server(pipeline: ResearchPipeline):
             return f"Error fetching {url}: {e}"
 
     @mcp.tool()
+    async def ingest_file(path: str) -> str:
+        """Ingest a local file (PDF, HTML, Markdown, or text).
+
+        Reads the file, auto-detects format, extracts text, and stores it.
+        Returns the entry ID for later distillation.
+        """
+        from researcher.fetcher import fetch_file
+        try:
+            result = await fetch_file(path)
+            if not result.content.strip():
+                return f"No text content extracted from: {path}"
+
+            import hashlib
+            from khonliang.knowledge.store import KnowledgeEntry, Tier
+
+            entry_id = hashlib.sha256(path.encode()).hexdigest()[:16]
+            entry = KnowledgeEntry(
+                id=entry_id,
+                tier=Tier.IMPORTED,
+                title=result.title or path,
+                content=result.content,
+                source=result.url,
+                scope="research",
+                tags=["paper", "undistilled", f"format:{result.format.value}"],
+                metadata={
+                    "url": result.url,
+                    "format": result.format.value,
+                    "fetched_at": result.fetched_at,
+                    **result.metadata,
+                },
+            )
+            pipeline.knowledge.add(entry)
+            return f"Ingested: {result.title} ({result.format.value})\nEntry ID: {entry_id}"
+        except FileNotFoundError:
+            return f"File not found: {path}"
+        except Exception as e:
+            return f"Error reading {path}: {e}"
+
+    @mcp.tool()
     async def fetch_paper_list(url: str) -> str:
         """Parse a URL containing a list of papers (awesome-list, bibliography, etc.).
 
