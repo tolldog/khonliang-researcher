@@ -47,26 +47,27 @@ Paper summaries:
 """
 
 _PROJECT_PROMPT = """\
-Given these {count} paper summaries, identify what's most applicable to:
+You are analyzing {count} research papers for applicability to a specific project.
 
-Project: {project_name}
-Description: {project_description}
+PROJECT: {project_name}
+DESCRIPTION: {project_description}
 
-Structure your response as:
+For EACH applicable paper, explain SPECIFICALLY how its findings could be implemented in this project. Be concrete — name specific components, methods, or code changes.
 
-## High Priority (implement now)
-- Finding/method and which paper, with concrete implementation suggestion
+Structure EXACTLY as:
 
-## Medium Priority (worth exploring)
-- Finding/method and which paper
+## Implement Now
+For each: Paper title → what to build/change → expected benefit
 
-## Background Context (good to know)
-- Finding that informs understanding
+## Worth Exploring
+For each: Paper title → idea → what needs validation first
 
-## Not Applicable
-- Papers that don't apply and why (brief)
+## Background Only
+Papers that inform thinking but don't have direct implementation paths
 
-Paper summaries:
+Keep each entry to 2-3 sentences max. Do not repeat papers.
+
+PAPERS:
 {summaries}
 """
 
@@ -145,9 +146,13 @@ class Synthesizer:
 
         return summaries
 
-    def _format_summaries(self, summaries: List[Dict]) -> str:
-        """Format summaries for prompt injection."""
+    def _format_summaries(self, summaries: List[Dict], max_chars: int = 10000) -> str:
+        """Format summaries compactly for prompt injection.
+
+        Keeps total under max_chars to avoid exceeding model context.
+        """
         parts = []
+        total = 0
         for i, s in enumerate(summaries, 1):
             data = s["summary"]
             title = data.get("title", s["title"])
@@ -155,16 +160,24 @@ class Synthesizer:
             findings = data.get("key_findings", [])
             methods = data.get("methods", [])
 
-            part = f"### Paper {i}: {title}\n"
+            # Compact format: one block per paper
+            lines = [f"{i}. {title}"]
             if abstract:
-                part += f"Abstract: {abstract}\n"
+                lines.append(f"   {abstract[:150]}")
             if findings:
-                part += "Key findings:\n" + "\n".join(f"- {f}" for f in findings) + "\n"
+                for f in findings[:3]:
+                    lines.append(f"   - {f[:100]}")
             if methods:
-                part += "Methods: " + ", ".join(methods) + "\n"
-            parts.append(part)
+                lines.append(f"   Methods: {', '.join(methods)}")
 
-        return "\n".join(parts)
+            block = "\n".join(lines)
+            if total + len(block) > max_chars:
+                parts.append(f"... and {len(summaries) - i + 1} more papers")
+                break
+            parts.append(block)
+            total += len(block)
+
+        return "\n\n".join(parts)
 
     async def _generate(self, prompt: str) -> str:
         """Run LLM generation via the summarizer model."""
@@ -203,7 +216,7 @@ class Synthesizer:
         )
 
     async def project_brief(
-        self, project_name: str, project_description: str, limit: int = 30
+        self, project_name: str, project_description: str, limit: int = 20
     ) -> SynthesisResult:
         """Generate applicability brief for a specific project."""
         summaries = self._get_distilled_summaries(limit=limit)
