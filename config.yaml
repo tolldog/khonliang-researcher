@@ -1,7 +1,7 @@
 models:
   summarizer: qwen2.5:7b
   extractor: llama3.2:3b
-  assessor: llama3.2:3b
+  assessor: qwen2.5:7b
 
 ollama_url: http://localhost:11434
 
@@ -22,3 +22,10 @@ projects:
       Multi-agent LLM orchestration library with roles, routing, consensus,
       knowledge stores, triple stores, digest synthesis, and MCP server.
     scope: library
+  genealogy:
+    description: >
+      Family history research tool using khonliang. Multi-agent system with
+      researcher, fact-checker, narrator roles. GEDCOM parsing, cross-tree
+      entity resolution, knowledge graph for family relationships, agentic
+      RAG for historical records, WebSocket chat with session context.
+    scope: genealogy

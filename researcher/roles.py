@@ -26,14 +26,14 @@ PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 # Size thresholds and model tiers for summarization
 MODEL_TIERS: List[Tuple[int, str, int]] = [
     # (max_chars, model, context_limit)
-    (15_000, "llama3.2:3b", 15_000),    # tiny/small: fast model, no truncation
-    (50_000, "qwen2.5:7b", 12_000),     # medium: 7B with truncation
-    (999_999_999, "qwen2.5:7b", 12_000), # large/huge: same
+    (15_000, "llama3.2:3b", 15_000),     # tiny/small: fast model, no truncation
+    (50_000, "qwen2.5:7b", 24_000),      # medium: 7B with more context
+    (999_999_999, "qwen2.5:7b", 24_000),  # large/huge: same
 ]
 
 # Fallback model for retries after failure
 FALLBACK_MODEL = "deepseek-r1:14b"
-FALLBACK_CONTEXT_LIMIT = 16_000
+FALLBACK_CONTEXT_LIMIT = 32_000
 
 
 def _select_model(content_length: int) -> Tuple[str, int]:
