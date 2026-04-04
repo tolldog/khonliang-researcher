@@ -377,6 +377,70 @@ def create_research_server(pipeline: ResearchPipeline):
         )
 
     # ------------------------------------------------------------------
+    # Graph + Matrix tools
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def concept_matrix(min_connections: int = 2, max_concepts: int = 30) -> str:
+        """Show a concept × paper matrix.
+
+        Rows are concepts/methods, columns are papers. Shows which papers
+        cover which concepts, with relationship types and confidence scores.
+        Good for finding coverage gaps and seeing concept density.
+        """
+        from researcher.graph import build_concept_matrix, format_matrix
+
+        matrix_data = build_concept_matrix(
+            pipeline.triples,
+            min_connections=min_connections,
+            max_concepts=max_concepts,
+        )
+        if not matrix_data["concepts"]:
+            return "No concept matrix data. Distill some papers first."
+        return format_matrix(matrix_data, pipeline.knowledge)
+
+    @mcp.tool()
+    def concept_tree(concept: str, depth: int = 4, branches: int = 3) -> str:
+        """Trace a concept's connections through the knowledge graph.
+
+        Shows a tree of related concepts connected through papers:
+            GRPO
+            ├── improved_by → MAGRPO
+            │   ├── applied_to → LLM Collaboration
+            │   └── extends → C3
+            └── used_by → ConsensusEngine
+
+        Like a LinkedIn connection graph for research concepts.
+        """
+        from researcher.graph import build_concept_graph, trace_chain
+
+        graph = build_concept_graph(pipeline.triples)
+        return trace_chain(graph, concept, max_depth=depth, max_branches=branches)
+
+    @mcp.tool()
+    def concept_path(start: str, end: str) -> str:
+        """Find how two concepts connect through the knowledge graph.
+
+        Traces paths from start → end through intermediate concepts.
+        Shows the chain of papers and relationships connecting them.
+        """
+        from researcher.graph import build_concept_graph, find_paths
+
+        graph = build_concept_graph(pipeline.triples)
+        paths = find_paths(graph, start, end)
+        if not paths:
+            return f"No path found from '{start}' to '{end}'."
+
+        lines = [f"Found {len(paths)} path(s) from '{start}' to '{end}':\n"]
+        for i, path in enumerate(paths[:5], 1):
+            chain = " → ".join(
+                f"{node} —[{pred}]→ {target}"
+                for node, pred, target in path
+            )
+            lines.append(f"  {i}. {chain}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Synthesis tools
     # ------------------------------------------------------------------
 
