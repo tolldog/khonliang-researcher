@@ -60,7 +60,7 @@ def create_research_server(pipeline: ResearchPipeline):
 
 ## Discovery
 - `find_papers(query, engines="arxiv,semantic_scholar")` — search by keyword
-- `browse_feeds(query, relevant_only=true)` — scan RSS feeds for new posts
+- `browse_feeds(query, relevant_only=True)` — scan RSS feeds for new posts
 - `research_capabilities(project)` — generate queries from scanned code capabilities
 - `scan_codebase(project)` — AST-scan a project to discover what it already does
 - `ingest_github(repo_url)` — cleanroom-extract concepts from a GitHub repo
@@ -113,7 +113,7 @@ and per-project applicability scores.
 - `brief_idea(idea_id)` — synthesize claim-by-claim assessment
 
 ## Evaluation
-- `evaluate_capability(description)` — assess if a khonliang feature helps researcher
+- `evaluate_capability(capability)` — assess if a khonliang feature helps researcher
 - `score_relevance(entry_id)` — score a paper against all projects
 - `health_check()` — verify Ollama, models, DB, disk
 
