@@ -98,10 +98,18 @@ class ResearchPipeline:
 
     def _build_url_index(self):
         """Build URL index from existing knowledge entries."""
+        from researcher.fetcher import extract_arxiv_id
         for entry in self.knowledge.get_by_tier(Tier.IMPORTED):
             url = entry.metadata.get("url", "")
             if url:
                 self._url_index[url] = entry.id
+                # Also index canonical arxiv URL for cross-format dedup
+                arxiv_id = extract_arxiv_id(url)
+                if arxiv_id:
+                    self._url_index[f"https://arxiv.org/abs/{arxiv_id}"] = entry.id
+            original = entry.metadata.get("original_url", "")
+            if original:
+                self._url_index[original] = entry.id
 
     def _migrate_status(self):
         """One-time migration: backfill EntryStatus from tags for existing entries."""
@@ -166,7 +174,8 @@ class ResearchPipeline:
             tags=["paper"],
             status=EntryStatus.INGESTED,
             metadata={
-                "url": url,
+                "url": canonical_url,
+                "original_url": url if url != canonical_url else "",
                 "fetched_at": result.fetched_at,
                 **result.metadata,
             },
@@ -689,7 +698,8 @@ class ResearchPipeline:
 
         # Store FRs as Tier 3 knowledge entries, filtering out already-built
         fr_count = 0
-        skipped = 0
+        skipped = 0  # capability matches
+        fr_existed = 0  # already in knowledge store
         for item in classifications:
             for fr in item.get("feature_requests", []):
                 fr_title_lower = fr.get("title", "").lower()
@@ -714,12 +724,14 @@ class ResearchPipeline:
                         pass
 
                 import hashlib
-                fr_id = f"fr_{fr['target']}_{hashlib.sha256(fr['title'].encode()).hexdigest()[:8]}"
+                # Hash target + title + concept for stable, collision-resistant IDs
+                fr_hash_input = f"{fr['target']}:{fr['title']}:{item.get('concept', '')}"
+                fr_id = f"fr_{fr['target']}_{hashlib.sha256(fr_hash_input.encode()).hexdigest()[:8]}"
 
                 # Don't overwrite existing FRs (preserves reviews, deps, status history)
                 existing = self.knowledge.get(fr_id)
                 if existing:
-                    skipped += 1
+                    fr_existed += 1
                     continue
 
                 fr_entry = KnowledgeEntry(
@@ -745,6 +757,8 @@ class ResearchPipeline:
 
         if skipped:
             logger.info("Synergize: skipped %d FRs matching existing capabilities", skipped)
+        if fr_existed:
+            logger.info("Synergize: skipped %d FRs already in knowledge store", fr_existed)
 
         self.digest.record(
             summary=f"Synergize: {len(classifications)} concepts classified, {fr_count} FRs generated",
