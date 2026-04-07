@@ -9,6 +9,7 @@ Orchestrates khonliang components:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -43,6 +44,62 @@ class DistillResult:
     triples: List[Dict[str, Any]] = field(default_factory=list)
     assessments: Dict[str, Any] = field(default_factory=dict)
     success: bool = False
+
+
+def update_capability_status(
+    knowledge: KnowledgeStore,
+    target: str,
+    title: str,
+    concept: str,
+    status: str,
+    fr_id: str = "",
+):
+    """Track what exists/is planned per project. Call on FR status changes.
+
+    Status is monotonic: 'exists' is never downgraded to 'planned'.
+    Tags and content are kept in sync with the resolved status.
+    """
+    def _resolve(current: str, new: str) -> str:
+        if current == "exists" or new == "exists":
+            return "exists"
+        return new
+
+    cap_id = f"cap_{target}_{hashlib.sha256(title.encode()).hexdigest()[:8]}"
+
+    existing = knowledge.get(cap_id)
+    if existing:
+        metadata = existing.metadata or {}
+        resolved = _resolve(metadata.get("capability_status", ""), status)
+        metadata["target"] = target
+        metadata["concept"] = concept
+        metadata["capability_status"] = resolved
+        if fr_id:
+            metadata["fr_id"] = fr_id
+        existing.metadata = metadata
+        existing.content = f"{resolved}: {title}"
+        existing.tags = [
+            t for t in (existing.tags or [])
+            if not t.startswith("cap:") and t != "capability"
+        ] + ["capability", f"cap:{target}", f"cap:{resolved}"]
+        knowledge.add(existing)
+    else:
+        entry = KnowledgeEntry(
+            id=cap_id,
+            tier=Tier.DERIVED,
+            title=title,
+            content=f"{status}: {title}",
+            source="capability_tracker",
+            scope="capability",
+            tags=["capability", f"cap:{target}", f"cap:{status}"],
+            status=EntryStatus.DISTILLED,
+            metadata={
+                "target": target,
+                "concept": concept,
+                "capability_status": status,
+                "fr_id": fr_id,
+            },
+        )
+        knowledge.add(entry)
 
 
 class ResearchPipeline:
