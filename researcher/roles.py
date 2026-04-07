@@ -26,14 +26,15 @@ PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 # Size thresholds and model tiers for summarization
 MODEL_TIERS: List[Tuple[int, str, int]] = [
     # (max_chars, model, context_limit)
-    (15_000, "llama3.2:3b", 15_000),     # tiny/small: fast model, no truncation
-    (50_000, "qwen2.5:7b", 24_000),      # medium: 7B with more context
-    (999_999_999, "qwen2.5:7b", 24_000),  # large/huge: same
+    # Tested: 7B reliable up to ~12k, 32B reliable up to ~16k for JSON output
+    (8_000, "qwen2.5:7b", 8_000),         # small: 7B, fast
+    (50_000, "qwen2.5:7b", 12_000),       # medium: 7B, truncated
+    (999_999_999, "qwen2.5:32b", 16_000), # large: 32B for big papers
 ]
 
 # Fallback model for retries after failure
-FALLBACK_MODEL = "deepseek-r1:14b"
-FALLBACK_CONTEXT_LIMIT = 32_000
+FALLBACK_MODEL = "qwen2.5:32b"
+FALLBACK_CONTEXT_LIMIT = 16_000
 
 
 def _select_model(content_length: int) -> Tuple[str, int]:
@@ -88,6 +89,8 @@ class SummarizerRole(BaseRole):
                 model=model,
                 constrained=is_retry,  # Use Ollama native JSON mode on retry
             )
+            if not result or (isinstance(result, dict) and len(result) == 0):
+                raise ValueError(f"Empty summary from {model}")
             return {"summary": result, "success": True, "model_used": model}
         except Exception as e:
             logger.error("Summarization failed with %s: %s", model, e)

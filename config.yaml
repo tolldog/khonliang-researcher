@@ -2,8 +2,30 @@ models:
   summarizer: qwen2.5:7b
   extractor: llama3.2:3b
   assessor: qwen2.5:7b
+  idea_parser: llama3.2:3b
+  embedder: nomic-embed-text
+  reviewer: qwen2.5:32b
+
+model_timeouts:
+  llama3.2:3b: 120
+  qwen2.5:7b: 120
+  qwen2.5:32b: 600
+  gemma4:31b: 600
+  deepseek-r1:32b: 600
+
+relevance_threshold: 0.6
 
 ollama_url: http://localhost:11434
+
+predicate_aliases:
+  applicable_to: applies_to
+  used_for: uses_method
+  achieves: outperforms
+  extends: improves_on
+  based_on: uses_method
+  related: related_to
+  utilizes: uses_method
+  employs: uses_method
 
 feeds_opml: feeds.opml
 
@@ -17,11 +39,15 @@ projects:
       with consensus voting, blackboard coordination, and triple-store knowledge.
       Trades volatile stocks with 5-10% swings using mean reversion.
     scope: trading
+    depends_on: [khonliang]
+    repo: /mnt/dev/ttoll/dev/ollama-roles
   khonliang:
     description: >
       Multi-agent LLM orchestration library with roles, routing, consensus,
       knowledge stores, triple stores, digest synthesis, and MCP server.
     scope: library
+    depends_on: []
+    repo: /mnt/dev/ttoll/ollama-khonliang
   genealogy:
     description: >
       Family history research tool using khonliang. Multi-agent system with
@@ -29,3 +55,13 @@ projects:
       entity resolution, knowledge graph for family relationships, agentic
       RAG for historical records, WebSocket chat with session context.
     scope: genealogy
+    depends_on: [khonliang]
+    repo: /mnt/dev/ttoll/dev/ollama-roles
+  researcher:
+    description: >
+      Automated research pipeline: RSS/search -> fetch -> distill ->
+      concept graph -> synergize -> FR generation. MCP server for
+      project Claudes to consume research insights.
+    scope: research
+    depends_on: [khonliang]
+    repo: /mnt/dev/ttoll/dev/khonliang-researcher

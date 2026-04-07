@@ -1,6 +1,6 @@
 """Concept graph and matrix views over the distilled knowledge base.
 
-Two views of the same data:
+Three views of the same data:
 
 1. **Matrix**: Concepts × Papers — which papers cover which concepts,
    with relationship types and scores. Good for finding coverage gaps.
@@ -9,7 +9,11 @@ Two views of the same data:
    Traverse chains like "GRPO → MAGRPO → C3 → Weight Learning".
    Similar to LinkedIn connection graphs but for research concepts.
 
-Both built from the TripleStore + KnowledgeStore data.
+3. **Project Tags**: Concepts annotated with project relevance scores
+   derived from paper assessments. Shows which concepts matter for
+   which downstream projects (autostock, khonliang, genealogy).
+
+All built from the TripleStore + KnowledgeStore data.
 """
 
 import json
@@ -22,6 +26,64 @@ from khonliang.knowledge.store import KnowledgeStore, Tier
 from khonliang.knowledge.triples import TripleStore
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Project tagging
+# ---------------------------------------------------------------------------
+
+def build_project_scores(
+    knowledge: KnowledgeStore,
+    triples: TripleStore,
+    min_score: float = 0.3,
+) -> Dict[str, Dict[str, float]]:
+    """Build concept → {project: score} mapping from paper assessments.
+
+    Walks: paper assessment scores → triples → concepts.
+    A concept's score for a project = max score across papers it appears in.
+    """
+    # Step 1: paper_id → {project: score} from summary metadata
+    paper_scores: Dict[str, Dict[str, float]] = {}
+    for entry in knowledge.get_by_tier(Tier.DERIVED):
+        if "summary" not in (entry.tags or []):
+            continue
+        assessments = entry.metadata.get("assessments", {})
+        parent_id = entry.metadata.get("parent_id", "")
+        if not parent_id or not assessments:
+            continue
+        scores = {}
+        for project, assessment in assessments.items():
+            if isinstance(assessment, dict):
+                score = float(assessment.get("score", 0))
+                if score >= min_score:
+                    scores[project] = score
+        if scores:
+            paper_scores[f"paper:{parent_id}"] = scores
+
+    # Step 2: propagate to concepts via triples
+    concept_scores: Dict[str, Dict[str, float]] = defaultdict(dict)
+    all_triples = triples.get(min_confidence=0.3, limit=5000)
+
+    for t in all_triples:
+        source = t.source or ""
+        if source not in paper_scores:
+            continue
+        for project, score in paper_scores[source].items():
+            # Both subject and object inherit the paper's project score
+            for concept in (t.subject, t.object):
+                current = concept_scores[concept].get(project, 0)
+                concept_scores[concept][project] = max(current, score)
+
+    return dict(concept_scores)
+
+
+def format_project_tags(scores: Dict[str, float], threshold: float = 0.4) -> str:
+    """Format project scores as compact tags: [autostock:85% khonliang:72%]"""
+    tags = []
+    for project, score in sorted(scores.items(), key=lambda x: -x[1]):
+        if score >= threshold:
+            tags.append(f"{project}:{score:.0%}")
+    return f"[{' '.join(tags)}]" if tags else ""
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +168,20 @@ def build_concept_matrix(
     }
 
 
-def format_matrix(matrix_data: Dict[str, Any], knowledge: KnowledgeStore) -> str:
-    """Format the matrix as readable text."""
+def format_matrix(
+    matrix_data: Dict[str, Any],
+    knowledge: KnowledgeStore,
+    triples: Optional[TripleStore] = None,
+) -> str:
+    """Format the matrix as readable text with project tags."""
     concepts = matrix_data["concepts"]
     matrix = matrix_data["matrix"]
     counts = matrix_data["concept_counts"]
+
+    # Build project scores if triple store available
+    project_scores: Dict[str, Dict[str, float]] = {}
+    if triples:
+        project_scores = build_project_scores(knowledge, triples)
 
     # Resolve paper IDs to titles
     paper_titles = {}
@@ -126,7 +197,11 @@ def format_matrix(matrix_data: Dict[str, Any], knowledge: KnowledgeStore) -> str
 
     for concept in concepts[:30]:
         papers = matrix[concept]
-        lines.append(f"### {concept} ({counts[concept]} papers)")
+        tags = format_project_tags(project_scores.get(concept, {}))
+        header = f"### {concept} ({counts[concept]} papers)"
+        if tags:
+            header += f" {tags}"
+        lines.append(header)
         for paper_id, cell in sorted(papers.items(), key=lambda x: -x[1]["confidence"]):
             title = paper_titles.get(paper_id, paper_id)
             preds = ", ".join(set(cell["predicates"]))
@@ -147,11 +222,14 @@ class ConceptNode:
     paper_count: int = 0
     connections: Dict[str, List[str]] = field(default_factory=dict)
     # connections = {"MAGRPO": ["improves_on"], "consensus": ["applies_to"]}
+    projects: Dict[str, float] = field(default_factory=dict)
+    # projects = {"autostock": 0.85, "khonliang": 0.72}
 
 
 def build_concept_graph(
     triples: TripleStore,
     min_confidence: float = 0.5,
+    knowledge: Optional[KnowledgeStore] = None,
 ) -> Dict[str, ConceptNode]:
     """Build a concept graph from triples.
 
@@ -181,6 +259,13 @@ def build_concept_graph(
             subj_node.paper_count = max(subj_node.paper_count, 1)
             nodes[t.object].paper_count = max(nodes[t.object].paper_count, 1)
 
+    # Annotate with project scores if knowledge store available
+    if knowledge:
+        scores = build_project_scores(knowledge, triples)
+        for concept, proj_scores in scores.items():
+            if concept in nodes:
+                nodes[concept].projects = proj_scores
+
     return nodes
 
 
@@ -207,7 +292,8 @@ def trace_chain(
         else:
             return f"Concept '{start}' not found in graph."
 
-    lines = [start]
+    root_tags = format_project_tags(graph[start].projects)
+    lines = [f"{start} {root_tags}" if root_tags else start]
     visited = {start}
     _trace_recursive(graph, start, lines, visited, "", max_depth, max_branches, 0)
     return "\n".join(lines)
@@ -246,7 +332,10 @@ def _trace_recursive(
         continuation = "    " if is_last else "│   "
 
         pred_str = ", ".join(predicates[:2])
-        lines.append(f"{prefix}{branch}{pred_str} → {target}")
+        target_node = graph.get(target)
+        tags = format_project_tags(target_node.projects) if target_node else ""
+        tag_suffix = f" {tags}" if tags else ""
+        lines.append(f"{prefix}{branch}{pred_str} → {target}{tag_suffix}")
 
         visited.add(target)
         _trace_recursive(
