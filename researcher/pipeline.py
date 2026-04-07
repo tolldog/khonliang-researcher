@@ -898,7 +898,13 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                 meta["project_name"] = meta["project_name"] or data.get("name", "")
                 meta["description"] = meta["description"] or data.get("description", "")
                 meta["dependencies"] = meta["dependencies"] or list(data.get("dependencies", {}).keys())
-                meta["entry_points"] = meta["entry_points"] or list(data.get("bin", {}).keys())
+                if not meta["entry_points"]:
+                    bin_data = data.get("bin", {})
+                    if isinstance(bin_data, dict):
+                        meta["entry_points"] = list(bin_data.keys())
+                    elif isinstance(bin_data, str):
+                        package_name = data.get("name", "") or meta["project_name"]
+                        meta["entry_points"] = [package_name] if package_name else []
                 if meta["ecosystem"] == "unknown":
                     meta["ecosystem"] = "node"
             except (json.JSONDecodeError, Exception):
@@ -1079,7 +1085,8 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                     "url": repo_url,
                     "capabilities": capabilities,
                     "code_capabilities": code_capabilities,
-                    "readme_claims": readme_only,
+                    "readme_claims": readme_claims,
+                    "readme_only_claims": readme_only,
                     "imports_from": imports_from,
                     "architecture": architecture,
                     "package": pkg_meta,
@@ -1124,7 +1131,8 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                 "entry_id": entry_id,
                 "capabilities": capabilities,
                 "code_capabilities": code_capabilities,
-                "readme_claims": readme_only,
+                "readme_claims": readme_claims,
+                "readme_only_claims": readme_only,
                 "imports_from": imports_from,
                 "architecture": architecture,
                 "depth": depth,

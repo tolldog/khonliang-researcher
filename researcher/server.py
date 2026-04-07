@@ -1425,7 +1425,7 @@ Completing an FR automatically records the capability as "exists" for the target
         lines = [header]
         for cap in result.get("code_capabilities", []):
             lines.append(f"  [code] {cap}")
-        for claim in result.get("readme_claims", []):
+        for claim in result.get("readme_only_claims", []):
             lines.append(f"  [readme] {claim}")
         if result.get("imports_from"):
             for dep, items in result["imports_from"].items():

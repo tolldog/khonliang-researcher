@@ -1316,7 +1316,7 @@ def ingest_github(ctx, repo_url, label, depth):
         click.echo(f"\n{result['repo']}: {len(result['capabilities'])} capabilities\n")
         for cap in result.get("code_capabilities", []):
             click.echo(f"  [code] {cap}")
-        for claim in result.get("readme_claims", []):
+        for claim in result.get("readme_only_claims", []):
             click.echo(f"  [readme] {claim}")
         if result.get("imports_from"):
             click.echo()
