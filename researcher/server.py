@@ -33,24 +33,11 @@ def create_research_server(pipeline: ResearchPipeline):
         knowledge_store=pipeline.knowledge,
         triple_store=pipeline.triples,
     )
-    base.guide_tools["research_guide"] = "how to discover, distill, and use research papers"
+    base.add_guide("research_guide", "how to discover, distill, and use research papers")
     mcp = base.create_app()
 
-    synthesizer = Synthesizer(pipeline.knowledge, pipeline.triples, pipeline.pool)
-    worker = DistillWorker(pipeline)
-
-    # ------------------------------------------------------------------
-    # Guide tool
-    # ------------------------------------------------------------------
-
-    @mcp.tool()
-    def research_guide() -> str:
-        """How to discover, distill, and use research papers.
-
-        Covers the full workflow: find → fetch → distill → explore → apply.
-        Call this before using research tools for the first time.
-        """
-        return """# Research Pipeline Guide
+    _RESEARCH_GUIDE = """\
+# Research Pipeline Guide
 
 ## Quick start
 1. `find_papers(query)` — search arxiv + semantic scholar
@@ -122,6 +109,14 @@ Most tools accept detail="compact|brief|full":
 - compact: key=value pairs for agent loops
 - brief: structured one-line-per-item (default)
 - full: rich detail with context"""
+
+    @mcp.tool()
+    async def research_guide() -> str:
+        """how to discover, distill, and use research papers"""
+        return _RESEARCH_GUIDE
+
+    synthesizer = Synthesizer(pipeline.knowledge, pipeline.triples, pipeline.pool)
+    worker = DistillWorker(pipeline)
 
     # ------------------------------------------------------------------
     # Capability tracking helpers
@@ -1423,12 +1418,21 @@ Completing an FR automatically records the capability as "exists" for the target
         if "error" in result:
             return result["error"]
 
-        lines = [f"{result['repo']} | {len(result['capabilities'])} capabilities | depth={result['depth']}"]
-        for cap in result["capabilities"]:
-            lines.append(f"  - {cap}")
+        arch = result.get("architecture", "")
+        header = f"{result['repo']} | {len(result['capabilities'])} capabilities | depth={result['depth']}"
+        if arch:
+            header += f" | {arch}"
+        lines = [header]
+        for cap in result.get("code_capabilities", []):
+            lines.append(f"  [code] {cap}")
+        for claim in result.get("readme_claims", []):
+            lines.append(f"  [readme] {claim}")
         if result.get("imports_from"):
             for dep, items in result["imports_from"].items():
                 lines.append(f"  imports {dep}: {', '.join(items[:3])}")
+        if result.get("relevance_scores"):
+            for proj, score in sorted(result["relevance_scores"].items(), key=lambda x: -x[1]):
+                lines.append(f"  relevance({proj}): {score:.2f}")
         return "\n".join(lines)
 
     @mcp.tool()

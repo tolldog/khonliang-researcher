@@ -309,11 +309,13 @@ Extract capabilities. Each must be:
 - Named in 3-8 words
 
 Also identify what this project imports from its dependencies (not stdlib/pip).
+Identify the primary architecture pattern (e.g., "plugin system", "pipeline", "event-driven", "CLI tool", "MCP server", "library") in 3-8 words.
 
 Respond with JSON:
 {{
   "capabilities": ["Capability Name 1", "Capability Name 2", ...],
-  "imports_from": {{"dependency_name": ["what it uses"]}}
+  "imports_from": {{"dependency_name": ["what it uses"]}},
+  "architecture": "primary pattern in 3-8 words"
 }}
 
 Only output JSON. No other text.
@@ -1018,6 +1020,7 @@ class Synthesizer:
         chunk_size = 20
         all_capabilities = []
         all_imports: Dict[str, list] = {}
+        all_architectures: list[str] = []
         reviewer = self.pool.get_client("reviewer")
 
         for i in range(0, len(lines), chunk_size):
@@ -1048,6 +1051,9 @@ class Synthesizer:
                     all_imports.setdefault(dep, []).extend(
                         i for i in items if i not in all_imports.get(dep, [])
                     )
+                arch = data.get("architecture", "")
+                if arch and arch not in all_architectures:
+                    all_architectures.append(arch)
             except (json.JSONDecodeError, Exception) as e:
                 logger.warning("Scan chunk %d failed for %s: %s",
                                i // chunk_size, project_name, e
@@ -1057,6 +1063,7 @@ class Synthesizer:
         content = json.dumps({
             "capabilities": all_capabilities,
             "imports_from": all_imports,
+            "architecture": all_architectures[0] if all_architectures else "",
         })
         return SynthesisResult(
             query="scan",
