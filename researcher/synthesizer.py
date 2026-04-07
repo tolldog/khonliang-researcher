@@ -363,11 +363,11 @@ class Synthesizer:
         self.pool = pool
 
     def _get_distilled_summaries(
-        self, query: Optional[str] = None, limit: int = 50
+        self, query: Optional[str] = None, limit: Optional[int] = 50
     ) -> List[Dict[str, Any]]:
         """Get distilled paper summaries, optionally filtered by search query."""
         if query:
-            entries = self.knowledge.search(query, scope="research", limit=limit)
+            entries = self.knowledge.search(query, scope="research", limit=limit or 500)
             # Filter to Tier 3 summaries only
             entries = [e for e in entries if e.tier == Tier.DERIVED and "summary" in (e.tags or [])]
         else:
@@ -375,7 +375,9 @@ class Synthesizer:
                 e
                 for e in self.knowledge.get_by_tier(Tier.DERIVED)
                 if "summary" in (e.tags or [])
-            ][:limit]
+            ]
+            if limit:
+                entries = entries[:limit]
 
         summaries = []
         for entry in entries:
@@ -467,7 +469,20 @@ class Synthesizer:
         self, project_name: str, project_description: str, limit: int = 20
     ) -> SynthesisResult:
         """Generate applicability brief for a specific project."""
-        summaries = self._get_distilled_summaries(limit=limit)
+        summaries = self._get_distilled_summaries(limit=None)  # fetch all, filter by score below
+        # Filter to summaries that scored for this project
+        summaries = [
+            s for s in summaries
+            if project_name in s.get("assessments", {})
+            and isinstance(s["assessments"][project_name], dict)
+            and float(s["assessments"][project_name].get("score", 0)) > 0.3
+        ]
+        # Sort by score descending, take top N
+        summaries.sort(
+            key=lambda s: float(s.get("assessments", {}).get(project_name, {}).get("score", 0)),
+            reverse=True,
+        )
+        summaries = summaries[:limit]
         if not summaries:
             return SynthesisResult(
                 query=project_name, synthesis_type="project",

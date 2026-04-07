@@ -769,7 +769,7 @@ def fr_update(ctx, fr_id, status, branch, notes):
         entry.metadata["status_history"] = history
 
     if status == "completed":
-        pipeline.knowledge.set_status(fr_id, EntryStatus.ARCHIVED)
+        entry.status = EntryStatus.ARCHIVED
         entry.tags = [t for t in (entry.tags or []) if t != "fr"] + ["fr:completed"]
 
         target = entry.metadata.get("target", "")

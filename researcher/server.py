@@ -614,7 +614,7 @@ Completing an FR automatically records the capability as "exists" for the target
 
         if status == "completed":
             from khonliang.knowledge.store import EntryStatus
-            pipeline.knowledge.set_status(fr_id, EntryStatus.ARCHIVED)
+            entry.status = EntryStatus.ARCHIVED
             entry.tags = [t for t in (entry.tags or []) if t != "fr"] + ["fr:completed"]
 
             # Record capability as "exists" for the target project
