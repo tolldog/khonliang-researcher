@@ -33,10 +33,95 @@ def create_research_server(pipeline: ResearchPipeline):
         knowledge_store=pipeline.knowledge,
         triple_store=pipeline.triples,
     )
+    base.guide_tools["research_guide"] = "how to discover, distill, and use research papers"
     mcp = base.create_app()
 
     synthesizer = Synthesizer(pipeline.knowledge, pipeline.triples, pipeline.pool)
     worker = DistillWorker(pipeline)
+
+    # ------------------------------------------------------------------
+    # Guide tool
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def research_guide() -> str:
+        """How to discover, distill, and use research papers.
+
+        Covers the full workflow: find → fetch → distill → explore → apply.
+        Call this before using research tools for the first time.
+        """
+        return """# Research Pipeline Guide
+
+## Quick start
+1. `find_papers(query)` — search arxiv + semantic scholar
+2. `fetch_paper(url)` — ingest a paper into the knowledge store
+3. `start_distillation()` — summarize + extract triples + score relevance
+4. `feature_requests(target="your_project")` — see what emerged
+
+## Discovery
+- `find_papers(query, engines="arxiv,semantic_scholar")` — search by keyword
+- `browse_feeds(query, relevant_only=True)` — scan RSS feeds for new posts
+- `research_capabilities(project)` — generate queries from scanned code capabilities
+- `scan_codebase(project)` — AST-scan a project to discover what it already does
+- `ingest_github(repo_url)` — cleanroom-extract concepts from a GitHub repo
+
+## Ingestion
+- `fetch_paper(url)` — single paper (arxiv, HTML, PDF)
+- `fetch_papers_batch(urls)` — comma-separated URLs, concurrent fetch
+- `fetch_paper_list(url)` — parse an awesome-list or bibliography page
+- `ingest_file(path)` — local file (PDF, HTML, Markdown, text)
+- `ingest_idea(text)` — decompose informal text into researchable claims
+
+## Distillation
+- `start_distillation(batch_size)` — process pending queue (0 = all)
+- `distill_paper(entry_id)` — distill a single paper
+- `worker_status()` — check queue depth and progress
+- `reading_list(detail)` — see pending/distilled/failed/skipped counts
+
+Papers below the relevance threshold are auto-skipped.
+Each distilled paper produces: structured summary, relationship triples,
+and per-project applicability scores.
+
+## Exploration
+- `knowledge_search(query)` — full-text search across all stored content
+- `find_relevant(query, project)` — search filtered by project relevance
+- `concept_tree(concept)` — trace a concept's connections as a tree
+- `concept_path(start, end)` — find how two concepts connect
+- `concept_matrix(min_connections)` — entity × document coverage matrix
+- `concepts_for_project(project)` — concepts ranked by project relevance
+- `paper_context(query)` — build rich context for prompt injection
+- `triple_query(subject)` — query the relationship graph directly
+
+## Synthesis
+- `synthesize_topic(topic)` — cross-paper analysis of a theme
+- `synthesize_project(project)` — applicability brief for a project
+- `synthesize_landscape()` — map major directions, trends, gaps
+- `project_landscape(project)` — per-project view with concepts, FRs, capabilities
+
+## Feature Requests
+- `synergize()` — classify concepts and auto-generate FRs
+- `feature_requests(target)` — list FRs for a project
+- `next_fr(target)` — highest priority unblocked FR
+- `review_feature_requests(target)` — deep-review with 32B model
+- `promote_fr(...)` — manually create a vetted FR
+- `fr_workflow()` — full lifecycle protocol (open → planned → completed)
+- `project_capabilities(target)` — what exists vs what's planned
+
+## Ideas Pipeline
+- `ingest_idea(text)` — parse claims + generate search queries
+- `research_idea(idea_id)` — find papers for each claim
+- `brief_idea(idea_id)` — synthesize claim-by-claim assessment
+
+## Evaluation
+- `evaluate_capability(capability)` — assess if a khonliang feature helps researcher
+- `score_relevance(entry_id)` — score a paper against all projects
+- `health_check()` — verify Ollama, models, DB, disk
+
+## detail parameter
+Most tools accept detail="compact|brief|full":
+- compact: key=value pairs for agent loops
+- brief: structured one-line-per-item (default)
+- full: rich detail with context"""
 
     # ------------------------------------------------------------------
     # Capability tracking helpers
