@@ -45,6 +45,48 @@ class DistillResult:
     success: bool = False
 
 
+def update_capability_status(
+    knowledge: KnowledgeStore,
+    target: str,
+    title: str,
+    concept: str,
+    status: str,
+    fr_id: str = "",
+):
+    """Track what exists/is planned per project. Call on FR status changes."""
+    import hashlib
+    cap_id = f"cap_{target}_{hashlib.sha256(title.encode()).hexdigest()[:8]}"
+
+    existing = knowledge.get(cap_id)
+    if existing:
+        existing.metadata["capability_status"] = status
+        if fr_id:
+            existing.metadata["fr_id"] = fr_id
+        if status == "exists":
+            existing.tags = [t for t in (existing.tags or []) if not t.startswith("cap:")] + [
+                "capability", f"cap:{target}", "cap:exists"
+            ]
+        knowledge.add(existing)
+    else:
+        entry = KnowledgeEntry(
+            id=cap_id,
+            tier=Tier.DERIVED,
+            title=title,
+            content=f"{status}: {title}",
+            source="capability_tracker",
+            scope="capability",
+            tags=["capability", f"cap:{target}", f"cap:{status}"],
+            status=EntryStatus.DISTILLED,
+            metadata={
+                "target": target,
+                "concept": concept,
+                "capability_status": status,
+                "fr_id": fr_id,
+            },
+        )
+        knowledge.add(entry)
+
+
 class ResearchPipeline:
     """Main orchestrator for the research paper pipeline."""
 

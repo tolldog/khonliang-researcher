@@ -44,38 +44,8 @@ def create_research_server(pipeline: ResearchPipeline):
 
     def _update_capability_status(target: str, title: str, concept: str, status: str, fr_id: str = ""):
         """Track what exists/is planned per project. Auto-updated on FR status changes."""
-        import hashlib
-        from khonliang.knowledge.store import KnowledgeEntry, EntryStatus
-        cap_id = f"cap_{target}_{hashlib.sha256(title.encode()).hexdigest()[:8]}"
-
-        existing = pipeline.knowledge.get(cap_id)
-        if existing:
-            existing.metadata["capability_status"] = status
-            if fr_id:
-                existing.metadata["fr_id"] = fr_id
-            if status == "exists":
-                existing.tags = [t for t in (existing.tags or []) if not t.startswith("cap:")] + [
-                    "capability", f"cap:{target}", "cap:exists"
-                ]
-            pipeline.knowledge.add(existing)
-        else:
-            entry = KnowledgeEntry(
-                id=cap_id,
-                tier=Tier.DERIVED,
-                title=title,
-                content=f"{status}: {title}",
-                source="capability_tracker",
-                scope="capability",
-                tags=["capability", f"cap:{target}", f"cap:{status}"],
-                status=EntryStatus.DISTILLED,
-                metadata={
-                    "target": target,
-                    "concept": concept,
-                    "capability_status": status,
-                    "fr_id": fr_id,
-                },
-            )
-            pipeline.knowledge.add(entry)
+        from researcher.pipeline import update_capability_status
+        update_capability_status(pipeline.knowledge, target, title, concept, status, fr_id)
 
     # ------------------------------------------------------------------
     # Custom research tools
@@ -917,7 +887,7 @@ Completing an FR automatically records the capability as "exists" for the target
 
         # Archive the merged FRs
         for entry in merged_entries:
-            pipeline.knowledge.set_status(entry.id, EntryStatus.ARCHIVED)
+            entry.status = EntryStatus.ARCHIVED
             entry.tags = [t for t in (entry.tags or []) if t != "fr"] + ["fr:archived", f"merged_into:{keep_id}"]
             pipeline.knowledge.add(entry)
 

@@ -768,12 +768,17 @@ def fr_update(ctx, fr_id, status, branch, notes):
         history.append({"status": status, "notes": notes, "at": time.strftime("%Y-%m-%d %H:%M")})
         entry.metadata["status_history"] = history
 
+    from researcher.pipeline import update_capability_status
+
+    target = entry.metadata.get("target", "")
+    concept = entry.metadata.get("concept", "")
+
     if status == "completed":
         entry.status = EntryStatus.ARCHIVED
         entry.tags = [t for t in (entry.tags or []) if t != "fr"] + ["fr:completed"]
 
-        target = entry.metadata.get("target", "")
         if target:
+            update_capability_status(pipeline.knowledge, target, entry.title, concept, "exists", fr_id)
             click.echo(f"Completed: {entry.title}")
             # Check for unblocked FRs
             unblocked = []
@@ -788,6 +793,8 @@ def fr_update(ctx, fr_id, status, branch, notes):
                 for title in unblocked:
                     click.echo(f"  - {title}")
     else:
+        if target and status in ("planned", "in_progress"):
+            update_capability_status(pipeline.knowledge, target, entry.title, concept, "planned", fr_id)
         click.echo(f"{entry.title}: {prev_status} → {status}")
         if branch:
             click.echo(f"Branch: {branch}")
@@ -989,7 +996,7 @@ def fr_merge(ctx, keep_id, merge_ids, title, description):
     pipeline.knowledge.add(keep_entry)
 
     for entry in merged_entries:
-        pipeline.knowledge.set_status(entry.id, EntryStatus.ARCHIVED)
+        entry.status = EntryStatus.ARCHIVED
         entry.tags = [t for t in (entry.tags or []) if t != "fr"] + ["fr:archived", f"merged_into:{keep_id}"]
         pipeline.knowledge.add(entry)
 
