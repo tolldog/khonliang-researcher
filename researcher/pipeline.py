@@ -54,18 +54,33 @@ def update_capability_status(
     status: str,
     fr_id: str = "",
 ):
-    """Track what exists/is planned per project. Call on FR status changes."""
+    """Track what exists/is planned per project. Call on FR status changes.
+
+    Status is monotonic: 'exists' is never downgraded to 'planned'.
+    Tags and content are kept in sync with the resolved status.
+    """
+    def _resolve(current: str, new: str) -> str:
+        if current == "exists" or new == "exists":
+            return "exists"
+        return new
+
     cap_id = f"cap_{target}_{hashlib.sha256(title.encode()).hexdigest()[:8]}"
 
     existing = knowledge.get(cap_id)
     if existing:
-        existing.metadata["capability_status"] = status
+        metadata = existing.metadata or {}
+        resolved = _resolve(metadata.get("capability_status", ""), status)
+        metadata["target"] = target
+        metadata["concept"] = concept
+        metadata["capability_status"] = resolved
         if fr_id:
-            existing.metadata["fr_id"] = fr_id
-        if status == "exists":
-            existing.tags = [t for t in (existing.tags or []) if not t.startswith("cap:")] + [
-                "capability", f"cap:{target}", "cap:exists"
-            ]
+            metadata["fr_id"] = fr_id
+        existing.metadata = metadata
+        existing.content = f"{resolved}: {title}"
+        existing.tags = [
+            t for t in (existing.tags or [])
+            if not t.startswith("cap:") and t != "capability"
+        ] + ["capability", f"cap:{target}", f"cap:{resolved}"]
         knowledge.add(existing)
     else:
         entry = KnowledgeEntry(
