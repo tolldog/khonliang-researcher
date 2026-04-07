@@ -25,7 +25,7 @@ import sys
 
 import click
 
-from researcher.pipeline import create_pipeline
+from researcher.pipeline import create_pipeline, update_capability_status
 
 
 def _run(coro):
@@ -767,8 +767,6 @@ def fr_update(ctx, fr_id, status, branch, notes):
         history = entry.metadata.get("status_history", [])
         history.append({"status": status, "notes": notes, "at": time.strftime("%Y-%m-%d %H:%M")})
         entry.metadata["status_history"] = history
-
-    from researcher.pipeline import update_capability_status
 
     target = entry.metadata.get("target", "")
     concept = entry.metadata.get("concept", "")

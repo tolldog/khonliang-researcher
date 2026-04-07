@@ -9,6 +9,7 @@ Orchestrates khonliang components:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -54,7 +55,6 @@ def update_capability_status(
     fr_id: str = "",
 ):
     """Track what exists/is planned per project. Call on FR status changes."""
-    import hashlib
     cap_id = f"cap_{target}_{hashlib.sha256(title.encode()).hexdigest()[:8]}"
 
     existing = knowledge.get(cap_id)
