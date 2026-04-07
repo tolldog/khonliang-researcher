@@ -136,9 +136,14 @@ class ResearchPipeline:
             logger.info("Paper already ingested: %s", url)
             return self._url_index[url]
 
-        # Normalize arxiv URLs
+        # Normalize arxiv URLs to canonical form for dedup
         arxiv_id = extract_arxiv_id(url)
+        canonical_url = url
         if arxiv_id:
+            canonical_url = f"https://arxiv.org/abs/{arxiv_id}"
+            if canonical_url in self._url_index:
+                logger.info("Paper already ingested (arxiv %s): %s", arxiv_id, url)
+                return self._url_index[canonical_url]
             result = await fetch_arxiv(url)
         else:
             result = await fetch_url(url)
@@ -147,9 +152,9 @@ class ResearchPipeline:
             logger.warning("Empty content from %s", url)
             return None
 
-        # Store as Tier 2
+        # Store as Tier 2 — use canonical URL for consistent IDs
         import hashlib
-        entry_id = hashlib.sha256(url.encode()).hexdigest()[:16]
+        entry_id = hashlib.sha256(canonical_url.encode()).hexdigest()[:16]
 
         entry = KnowledgeEntry(
             id=entry_id,
@@ -167,7 +172,9 @@ class ResearchPipeline:
             },
         )
         self.knowledge.add(entry)
-        self._url_index[url] = entry_id
+        self._url_index[canonical_url] = entry_id
+        if url != canonical_url:
+            self._url_index[url] = entry_id
 
         self.digest.record(
             summary=f"Ingested paper: {result.title or url}",
@@ -706,7 +713,15 @@ class ResearchPipeline:
                     except Exception:
                         pass
 
-                fr_id = f"fr_{fr['target']}_{fr_count}"
+                import hashlib
+                fr_id = f"fr_{fr['target']}_{hashlib.sha256(fr['title'].encode()).hexdigest()[:8]}"
+
+                # Don't overwrite existing FRs (preserves reviews, deps, status history)
+                existing = self.knowledge.get(fr_id)
+                if existing:
+                    skipped += 1
+                    continue
+
                 fr_entry = KnowledgeEntry(
                     id=fr_id,
                     tier=Tier.DERIVED,

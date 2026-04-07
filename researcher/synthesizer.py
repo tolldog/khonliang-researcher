@@ -467,7 +467,20 @@ class Synthesizer:
         self, project_name: str, project_description: str, limit: int = 20
     ) -> SynthesisResult:
         """Generate applicability brief for a specific project."""
-        summaries = self._get_distilled_summaries(limit=limit)
+        summaries = self._get_distilled_summaries(limit=limit * 3)
+        # Filter to summaries that scored for this project
+        summaries = [
+            s for s in summaries
+            if project_name in s.get("assessments", {})
+            and isinstance(s["assessments"][project_name], dict)
+            and float(s["assessments"][project_name].get("score", 0)) > 0.3
+        ]
+        # Sort by score descending, take top N
+        summaries.sort(
+            key=lambda s: float(s.get("assessments", {}).get(project_name, {}).get("score", 0)),
+            reverse=True,
+        )
+        summaries = summaries[:limit]
         if not summaries:
             return SynthesisResult(
                 query=project_name, synthesis_type="project",
