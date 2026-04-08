@@ -1314,12 +1314,18 @@ def ingest_github(ctx, repo_url, label, depth):
             return
 
         click.echo(f"\n{result['repo']}: {len(result['capabilities'])} capabilities\n")
-        for cap in result["capabilities"]:
-            click.echo(f"  - {cap}")
+        for cap in result.get("code_capabilities", []):
+            click.echo(f"  [code] {cap}")
+        for claim in result.get("readme_only_claims", []):
+            click.echo(f"  [readme] {claim}")
         if result.get("imports_from"):
             click.echo()
             for dep, items in result["imports_from"].items():
                 click.echo(f"  Imports {dep}: {', '.join(items[:5])}")
+        if result.get("relevance_scores"):
+            click.echo()
+            for proj, score in sorted(result["relevance_scores"].items(), key=lambda x: -x[1]):
+                click.echo(f"  Relevance({proj}): {score:.2f}")
 
     _run(_ingest())
 

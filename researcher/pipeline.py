@@ -831,6 +831,111 @@ class ResearchPipeline:
             "concept_count": len(classifications),
         }
 
+    _README_CLAIMS_PROMPT = """\
+Extract capability claims from the following README. List only concrete, specific \
+features that this project claims to implement. Do not list generic descriptions. \
+Each capability name should be 3-8 words describing what the project does.
+
+README:
+{readme_text}
+
+Respond with JSON only. The "claims" array must contain capabilities found in the README above.
+{{"claims": ["capability from readme", ...]}}
+"""
+
+    async def _extract_readme_claims(self, readme: str) -> list:
+        """Extract capability claims from README text using the extractor model."""
+        client = self.pool.get_client("extractor")
+        prompt = self._README_CLAIMS_PROMPT.format(readme_text=readme[:2000])
+        try:
+            raw = await client.generate(
+                prompt=prompt,
+                system="Extract capabilities. Output only JSON.",
+                temperature=0.1,
+                max_tokens=1000,
+            )
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = "\n".join(raw.split("\n")[1:])
+            if raw.endswith("```"):
+                raw = "\n".join(raw.split("\n")[:-1])
+            return json.loads(raw).get("claims", [])
+        except Exception:
+            return []
+
+    @staticmethod
+    def _extract_package_metadata(repo_path: Path) -> Dict[str, Any]:
+        """Extract project metadata from package config files."""
+        meta: Dict[str, Any] = {
+            "project_name": "", "description": "", "dependencies": [],
+            "entry_points": [], "mcp_tools": [], "ecosystem": "unknown",
+        }
+
+        # pyproject.toml
+        pyproject = repo_path / "pyproject.toml"
+        if pyproject.exists():
+            import tomllib
+            try:
+                with open(pyproject, "rb") as f:
+                    data = tomllib.load(f)
+                proj = data.get("project", {})
+                meta["project_name"] = proj.get("name", "")
+                meta["description"] = proj.get("description", "")
+                meta["dependencies"] = [
+                    d.split(">")[0].split("<")[0].split("=")[0].split("[")[0].strip()
+                    for d in proj.get("dependencies", [])
+                ]
+                meta["entry_points"] = list(proj.get("scripts", {}).keys())
+                meta["ecosystem"] = "python"
+            except Exception:
+                pass
+
+        # package.json
+        pkg_json = repo_path / "package.json"
+        if pkg_json.exists():
+            try:
+                data = json.loads(pkg_json.read_text(errors="replace"))
+                meta["project_name"] = meta["project_name"] or data.get("name", "")
+                meta["description"] = meta["description"] or data.get("description", "")
+                meta["dependencies"] = meta["dependencies"] or list(data.get("dependencies", {}).keys())
+                if not meta["entry_points"]:
+                    bin_data = data.get("bin", {})
+                    if isinstance(bin_data, dict):
+                        meta["entry_points"] = list(bin_data.keys())
+                    elif isinstance(bin_data, str):
+                        package_name = data.get("name", "") or meta["project_name"]
+                        meta["entry_points"] = [package_name] if package_name else []
+                if meta["ecosystem"] == "unknown":
+                    meta["ecosystem"] = "node"
+            except (json.JSONDecodeError, Exception):
+                pass
+
+        # setup.py fallback
+        if meta["ecosystem"] == "unknown":
+            setup_py = repo_path / "setup.py"
+            if setup_py.exists():
+                import re
+                meta["ecosystem"] = "python"
+                text = setup_py.read_text(errors="replace")[:3000]
+                m = re.search(r'name\s*=\s*["\']([^"\']+)', text)
+                if m:
+                    meta["project_name"] = m.group(1)
+                m = re.search(r'description\s*=\s*["\']([^"\']+)', text)
+                if m:
+                    meta["description"] = m.group(1)
+
+        # MCP config files
+        for mcp_file in ["mcp.json", ".mcp", "claude_desktop_config.json"]:
+            p = repo_path / mcp_file
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text(errors="replace"))
+                    meta["mcp_tools"] = list(data.get("tools", {}).keys())
+                except Exception:
+                    pass
+
+        return meta
+
     async def ingest_github_repo(
         self, repo_url: str, label: str = "", depth: str = "readme+code",
     ) -> Dict[str, Any]:
@@ -868,6 +973,11 @@ class ResearchPipeline:
 
             repo_path = Path(tmp_dir)
 
+            # Extract package metadata
+            pkg_meta = self._extract_package_metadata(repo_path)
+            if not label and pkg_meta["description"]:
+                label = pkg_meta["description"]
+
             # Read README
             readme = ""
             for name in ["README.md", "readme.md", "README.rst", "README"]:
@@ -876,9 +986,14 @@ class ResearchPipeline:
                     readme = p.read_text(errors="replace")[:4000]
                     break
 
-            capabilities = []
+            code_capabilities = []
+            readme_claims = []
             imports_from = {}
             architecture = ""
+
+            # Extract README claims via LLM
+            if readme:
+                readme_claims = await self._extract_readme_claims(readme)
 
             if depth in ("readme+code", "full"):
                 # AST scan — same as scan_codebase but on temp dir
@@ -887,6 +1002,7 @@ class ResearchPipeline:
                     project_name=repo_key,
                     repo_path=str(repo_path),
                     description=label or readme[:500],
+                    dependencies=", ".join(pkg_meta["dependencies"][:15]),
                 )
                 if result.success:
                     content = result.content.strip()
@@ -896,10 +1012,44 @@ class ResearchPipeline:
                         content = "\n".join(content.split("\n")[:-1])
                     try:
                         scan_data = json.loads(content)
-                        capabilities = scan_data.get("capabilities", [])
+                        code_capabilities = scan_data.get("capabilities", [])
                         imports_from = scan_data.get("imports_from", {})
+                        architecture = scan_data.get("architecture", "")
                     except json.JSONDecodeError:
                         pass
+
+            # Scan documentation files for full depth
+            doc_summary = ""
+            if depth == "full":
+                doc_files = []
+                for doc_name in ["ARCHITECTURE.md", "CONTRIBUTING.md", "API.md", "DESIGN.md"]:
+                    p = repo_path / doc_name
+                    if p.exists():
+                        doc_files.append((doc_name, p.read_text(errors="replace")[:3000]))
+                docs_dir = repo_path / "docs"
+                if docs_dir.is_dir():
+                    for doc_path in sorted(docs_dir.rglob("*.md"))[:10]:
+                        rel = doc_path.relative_to(repo_path)
+                        doc_files.append((str(rel), doc_path.read_text(errors="replace")[:2000]))
+                if doc_files:
+                    doc_texts = [f"--- {name} ---\n{content}" for name, content in doc_files[:8]]
+                    combined = "\n\n".join(doc_texts)[:8000]
+                    client = self.pool.get_client("extractor")
+                    try:
+                        doc_summary = await client.generate(
+                            prompt=f"Summarize the key technical decisions, patterns, and capabilities described in these project documents:\n\n{combined}",
+                            system="Summarize technical documentation concisely. Focus on architecture, APIs, and design decisions.",
+                            temperature=0.1,
+                            max_tokens=1000,
+                        )
+                        doc_summary = doc_summary.strip()
+                    except Exception:
+                        pass
+
+            # Merge capabilities: code-verified first, then README-only claims
+            code_set = {c.lower() for c in code_capabilities}
+            readme_only = [c for c in readme_claims if c.lower() not in code_set]
+            capabilities = code_capabilities + readme_only
 
             # Build concept summary (no code stored)
             summary_parts = [f"GitHub: {repo_key}"]
@@ -913,6 +1063,12 @@ class ResearchPipeline:
                 summary_parts.append(f"Capabilities: {', '.join(capabilities)}")
             if architecture:
                 summary_parts.append(f"Architecture: {architecture}")
+            if pkg_meta["entry_points"]:
+                summary_parts.append(f"Entry points: {', '.join(pkg_meta['entry_points'])}")
+            if pkg_meta["mcp_tools"]:
+                summary_parts.append(f"MCP tools: {', '.join(pkg_meta['mcp_tools'])}")
+            if doc_summary:
+                summary_parts.append(f"Documentation: {doc_summary[:1000]}")
 
             # Store as knowledge entry
             entry = KnowledgeEntry(
@@ -928,19 +1084,37 @@ class ResearchPipeline:
                     "repo": repo_key,
                     "url": repo_url,
                     "capabilities": capabilities,
+                    "code_capabilities": code_capabilities,
+                    "readme_claims": readme_claims,
+                    "readme_only_claims": readme_only,
                     "imports_from": imports_from,
+                    "architecture": architecture,
+                    "package": pkg_meta,
+                    "doc_summary": doc_summary or None,
                     "depth": depth,
                 },
             )
             self.knowledge.add(entry)
 
-            # Store triples
-            for cap in capabilities:
+            # Score relevance against configured projects
+            scores = await self.score_relevance(entry_id)
+
+            # Store triples — differentiate code-verified vs README claims
+            readme_set = {c.lower() for c in readme_claims}
+            for cap in code_capabilities:
                 self.triples.add(
                     subject=repo_key,
                     predicate="implements",
                     obj=cap,
-                    confidence=0.8,
+                    confidence=0.95 if cap.lower() in readme_set else 0.85,
+                    source=f"github:{repo_key}",
+                )
+            for claim in readme_only:
+                self.triples.add(
+                    subject=repo_key,
+                    predicate="claims",
+                    obj=claim,
+                    confidence=0.6,
                     source=f"github:{repo_key}",
                 )
 
@@ -956,8 +1130,13 @@ class ResearchPipeline:
                 "repo": repo_key,
                 "entry_id": entry_id,
                 "capabilities": capabilities,
+                "code_capabilities": code_capabilities,
+                "readme_claims": readme_claims,
+                "readme_only_claims": readme_only,
                 "imports_from": imports_from,
+                "architecture": architecture,
                 "depth": depth,
+                "relevance_scores": scores,
             }
 
         finally:
