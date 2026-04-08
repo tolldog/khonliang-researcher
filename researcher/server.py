@@ -1209,14 +1209,17 @@ Completing an FR automatically records the capability as "exists" for the target
 
     @mcp.tool()
     async def synergize_compare(min_score: float = 0.5, max_concepts: int = 10) -> str:
-        """Compare self-distillation candidates. Shows diversity metrics across N synergize outputs.
+        """Compare self-distillation candidates. Shows per-candidate concept/FR counts and
+        diversity metrics (overlap ratios) across N synergize outputs.
 
         Generates N candidates in parallel, selects the best, and reports
-        concept/FR overlap to evaluate distillation quality.
+        summary statistics. Does not return full candidate texts (use synergize
+        directly for the selected output).
         """
         result = await pipeline.synergize_compare(min_score=min_score, max_concepts=max_concepts)
         if "error" in result:
-            return f"Error: {result['error']}"
+            raw = result.get("raw", "")
+            return f"Error: {result['error']}\n{raw[:500]}" if raw else f"Error: {result['error']}"
 
         lines = [f"Selected candidate {result['selected']} of {result['n_candidates']}"]
         for c in result["candidates"]:

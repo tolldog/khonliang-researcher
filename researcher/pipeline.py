@@ -885,11 +885,13 @@ class ResearchPipeline:
                 raw = "\n".join(raw.split("\n")[:-1])
             try:
                 items = json.loads(raw)
-                concepts = {item.get("concept", "").lower() for item in items}
+                concepts = {item.get("concept", "").lower() for item in items} - {""}
                 fr_titles = set()
                 for item in items:
                     for fr in item.get("feature_requests", []):
-                        fr_titles.add(fr.get("title", "").lower())
+                        title = fr.get("title", "").lower()
+                        if title:
+                            fr_titles.add(title)
                 all_concepts.append(concepts)
                 all_fr_titles.append(fr_titles)
                 parsed.append({
@@ -903,7 +905,7 @@ class ResearchPipeline:
                 all_fr_titles.append(set())
                 parsed.append({"candidate": i + 1, "valid": False})
 
-        # Compute pairwise concept overlap
+        # Compute global concept and FR overlap across all candidates
         union_concepts = set().union(*all_concepts) if all_concepts else set()
         intersection_concepts = all_concepts[0].copy() if all_concepts else set()
         for s in all_concepts[1:]:

@@ -501,7 +501,7 @@ class Synthesizer:
             if 0 <= choice < len(candidates):
                 selected = choice
                 logger.info("Self-distillation: selected candidate %d", selected + 1)
-        except (ValueError, IndexError):
+        except ValueError:
             logger.warning("Self-distillation: could not parse selection '%s', using candidate 1", choice_raw.strip())
 
         if compare:
