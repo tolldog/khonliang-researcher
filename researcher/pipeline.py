@@ -885,11 +885,14 @@ class ResearchPipeline:
                 raw = "\n".join(raw.split("\n")[:-1])
             try:
                 items = json.loads(raw)
-                concepts = {item.get("concept", "").lower() for item in items} - {""}
+                concepts = set()
                 fr_titles = set()
                 for item in items:
+                    concept = str(item.get("concept") or "").strip().lower()
+                    if concept:
+                        concepts.add(concept)
                     for fr in item.get("feature_requests", []):
-                        title = fr.get("title", "").lower()
+                        title = str(fr.get("title") or "").strip().lower()
                         if title:
                             fr_titles.add(title)
                 all_concepts.append(concepts)
