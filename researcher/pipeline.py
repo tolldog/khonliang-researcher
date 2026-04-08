@@ -712,11 +712,13 @@ class ResearchPipeline:
 
         synth = Synthesizer(self.knowledge, self.triples, self.pool)
         projects = self.config.get("projects", {})
+        n_samples = self.config.get("synergize_samples", 1)
 
         result = await synth.synergize(
             projects=projects,
             min_score=min_score,
             max_concepts=max_concepts,
+            n_samples=n_samples,
         )
 
         if not result.success:
@@ -829,6 +831,101 @@ class ResearchPipeline:
             "classifications": classifications,
             "fr_count": fr_count,
             "concept_count": len(classifications),
+        }
+
+    async def synergize_compare(
+        self, min_score: float = 0.5, max_concepts: int = 10
+    ) -> Dict[str, Any]:
+        """Run synergize in compare mode: return all candidates with diversity metrics.
+
+        Generates N candidates and returns them all with the model's selection
+        and concept overlap statistics for evaluating self-distillation quality.
+        """
+        from researcher.synthesizer import Synthesizer
+
+        synth = Synthesizer(self.knowledge, self.triples, self.pool)
+        projects = self.config.get("projects", {})
+        n_samples = self.config.get("synergize_samples", 3)
+
+        result = await synth.synergize(
+            projects=projects,
+            min_score=min_score,
+            max_concepts=max_concepts,
+            n_samples=max(n_samples, 2),
+            compare=True,
+        )
+
+        if not result.success:
+            return {"error": result.content}
+
+        # Parse the compare envelope
+        content = result.content.strip()
+        if content.startswith("```"):
+            content = "\n".join(content.split("\n")[1:])
+        if content.endswith("```"):
+            content = "\n".join(content.split("\n")[:-1])
+
+        try:
+            envelope = json.loads(content)
+        except json.JSONDecodeError:
+            return {"error": "Could not parse compare output", "raw": result.content}
+
+        selected = envelope.get("selected", 1)
+        candidates = envelope.get("candidates", [])
+
+        # Parse each candidate and compute diversity metrics
+        parsed = []
+        all_concepts: list[set] = []
+        all_fr_titles: list[set] = []
+        for i, raw in enumerate(candidates):
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = "\n".join(raw.split("\n")[1:])
+            if raw.endswith("```"):
+                raw = "\n".join(raw.split("\n")[:-1])
+            try:
+                items = json.loads(raw)
+                concepts = {item.get("concept", "").lower() for item in items}
+                fr_titles = set()
+                for item in items:
+                    for fr in item.get("feature_requests", []):
+                        fr_titles.add(fr.get("title", "").lower())
+                all_concepts.append(concepts)
+                all_fr_titles.append(fr_titles)
+                parsed.append({
+                    "candidate": i + 1,
+                    "concepts": len(concepts),
+                    "frs": len(fr_titles),
+                    "valid": True,
+                })
+            except json.JSONDecodeError:
+                all_concepts.append(set())
+                all_fr_titles.append(set())
+                parsed.append({"candidate": i + 1, "valid": False})
+
+        # Compute pairwise concept overlap
+        union_concepts = set().union(*all_concepts) if all_concepts else set()
+        intersection_concepts = all_concepts[0].copy() if all_concepts else set()
+        for s in all_concepts[1:]:
+            intersection_concepts &= s
+
+        union_frs = set().union(*all_fr_titles) if all_fr_titles else set()
+        intersection_frs = all_fr_titles[0].copy() if all_fr_titles else set()
+        for s in all_fr_titles[1:]:
+            intersection_frs &= s
+
+        return {
+            "selected": selected,
+            "n_candidates": len(candidates),
+            "candidates": parsed,
+            "diversity": {
+                "unique_concepts": len(union_concepts),
+                "shared_concepts": len(intersection_concepts),
+                "concept_overlap": len(intersection_concepts) / max(len(union_concepts), 1),
+                "unique_frs": len(union_frs),
+                "shared_frs": len(intersection_frs),
+                "fr_overlap": len(intersection_frs) / max(len(union_frs), 1),
+            },
         }
 
     _README_CLAIMS_PROMPT = """\

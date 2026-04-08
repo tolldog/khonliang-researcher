@@ -1208,6 +1208,30 @@ Completing an FR automatically records the capability as "exists" for the target
         return "\n".join(lines)
 
     @mcp.tool()
+    async def synergize_compare(min_score: float = 0.5, max_concepts: int = 10) -> str:
+        """Compare self-distillation candidates. Shows diversity metrics across N synergize outputs.
+
+        Generates N candidates in parallel, selects the best, and reports
+        concept/FR overlap to evaluate distillation quality.
+        """
+        result = await pipeline.synergize_compare(min_score=min_score, max_concepts=max_concepts)
+        if "error" in result:
+            return f"Error: {result['error']}"
+
+        lines = [f"Selected candidate {result['selected']} of {result['n_candidates']}"]
+        for c in result["candidates"]:
+            status = f"{c['concepts']} concepts, {c['frs']} FRs" if c["valid"] else "parse error"
+            marker = " <-" if c["candidate"] == result["selected"] else ""
+            lines.append(f"  #{c['candidate']}: {status}{marker}")
+
+        d = result["diversity"]
+        lines.append(f"\nDiversity:")
+        lines.append(f"  concepts: {d['unique_concepts']} unique, {d['shared_concepts']} shared ({d['concept_overlap']:.0%} overlap)")
+        lines.append(f"  FRs: {d['unique_frs']} unique, {d['shared_frs']} shared ({d['fr_overlap']:.0%} overlap)")
+
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def review_feature_requests(target: str = "", detail: str = "brief") -> str:
         """Review FRs with 32B model. detail='brief' or 'full'."""
         results = await pipeline.review_frs(target=target or None)

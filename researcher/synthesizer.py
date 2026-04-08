@@ -346,6 +346,21 @@ Paper summaries:
 """
 
 
+_SELECTION_PROMPT = """\
+You are evaluating {n} candidate outputs for the same synthesis task.
+Select the BEST candidate based on:
+1. Concept diversity — covers distinct, non-overlapping ideas
+2. FR quality — specific, well-scoped, actionable feature requests
+3. Correct scoping — library vs app classification is accurate
+4. Novelty — proposes genuinely new capabilities, not restatements
+
+CANDIDATES:
+{candidates}
+
+Respond with ONLY the number of the best candidate (1-{n}). No other text.
+"""
+
+
 @dataclass
 class SynthesisResult:
     query: str
@@ -431,15 +446,72 @@ class Synthesizer:
 
         return "\n\n".join(parts)
 
-    async def _generate(self, prompt: str) -> str:
-        """Run LLM generation via the summarizer model."""
+    async def _generate(
+        self, prompt: str, n_samples: int = 1, compare: bool = False,
+    ) -> str:
+        """Run LLM generation via the summarizer model.
+
+        When n_samples > 1, generates N candidates in parallel at higher
+        temperature and uses the same model to select the best one
+        (self-distillation).
+
+        When compare=True, returns JSON with all candidates and selection
+        metadata for quality evaluation.
+        """
+        import asyncio
+
         client = self.pool.get_client("summarizer")
-        return await client.generate(
-            prompt=prompt,
-            system=_SYNTHESIS_SYSTEM,
-            temperature=0.3,
-            max_tokens=6000,
+
+        if n_samples <= 1 and not compare:
+            return await client.generate(
+                prompt=prompt,
+                system=_SYNTHESIS_SYSTEM,
+                temperature=0.3,
+                max_tokens=6000,
+            )
+
+        # Sample N candidates in parallel at higher temperature for diversity
+        async def _sample():
+            return await client.generate(
+                prompt=prompt,
+                system=_SYNTHESIS_SYSTEM,
+                temperature=0.7,
+                max_tokens=6000,
+            )
+
+        n = max(n_samples, 2) if compare else n_samples
+        candidates = list(await asyncio.gather(*[_sample() for _ in range(n)]))
+        logger.info("Self-distillation: generated %d candidates, selecting best", len(candidates))
+
+        # Ask same model to select the best candidate
+        candidate_text = "\n\n".join(
+            f"=== CANDIDATE {i + 1} ===\n{c}" for i, c in enumerate(candidates)
         )
+        choice_raw = await client.generate(
+            prompt=_SELECTION_PROMPT.format(n=len(candidates), candidates=candidate_text),
+            system="Select the best candidate. Output only the number.",
+            temperature=0.1,
+            max_tokens=10,
+        )
+
+        # Parse selection, fallback to first candidate
+        selected = 0
+        try:
+            choice = int(choice_raw.strip()) - 1
+            if 0 <= choice < len(candidates):
+                selected = choice
+                logger.info("Self-distillation: selected candidate %d", selected + 1)
+        except (ValueError, IndexError):
+            logger.warning("Self-distillation: could not parse selection '%s', using candidate 1", choice_raw.strip())
+
+        if compare:
+            import json as _json
+            return _json.dumps({
+                "selected": selected + 1,
+                "candidates": candidates,
+            })
+
+        return candidates[selected]
 
     async def topic_summary(
         self, topic: str, limit: int = 30
@@ -630,6 +702,8 @@ class Synthesizer:
         min_score: float = 0.5,
         min_projects: int = 1,
         max_concepts: int = 10,
+        n_samples: int = 1,
+        compare: bool = False,
     ) -> SynthesisResult:
         """Classify research concepts and generate targeted FRs.
 
@@ -780,7 +854,7 @@ class Synthesizer:
             summaries=formatted_summaries,
         )
 
-        content = await self._generate(prompt)
+        content = await self._generate(prompt, n_samples=n_samples, compare=compare)
 
         return SynthesisResult(
             query="synergize",
