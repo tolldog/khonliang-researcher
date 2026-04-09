@@ -11,7 +11,7 @@ Three views of the same data:
 
 3. **Project Tags**: Concepts annotated with project relevance scores
    derived from paper assessments. Shows which concepts matter for
-   which downstream projects (autostock, khonliang, genealogy).
+   which downstream projects (khonliang, developer, genealogy).
 
 All built from the TripleStore + KnowledgeStore data.
 """
@@ -78,7 +78,7 @@ def build_project_scores(
 
 
 def format_project_tags(scores: Dict[str, float], threshold: float = 0.4) -> str:
-    """Format project scores as compact tags: [autostock:85% khonliang:72%]"""
+    """Format project scores as compact tags: [developer:85% khonliang:72%]"""
     tags = []
     for project, score in sorted(scores.items(), key=lambda x: -x[1]):
         if score >= threshold:
@@ -223,7 +223,7 @@ class ConceptNode:
     connections: Dict[str, List[str]] = field(default_factory=dict)
     # connections = {"MAGRPO": ["improves_on"], "consensus": ["applies_to"]}
     projects: Dict[str, float] = field(default_factory=dict)
-    # projects = {"autostock": 0.85, "khonliang": 0.72}
+    # projects = {"developer": 0.85, "khonliang": 0.72}
 
 
 def build_concept_graph(

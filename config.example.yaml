@@ -1,3 +1,10 @@
+# khonliang-researcher config — example template
+#
+# Copy this file to config.yaml and edit the paths and project entries
+# for your environment. The actual config.yaml is git-ignored because
+# it contains absolute, machine-specific paths and may reference private
+# projects that should not be checked in.
+
 models:
   summarizer: qwen2.5:7b
   extractor: llama3.2:3b
@@ -33,23 +40,16 @@ feeds_opml: feeds.opml
 
 db_path: data/researcher.db
 
+# Projects this researcher instance scores papers against. Edit the
+# `repo` paths to match your local checkout layout.
 projects:
-  autostock:
-    description: >
-      Multi-agent trading system using khonliang for orchestration.
-      6 specialist agents (quant, risk, macro, sentiment, compliance, execution)
-      with consensus voting, blackboard coordination, and triple-store knowledge.
-      Trades volatile stocks with 5-10% swings using mean reversion.
-    scope: trading
-    depends_on: [khonliang]
-    repo: /mnt/dev/ttoll/dev/ollama-roles
   khonliang:
     description: >
       Multi-agent LLM orchestration library with roles, routing, consensus,
       knowledge stores, triple stores, digest synthesis, and MCP server.
     scope: library
     depends_on: []
-    repo: /mnt/dev/ttoll/ollama-khonliang
+    repo: /path/to/ollama-khonliang
   genealogy:
     description: >
       Family history research tool using khonliang. Multi-agent system with
@@ -58,7 +58,7 @@ projects:
       RAG for historical records, WebSocket chat with session context.
     scope: genealogy
     depends_on: [khonliang]
-    repo: /mnt/dev/ttoll/dev/ollama-roles
+    repo: /path/to/genealogy
   researcher-lib:
     description: >
       Shared research/evaluation primitives library. Provides RelevanceScorer,
@@ -67,7 +67,7 @@ projects:
       world) and developer (create artifacts) apps.
     scope: library
     depends_on: [khonliang]
-    repo: /mnt/dev/ttoll/dev/khonliang-researcher-lib
+    repo: /path/to/khonliang-researcher-lib
   khonliang-bus:
     description: >
       Cross-app event bus and service registry. Go server with Python+Go
@@ -76,7 +76,7 @@ projects:
       push notifications and service discovery.
     scope: infrastructure
     depends_on: [khonliang]
-    repo: /mnt/dev/ttoll/dev/khonliang-bus
+    repo: /path/to/khonliang-bus
   researcher:
     description: >
       Automated research pipeline: RSS/search -> fetch -> distill ->
@@ -84,7 +84,7 @@ projects:
       project Claudes to consume research insights.
     scope: research
     depends_on: [khonliang, researcher-lib]
-    repo: /mnt/dev/ttoll/dev/khonliang-researcher
+    repo: /path/to/khonliang-researcher
   developer:
     description: >
       Development lifecycle MCP server. Inverse of researcher: ingests
@@ -96,4 +96,4 @@ projects:
       focus purely on code and code review.
     scope: development
     depends_on: [khonliang, researcher-lib, khonliang-bus]
-    repo: /mnt/dev/ttoll/dev/khonliang-developer
+    repo: /path/to/khonliang-developer

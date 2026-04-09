@@ -1,6 +1,6 @@
 # khonliang-researcher
 
-Automated research pipeline: RSS/search -> fetch -> distill -> concept graph -> synergize -> FR generation. Served over MCP for consumption by project Claudes (khonliang, autostock, genealogy).
+Automated research pipeline: RSS/search -> fetch -> distill -> concept graph -> synergize -> FR generation. Served over MCP for consumption by project Claudes (khonliang, developer, genealogy).
 
 ## Stack
 
