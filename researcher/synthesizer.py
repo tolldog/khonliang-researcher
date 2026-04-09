@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from khonliang.knowledge.store import KnowledgeStore, Tier
 from khonliang.knowledge.triples import TripleStore
 from khonliang.pool import ModelPool
+from khonliang_researcher import select_best_of_n, serialize_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -451,67 +452,30 @@ class Synthesizer:
     ) -> str:
         """Run LLM generation via the summarizer model.
 
-        When n_samples > 1, generates N candidates in parallel at higher
-        temperature and uses the same model to select the best one
-        (self-distillation).
+        When n_samples > 1, delegates to select_best_of_n for self-distillation
+        with researcher's FR-aware selection prompt.
 
         When compare=True, returns JSON with all candidates and selection
         metadata for quality evaluation.
         """
-        import asyncio
-
         client = self.pool.get_client("summarizer")
-
-        if n_samples <= 1 and not compare:
-            return await client.generate(
-                prompt=prompt,
-                system=_SYNTHESIS_SYSTEM,
-                temperature=0.3,
-                max_tokens=6000,
-            )
-
-        # Sample N candidates in parallel at higher temperature for diversity
-        async def _sample():
-            return await client.generate(
-                prompt=prompt,
-                system=_SYNTHESIS_SYSTEM,
-                temperature=0.7,
-                max_tokens=6000,
-            )
-
         n = max(n_samples, 2) if compare else n_samples
-        candidates = list(await asyncio.gather(*[_sample() for _ in range(n)]))
-        logger.info("Self-distillation: generated %d candidates, selecting best", len(candidates))
 
-        # Ask same model to select the best candidate
-        candidate_text = "\n\n".join(
-            f"=== CANDIDATE {i + 1} ===\n{c}" for i, c in enumerate(candidates)
+        result = await select_best_of_n(
+            client,
+            prompt,
+            n=n,
+            system=_SYNTHESIS_SYSTEM,
+            temperature=0.3 if n <= 1 else 0.7,
+            selection_temperature=0.1,
+            max_tokens=6000,
+            selection_prompt_template=_SELECTION_PROMPT,
+            return_candidates=compare,
         )
-        choice_raw = await client.generate(
-            prompt=_SELECTION_PROMPT.format(n=len(candidates), candidates=candidate_text),
-            system="Select the best candidate. Output only the number.",
-            temperature=0.1,
-            max_tokens=10,
-        )
-
-        # Parse selection, fallback to first candidate
-        selected = 0
-        try:
-            choice = int(choice_raw.strip()) - 1
-            if 0 <= choice < len(candidates):
-                selected = choice
-                logger.info("Self-distillation: selected candidate %d", selected + 1)
-        except ValueError:
-            logger.warning("Self-distillation: could not parse selection '%s', using candidate 1", choice_raw.strip())
 
         if compare:
-            import json as _json
-            return _json.dumps({
-                "selected": selected + 1,
-                "candidates": candidates,
-            })
-
-        return candidates[selected]
+            return serialize_candidates(result)
+        return result
 
     async def topic_summary(
         self, topic: str, limit: int = 30

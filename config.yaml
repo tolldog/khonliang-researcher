@@ -29,9 +29,9 @@ predicate_aliases:
   utilizes: uses_method
   employs: uses_method
 
-feeds_opml: feeds.opml
+feeds_opml: /mnt/dev/ttoll/dev/khonliang-researcher/feeds.opml
 
-db_path: data/researcher.db
+db_path: /mnt/dev/ttoll/dev/khonliang-researcher/data/researcher.db
 
 projects:
   autostock:
@@ -59,11 +59,32 @@ projects:
     scope: genealogy
     depends_on: [khonliang]
     repo: /mnt/dev/ttoll/dev/ollama-roles
+  researcher-lib:
+    description: >
+      Shared research/evaluation primitives library. Provides RelevanceScorer,
+      entity graph, BaseSynthesizer, BaseQueueWorker, and (planned) BaseIdeaParser,
+      select_best_of_n, LocalDocReader. Used by both researcher (ingest world)
+      and developer (create artifacts) apps.
+    scope: library
+    depends_on: [khonliang]
+    repo: /mnt/dev/ttoll/dev/khonliang-researcher-lib
   researcher:
     description: >
       Automated research pipeline: RSS/search -> fetch -> distill ->
       concept graph -> synergize -> FR generation. MCP server for
       project Claudes to consume research insights.
     scope: research
-    depends_on: [khonliang]
+    depends_on: [khonliang, researcher-lib]
     repo: /mnt/dev/ttoll/dev/khonliang-researcher
+  developer:
+    description: >
+      Development lifecycle MCP server. Inverse of researcher: ingests
+      specs/milestones/FRs, evaluates them against the research corpus
+      using local LLM best-of-N, manages git worktrees per FR, bundles
+      related FRs into work units, and dispatches pre-evaluated work
+      packages to Claude with full evidence chains. Talks to researcher
+      via khonliang-bus for on-demand corpus operations. Lets Claude
+      focus purely on code and code review.
+    scope: development
+    depends_on: [khonliang, researcher-lib, khonliang-bus]
+    repo: /mnt/dev/ttoll/dev/khonliang-developer
