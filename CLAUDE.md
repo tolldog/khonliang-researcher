@@ -46,7 +46,10 @@ Projects have `exists` / `planned` / `exploring` capability tags, auto-maintaine
 ## Running
 
 ```
-.venv/bin/python -m researcher.server --config /mnt/dev/ttoll/dev/khonliang-researcher/config.yaml
+.venv/bin/python -m researcher.server --config /path/to/khonliang-researcher/config.yaml
 ```
 
-Config path must be absolute for cross-session MCP launches.
+Config path must be absolute for cross-session MCP launches. Copy
+`config.example.yaml` to `config.yaml` and edit the paths for your
+environment — `config.yaml` is git-ignored because it contains
+machine-specific paths.
