@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "khonliang-researcher": {
+      "command": "/path/to/khonliang-researcher/.venv/bin/python",
+      "args": [
+        "-m",
+        "researcher.server",
+        "--config",
+        "/path/to/khonliang-researcher/config.yaml"
+      ],
+      "cwd": "/path/to/khonliang-researcher"
+    }
+  }
+}
