@@ -10,3 +10,8 @@ build/
 # reference private projects. Copy config.example.yaml to config.yaml
 # and edit for your environment.
 config.yaml
+
+# Local Claude Code MCP server registration. Contains absolute paths
+# to sibling MCP servers. Copy .mcp.example.json to .mcp.json and edit
+# the paths for your environment.
+.mcp.json
