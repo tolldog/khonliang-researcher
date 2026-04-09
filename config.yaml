@@ -59,11 +59,41 @@ projects:
     scope: genealogy
     depends_on: [khonliang]
     repo: /mnt/dev/ttoll/dev/ollama-roles
+  researcher-lib:
+    description: >
+      Shared research/evaluation primitives library. Provides RelevanceScorer,
+      entity graph, BaseSynthesizer, BaseQueueWorker, BaseIdeaParser,
+      select_best_of_n, and LocalDocReader. Used by both researcher (ingest
+      world) and developer (create artifacts) apps.
+    scope: library
+    depends_on: [khonliang]
+    repo: /mnt/dev/ttoll/dev/khonliang-researcher-lib
+  khonliang-bus:
+    description: >
+      Cross-app event bus and service registry. Go server with Python+Go
+      clients, HTTP+WebSocket transport, durable subscriptions, pluggable
+      backends. Optional infrastructure that any app can register with for
+      push notifications and service discovery.
+    scope: infrastructure
+    depends_on: [khonliang]
+    repo: /mnt/dev/ttoll/dev/khonliang-bus
   researcher:
     description: >
       Automated research pipeline: RSS/search -> fetch -> distill ->
       concept graph -> synergize -> FR generation. MCP server for
       project Claudes to consume research insights.
     scope: research
-    depends_on: [khonliang]
+    depends_on: [khonliang, researcher-lib]
     repo: /mnt/dev/ttoll/dev/khonliang-researcher
+  developer:
+    description: >
+      Development lifecycle MCP server. Inverse of researcher: ingests
+      specs/milestones/FRs, evaluates them against the research corpus
+      using local LLM best-of-N, manages git worktrees per FR, bundles
+      related FRs into work units, and dispatches pre-evaluated work
+      packages to Claude with full evidence chains. Talks to researcher
+      via khonliang-bus for on-demand corpus operations. Lets Claude
+      focus purely on code and code review.
+    scope: development
+    depends_on: [khonliang, researcher-lib, khonliang-bus]
+    repo: /mnt/dev/ttoll/dev/khonliang-developer
