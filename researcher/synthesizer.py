@@ -452,11 +452,13 @@ class Synthesizer:
     ) -> str:
         """Run LLM generation via the summarizer model.
 
-        When n_samples > 1, delegates to select_best_of_n for self-distillation
-        with researcher's FR-aware selection prompt.
+        Always delegates to select_best_of_n. For ordinary single-sample
+        generation it uses n=1 (which short-circuits to one client.generate
+        call inside the helper). For multi-candidate runs it uses n_samples
+        (or max(n_samples, 2) when compare=True so the returned payload can
+        carry candidate + selection metadata for quality evaluation).
 
-        When compare=True, returns JSON with all candidates and selection
-        metadata for quality evaluation.
+        Selection uses researcher's FR-aware _SELECTION_PROMPT.
         """
         client = self.pool.get_client("summarizer")
         n = max(n_samples, 2) if compare else n_samples

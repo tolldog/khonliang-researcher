@@ -29,9 +29,9 @@ predicate_aliases:
   utilizes: uses_method
   employs: uses_method
 
-feeds_opml: /mnt/dev/ttoll/dev/khonliang-researcher/feeds.opml
+feeds_opml: feeds.opml
 
-db_path: /mnt/dev/ttoll/dev/khonliang-researcher/data/researcher.db
+db_path: data/researcher.db
 
 projects:
   autostock:
@@ -62,12 +62,21 @@ projects:
   researcher-lib:
     description: >
       Shared research/evaluation primitives library. Provides RelevanceScorer,
-      entity graph, BaseSynthesizer, BaseQueueWorker, and (planned) BaseIdeaParser,
-      select_best_of_n, LocalDocReader. Used by both researcher (ingest world)
-      and developer (create artifacts) apps.
+      entity graph, BaseSynthesizer, BaseQueueWorker, BaseIdeaParser,
+      select_best_of_n, and LocalDocReader. Used by both researcher (ingest
+      world) and developer (create artifacts) apps.
     scope: library
     depends_on: [khonliang]
     repo: /mnt/dev/ttoll/dev/khonliang-researcher-lib
+  khonliang-bus:
+    description: >
+      Cross-app event bus and service registry. Go server with Python+Go
+      clients, HTTP+WebSocket transport, durable subscriptions, pluggable
+      backends. Optional infrastructure that any app can register with for
+      push notifications and service discovery.
+    scope: infrastructure
+    depends_on: [khonliang]
+    repo: /mnt/dev/ttoll/dev/khonliang-bus
   researcher:
     description: >
       Automated research pipeline: RSS/search -> fetch -> distill ->

@@ -1619,6 +1619,13 @@ def create_pipeline(config_path: str = "config.yaml") -> ResearchPipeline:
     if not Path(db_path).is_absolute():
         db_path = str(config_dir / db_path)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    # Write resolved path back so ResearchPipeline (and any downstream
+    # consumer that reads config["db_path"]) sees the absolute version.
+    config["db_path"] = db_path
+
+    feeds_opml = config.get("feeds_opml")
+    if feeds_opml and not Path(feeds_opml).is_absolute():
+        config["feeds_opml"] = str(config_dir / feeds_opml)
 
     knowledge = KnowledgeStore(db_path)
     predicate_aliases = config.get("predicate_aliases", {})
