@@ -24,6 +24,18 @@ from researcher.pipeline import create_pipeline, ResearchPipeline
 logger = logging.getLogger(__name__)
 
 
+def _compact_field(value: Any, limit: int = 80) -> str:
+    """Sanitize a value for inclusion in pipe-delimited compact output.
+
+    Replaces newlines and pipe characters that would otherwise corrupt
+    downstream parsing, then truncates to ``limit`` chars.
+    """
+    if value is None:
+        return "?"
+    text = str(value).replace("\r", " ").replace("\n", " ").replace("|", "/")
+    return truncate(text.strip(), limit)
+
+
 def create_research_server(pipeline: ResearchPipeline):
     """Create MCP server with khonliang base tools + custom research tools."""
     from researcher.synthesizer import Synthesizer
@@ -398,13 +410,27 @@ Most tools accept detail="compact|brief|full":
 
     @mcp.tool()
     def find_relevant(query: str, project: str = "", detail: str = "brief") -> str:
-        """Search papers by topic. detail: compact|brief|full."""
+        """Search papers by topic. detail: compact|brief|full.
+
+        When ``project`` is set, results are filtered to entries scored
+        above the pipeline's relevance threshold for that project (using
+        ``entry.metadata['relevance_scores']``).
+        """
         results = pipeline.search(query, limit=10)
+        if project and results:
+            threshold = pipeline.relevance.threshold
+            results = [
+                e for e in results
+                if (e.metadata or {}).get("relevance_scores", {}).get(project, 0) >= threshold
+            ]
         if not results:
             return f"No papers found for: {query}"
 
         def compact():
-            return "\n".join(f"{e.id}|{truncate(e.title, 60)}" for e in results)
+            return "\n".join(
+                f"id={_compact_field(e.id, 40)}|title={_compact_field(e.title, 60)}"
+                for e in results
+            )
 
         def brief():
             lines = [f"{len(results)} results for '{query}'"]
@@ -845,7 +871,12 @@ Completing an FR automatically records the capability as "exists" for the target
         fr_content = entry.content if entry else ""
 
         def compact():
-            return f"{top['id']}|{top.get('title','?')}|{top.get('target','?')}|{top.get('priority','?')}"
+            return (
+                f"id={_compact_field(top['id'], 40)}|"
+                f"title={_compact_field(top.get('title', '?'), 80)}|"
+                f"target={_compact_field(top.get('target', '?'), 30)}|"
+                f"priority={_compact_field(top.get('priority', '?'), 20)}"
+            )
 
         def brief():
             lines = [
@@ -926,13 +957,21 @@ Completing an FR automatically records the capability as "exists" for the target
         if not pairs:
             return f"No overlapping FRs above {threshold:.0%}."
 
+        BRIEF_LIMIT = 10
+
         def compact():
             return f"overlaps={len(pairs)}|threshold={threshold:.0%}"
 
         def brief():
             lines = [f"{len(pairs)} overlaps above {threshold:.0%}"]
-            for sim, fr_a, fr_b in pairs:
-                lines.append(f"  {sim:.0%}: {truncate(fr_a.get('title','?'),40)} <> {truncate(fr_b.get('title','?'),40)}")
+            shown = pairs[:BRIEF_LIMIT]
+            for sim, fr_a, fr_b in shown:
+                lines.append(
+                    f"  {sim:.0%}: {truncate(fr_a.get('title','?'),40)} <> {truncate(fr_b.get('title','?'),40)}"
+                )
+            remaining = len(pairs) - len(shown)
+            if remaining > 0:
+                lines.append(f"  +{remaining} more (use detail='full' to see all)")
             return "\n".join(lines)
 
         def full():
@@ -1043,8 +1082,11 @@ Completing an FR automatically records the capability as "exists" for the target
         above = max_score >= threshold
 
         def compact():
-            pairs = " ".join(f"{p}:{s:.2f}" for p, s in sorted(scores.items(), key=lambda x: -x[1]))
-            return f"{pairs} {'above' if above else 'below'}:{threshold:.2f}"
+            score_pairs = "|".join(
+                f"{_compact_field(p, 30)}={s:.2f}"
+                for p, s in sorted(scores.items(), key=lambda x: -x[1])
+            )
+            return f"{score_pairs}|status={'above' if above else 'below'}|threshold={threshold:.2f}"
 
         def brief():
             lines = [f"{title}"]
@@ -1448,8 +1490,8 @@ Completing an FR automatically records the capability as "exists" for the target
         def compact():
             # Extract key lines: count + first substantive bullet points
             lines = [l.strip() for l in content.split("\n") if l.strip() and not l.startswith("#")]
-            top = [truncate(l.lstrip("- "), 80) for l in lines[:5]]
-            return f"topic={topic}|papers={count}|" + "; ".join(top)
+            top = [_compact_field(l.lstrip("- "), 80) for l in lines[:5]]
+            return f"topic={_compact_field(topic, 60)}|papers={count}|highlights={'; '.join(top)}"
 
         def brief():
             # Structured bullets, no narrative
@@ -1488,8 +1530,8 @@ Completing an FR automatically records the capability as "exists" for the target
 
         def compact():
             lines = [l.strip() for l in content.split("\n") if l.strip() and not l.startswith("#")]
-            top = [truncate(l.lstrip("- "), 80) for l in lines[:5]]
-            return f"project={project}|papers={count}|" + "; ".join(top)
+            top = [_compact_field(l.lstrip("- "), 80) for l in lines[:5]]
+            return f"project={_compact_field(project, 30)}|papers={count}|highlights={'; '.join(top)}"
 
         def brief():
             lines = [f"{project} ({count} papers)"]
@@ -1519,8 +1561,8 @@ Completing an FR automatically records the capability as "exists" for the target
 
         def compact():
             lines = [l.strip() for l in content.split("\n") if l.strip() and not l.startswith("#")]
-            top = [truncate(l.lstrip("- "), 80) for l in lines[:5]]
-            return f"landscape|papers={count}|" + "; ".join(top)
+            top = [_compact_field(l.lstrip("- "), 80) for l in lines[:5]]
+            return f"scope=landscape|papers={count}|highlights={'; '.join(top)}"
 
         def brief():
             lines = [f"Landscape ({count} papers)"]
