@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from khonliang.knowledge.store import Tier, EntryStatus
-from khonliang.mcp import KhonliangMCPServer, compact_list, compact_entry, truncate, brief_or_full
+from khonliang.mcp import KhonliangMCPServer, compact_list, compact_entry, truncate, brief_or_full, format_response
 
 from researcher.pipeline import create_pipeline, ResearchPipeline
 
@@ -397,25 +397,35 @@ Most tools accept detail="compact|brief|full":
         return "\n".join(lines)
 
     @mcp.tool()
-    def find_relevant(query: str, project: str = "") -> str:
-        """Search papers by topic. Optionally filter by project relevance.
-
-        Returns matching papers from the knowledge store with their summaries.
-        """
+    def find_relevant(query: str, project: str = "", detail: str = "brief") -> str:
+        """Search papers by topic. detail: compact|brief|full."""
         results = pipeline.search(query, limit=10)
         if not results:
             return f"No papers found for: {query}"
 
-        lines = [f"Found {len(results)} results for '{query}':\n"]
-        for entry in results:
-            lines.append(f"[{entry.id}] {entry.title}")
-            lines.append(f"  Tags: {', '.join(entry.tags or [])}")
-            # Show first 150 chars of content
-            preview = entry.content[:150].replace("\n", " ")
-            lines.append(f"  {preview}...")
-            lines.append("")
+        def compact():
+            return "\n".join(f"{e.id}|{truncate(e.title, 60)}" for e in results)
 
-        return "\n".join(lines)
+        def brief():
+            lines = [f"{len(results)} results for '{query}'"]
+            for entry in results:
+                tags = ", ".join(entry.tags or [])
+                lines.append(f"[{entry.id}] {entry.title}")
+                if tags:
+                    lines.append(f"  {tags}")
+            return "\n".join(lines)
+
+        def full():
+            lines = [f"Found {len(results)} results for '{query}':\n"]
+            for entry in results:
+                lines.append(f"[{entry.id}] {entry.title}")
+                lines.append(f"  Tags: {', '.join(entry.tags or [])}")
+                preview = entry.content[:150].replace("\n", " ")
+                lines.append(f"  {preview}...")
+                lines.append("")
+            return "\n".join(lines)
+
+        return format_response(compact, brief, full, detail)
 
     @mcp.tool()
     def reading_list(detail: str = "brief") -> str:
@@ -446,12 +456,28 @@ Most tools accept detail="compact|brief|full":
         return brief_or_full(brief, full, detail=detail)
 
     @mcp.tool()
-    def paper_context(query: str) -> str:
-        """Build rich context from papers and triples for prompt injection.
+    def paper_context(query: str, detail: str = "brief") -> str:
+        """Paper context for prompt injection. detail: compact|brief|full."""
+        raw = pipeline.get_paper_context(query)
 
-        Combines relevant paper summaries with relationship triples.
-        """
-        return pipeline.get_paper_context(query)
+        def compact():
+            # Extract just paper titles from the raw context
+            lines = []
+            for line in raw.split("\n"):
+                line = line.strip()
+                if line.startswith("[") and "]" in line:
+                    lines.append(truncate(line, 80))
+                if len(lines) >= 3:
+                    break
+            return "\n".join(lines) if lines else truncate(raw, 100)
+
+        def brief():
+            return truncate(raw, 2000)
+
+        def full():
+            return raw
+
+        return format_response(compact, brief, full, detail)
 
     @mcp.tool()
     def paper_digest(hours: float = 24) -> str:
@@ -753,16 +779,8 @@ Completing an FR automatically records the capability as "exists" for the target
         return f"Dependencies set for {entry.title}:\n" + "\n".join(dep_titles)
 
     @mcp.tool()
-    def next_fr(target: str = "") -> str:
-        """Get the next FR to work on — highest priority with all dependencies met.
-
-        Considers:
-        1. Dependencies: all depends_on FRs must be completed (archived or status != active FR)
-        2. Priority: high > medium > low
-        3. Classification: library FRs before library+app before app (build the base first)
-
-        Returns the top FR with full details and dependency status.
-        """
+    def next_fr(target: str = "", detail: str = "brief") -> str:
+        """Next FR to work on (highest priority, deps met). detail: compact|brief|full."""
         from khonliang.knowledge.store import EntryStatus
 
         frs = pipeline.get_feature_requests(target=target or None)
@@ -826,46 +844,56 @@ Completing an FR automatically records the capability as "exists" for the target
         entry = pipeline.knowledge.get(top["id"])
         fr_content = entry.content if entry else ""
 
-        lines = [
-            f"# Next FR: {top.get('title', '?')}",
-            f"ID: {top['id']}",
-            f"Target: {top.get('target', '?')}",
-            f"Priority: {top.get('priority', '?')}",
-            f"Classification: {top.get('classification', '?')}",
-            f"Concept: {top.get('concept', '?')}",
-        ]
+        def compact():
+            return f"{top['id']}|{top.get('title','?')}|{top.get('target','?')}|{top.get('priority','?')}"
 
-        deps = top.get("depends_on", [])
-        if not deps and entry:
-            deps = entry.metadata.get("depends_on", [])
-        if deps:
-            lines.append(f"\nDependencies (all met):")
-            for d in deps:
-                dep = pipeline.knowledge.get(d)
-                lines.append(f"  {d}: {dep.title if dep else '?'}")
+        def brief():
+            lines = [
+                f"{top.get('title', '?')}",
+                f"id={top['id']} target={top.get('target','?')} priority={top.get('priority','?')} class={top.get('classification','?')}",
+            ]
+            desc = top.get("description", fr_content)
+            if desc:
+                lines.append(truncate(desc, 200))
+            more = len(candidates) - 1
+            if more:
+                lines.append(f"+{more} more ready")
+            return "\n".join(lines)
 
-        lines.append(f"\n## Description\n{top.get('description', fr_content)}")
+        def full():
+            lines = [
+                f"# Next FR: {top.get('title', '?')}",
+                f"ID: {top['id']}",
+                f"Target: {top.get('target', '?')}",
+                f"Priority: {top.get('priority', '?')}",
+                f"Classification: {top.get('classification', '?')}",
+                f"Concept: {top.get('concept', '?')}",
+            ]
+            deps = top.get("depends_on", [])
+            if not deps and entry:
+                deps = entry.metadata.get("depends_on", [])
+            if deps:
+                lines.append(f"\nDependencies (all met):")
+                for d in deps:
+                    dep = pipeline.knowledge.get(d)
+                    lines.append(f"  {d}: {dep.title if dep else '?'}")
+            lines.append(f"\n## Description\n{top.get('description', fr_content)}")
+            papers = top.get("backing_papers", [])
+            if papers:
+                lines.append(f"\n## Backing Papers")
+                for p in papers:
+                    lines.append(f"  - {p}")
+            if len(candidates) > 1:
+                lines.append(f"\n---\n{len(candidates) - 1} more FR(s) ready to work on.")
+            if blocked:
+                lines.append(f"{len(blocked)} FR(s) blocked on dependencies.")
+            return "\n".join(lines)
 
-        papers = top.get("backing_papers", [])
-        if papers:
-            lines.append(f"\n## Backing Papers")
-            for p in papers:
-                lines.append(f"  - {p}")
-
-        if len(candidates) > 1:
-            lines.append(f"\n---\n{len(candidates) - 1} more FR(s) ready to work on.")
-        if blocked:
-            lines.append(f"{len(blocked)} FR(s) blocked on dependencies.")
-
-        return "\n".join(lines)
+        return format_response(compact, brief, full, detail)
 
     @mcp.tool()
-    async def fr_overlaps(target: str = "", threshold: float = 0.75) -> str:
-        """Find overlapping feature requests that may need merging.
-
-        Uses embedding similarity to detect FRs that cover the same ground.
-        Returns pairs above the similarity threshold, ranked by overlap.
-        """
+    async def fr_overlaps(target: str = "", threshold: float = 0.75, detail: str = "brief") -> str:
+        """Find overlapping FRs. detail: compact|brief|full."""
         frs = pipeline.get_feature_requests(target=target or None)
         if len(frs) < 2:
             return "Need at least 2 FRs to check for overlaps."
@@ -896,22 +924,32 @@ Completing an FR automatically records the capability as "exists" for the target
         pairs.sort(key=lambda x: -x[0])
 
         if not pairs:
-            return f"No overlapping FRs found above {threshold:.0%} similarity."
+            return f"No overlapping FRs above {threshold:.0%}."
 
-        lines = [f"# FR Overlaps ({len(pairs)} pairs above {threshold:.0%})\n"]
-        for sim, fr_a, fr_b in pairs:
-            lines.append(f"**{sim:.0%} similar:**")
-            lines.append(f"  A: [{fr_a['id']}] {fr_a.get('title', '?')} → {fr_a.get('target', '?')}")
-            lines.append(f"  B: [{fr_b['id']}] {fr_b.get('title', '?')} → {fr_b.get('target', '?')}")
-            # Show what's different
-            if fr_a.get('target') != fr_b.get('target'):
-                lines.append(f"  Different targets — may be intentional (library+app split)")
-            if fr_a.get('concept') == fr_b.get('concept'):
-                lines.append(f"  Same concept: {fr_a.get('concept', '?')}")
-            lines.append("")
+        def compact():
+            return f"overlaps={len(pairs)}|threshold={threshold:.0%}"
 
-        lines.append("Use merge_frs(keep_id, merge_ids) to combine overlapping FRs.")
-        return "\n".join(lines)
+        def brief():
+            lines = [f"{len(pairs)} overlaps above {threshold:.0%}"]
+            for sim, fr_a, fr_b in pairs:
+                lines.append(f"  {sim:.0%}: {truncate(fr_a.get('title','?'),40)} <> {truncate(fr_b.get('title','?'),40)}")
+            return "\n".join(lines)
+
+        def full():
+            lines = [f"# FR Overlaps ({len(pairs)} pairs above {threshold:.0%})\n"]
+            for sim, fr_a, fr_b in pairs:
+                lines.append(f"**{sim:.0%} similar:**")
+                lines.append(f"  A: [{fr_a['id']}] {fr_a.get('title', '?')} → {fr_a.get('target', '?')}")
+                lines.append(f"  B: [{fr_b['id']}] {fr_b.get('title', '?')} → {fr_b.get('target', '?')}")
+                if fr_a.get('target') != fr_b.get('target'):
+                    lines.append(f"  Different targets — may be intentional (library+app split)")
+                if fr_a.get('concept') == fr_b.get('concept'):
+                    lines.append(f"  Same concept: {fr_a.get('concept', '?')}")
+                lines.append("")
+            lines.append("Use merge_frs(keep_id, merge_ids) to combine overlapping FRs.")
+            return "\n".join(lines)
+
+        return format_response(compact, brief, full, detail)
 
     @mcp.tool()
     def merge_frs(keep_id: str, merge_ids: str, merged_title: str = "", merged_description: str = "") -> str:
@@ -992,32 +1030,41 @@ Completing an FR automatically records the capability as "exists" for the target
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    async def score_relevance(entry_id: str) -> str:
-        """Score a paper's relevance to all configured projects.
-
-        Uses embedding similarity (fast, CPU-only) to compare the paper
-        against project descriptions. Scores are stored in entry metadata.
-        """
+    async def score_relevance(entry_id: str, detail: str = "brief") -> str:
+        """Score paper relevance to projects. detail: compact|brief|full."""
         scores = await pipeline.score_relevance(entry_id)
         if not scores:
             return f"Could not score {entry_id}. Check embedding model is available."
 
         entry = pipeline.knowledge.get(entry_id)
         title = entry.title if entry else entry_id
-
-        lines = [f"# Relevance: {title}\n"]
-        for project, score in sorted(scores.items(), key=lambda x: -x[1]):
-            bar = "=" * int(score * 20)
-            lines.append(f"  {project:15s} {score:.2f} |{bar}")
-
         threshold = pipeline.relevance.threshold
         max_score = max(scores.values())
-        if max_score < threshold:
-            lines.append(f"\nBelow threshold ({threshold:.2f}) — would be skipped by worker.")
-        else:
-            lines.append(f"\nAbove threshold ({threshold:.2f}) — will be distilled.")
+        above = max_score >= threshold
 
-        return "\n".join(lines)
+        def compact():
+            pairs = " ".join(f"{p}:{s:.2f}" for p, s in sorted(scores.items(), key=lambda x: -x[1]))
+            return f"{pairs} {'above' if above else 'below'}:{threshold:.2f}"
+
+        def brief():
+            lines = [f"{title}"]
+            for project, score in sorted(scores.items(), key=lambda x: -x[1]):
+                lines.append(f"  {project}: {score:.2f}")
+            lines.append(f"threshold={threshold:.2f} {'above' if above else 'below'}")
+            return "\n".join(lines)
+
+        def full():
+            lines = [f"# Relevance: {title}\n"]
+            for project, score in sorted(scores.items(), key=lambda x: -x[1]):
+                bar = "=" * int(score * 20)
+                lines.append(f"  {project:15s} {score:.2f} |{bar}")
+            if above:
+                lines.append(f"\nAbove threshold ({threshold:.2f}) — will be distilled.")
+            else:
+                lines.append(f"\nBelow threshold ({threshold:.2f}) — would be skipped by worker.")
+            return "\n".join(lines)
+
+        return format_response(compact, brief, full, detail)
 
     # ------------------------------------------------------------------
     # Idea tools
@@ -1149,17 +1196,11 @@ Completing an FR automatically records the capability as "exists" for the target
         return "\n".join(lines)
 
     @mcp.tool()
-    def concepts_for_project(project: str, min_score: float = 0.4, limit: int = 30) -> str:
-        """Show concepts most relevant to a project (autostock, khonliang, genealogy).
-
-        Ranks concepts by their project applicability score, derived from
-        paper assessments. Useful for identifying research themes that
-        feed into feature requests for a specific project.
-        """
+    def concepts_for_project(project: str, min_score: float = 0.4, limit: int = 30, detail: str = "brief") -> str:
+        """Concepts relevant to a project. detail: compact|brief|full."""
         from khonliang_researcher import build_project_scores
 
         scores = build_project_scores(pipeline.knowledge, pipeline.triples)
-        # Filter and rank by this project's score
         ranked = []
         for concept, proj_scores in scores.items():
             score = proj_scores.get(project, 0)
@@ -1167,45 +1208,87 @@ Completing an FR automatically records the capability as "exists" for the target
                 ranked.append((concept, score, proj_scores))
 
         if not ranked:
-            return f"No concepts found for project '{project}' above {min_score:.0%} threshold."
+            return f"No concepts for '{project}' above {min_score:.0%}."
 
         ranked.sort(key=lambda x: -x[1])
         ranked = ranked[:limit]
 
-        lines = [f"## Concepts for {project} ({len(ranked)} above {min_score:.0%})\n"]
-        for concept, score, all_scores in ranked:
-            other = ", ".join(
-                f"{p}:{s:.0%}" for p, s in sorted(all_scores.items(), key=lambda x: -x[1])
-                if p != project
-            )
-            lines.append(f"- **{concept}** ({score:.0%})")
-            if other:
-                lines.append(f"  Also: {other}")
+        def compact():
+            top = ranked[:5]
+            return "\n".join(f"{c}:{s:.0%}" for c, s, _ in top)
 
-        return "\n".join(lines)
+        def brief():
+            top = ranked[:15]
+            lines = [f"{project} concepts ({len(ranked)})"]
+            for concept, score, _ in top:
+                lines.append(f"  {concept}: {score:.0%}")
+            return "\n".join(lines)
+
+        def full():
+            lines = [f"## Concepts for {project} ({len(ranked)} above {min_score:.0%})\n"]
+            for concept, score, all_scores in ranked:
+                other = ", ".join(
+                    f"{p}:{s:.0%}" for p, s in sorted(all_scores.items(), key=lambda x: -x[1])
+                    if p != project
+                )
+                lines.append(f"- **{concept}** ({score:.0%})")
+                if other:
+                    lines.append(f"  Also: {other}")
+            return "\n".join(lines)
+
+        return format_response(compact, brief, full, detail)
 
     # ------------------------------------------------------------------
     # Synergize tools
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    async def synergize(min_score: float = 0.5, max_concepts: int = 10) -> str:
-        """Classify concepts and generate FRs. Returns compact summary."""
+    async def synergize(min_score: float = 0.5, max_concepts: int = 10, detail: str = "brief") -> str:
+        """Classify concepts and generate FRs. detail: compact|brief|full."""
         result = await pipeline.synergize(min_score=min_score, max_concepts=max_concepts)
         if "error" in result:
             raw = result.get("raw", "")
             return f"Error: {result['error']}\n\n{raw}" if raw else f"Error: {result['error']}"
 
-        lines = [f"{result['concept_count']} concepts, {result['fr_count']} FRs"]
-        for item in result["classifications"]:
-            concept = item.get("concept", "?")
-            cls = item.get("classification", "?")
-            targets = ",".join(item.get("targets", []))
-            lines.append(f"\n{concept} -> {cls} [{targets}]")
-            for fr in item.get("feature_requests", []):
-                lines.append(f"  [{fr.get('priority','med')}] {fr.get('title','?')} -> {fr.get('target','?')}")
+        concepts = result["concept_count"]
+        fr_count = result["fr_count"]
+        classifications = result["classifications"]
 
-        return "\n".join(lines)
+        def compact():
+            fr_titles = []
+            for item in classifications:
+                for fr in item.get("feature_requests", []):
+                    fr_titles.append(truncate(fr.get("title", "?"), 50))
+            return f"concepts={concepts}|frs={fr_count}|" + "; ".join(fr_titles[:5])
+
+        def brief():
+            lines = [f"{concepts} concepts, {fr_count} FRs"]
+            for item in classifications:
+                concept = item.get("concept", "?")
+                cls = item.get("classification", "?")
+                targets = ",".join(item.get("targets", []))
+                lines.append(f"\n{concept} -> {cls} [{targets}]")
+                for fr in item.get("feature_requests", []):
+                    lines.append(f"  [{fr.get('priority','med')}] {fr.get('title','?')} -> {fr.get('target','?')}")
+            return "\n".join(lines)
+
+        def full():
+            lines = [f"{concepts} concepts, {fr_count} FRs"]
+            for item in classifications:
+                concept = item.get("concept", "?")
+                cls = item.get("classification", "?")
+                targets = ",".join(item.get("targets", []))
+                lines.append(f"\n{concept} -> {cls} [{targets}]")
+                for fr in item.get("feature_requests", []):
+                    lines.append(f"  [{fr.get('priority','med')}] {fr.get('title','?')} -> {fr.get('target','?')}")
+                    if fr.get("description"):
+                        lines.append(f"    {truncate(fr['description'], 200)}")
+                papers = item.get("backing_papers", [])
+                if papers:
+                    lines.append(f"  papers: {', '.join(str(p) for p in papers)}")
+            return "\n".join(lines)
+
+        return format_response(compact, brief, full, detail)
 
     @mcp.tool()
     async def synergize_compare(min_score: float = 0.5, max_concepts: int = 10) -> str:
@@ -1269,34 +1352,40 @@ Completing an FR automatically records the capability as "exists" for the target
         return brief_or_full(brief, full, detail=detail)
 
     @mcp.tool()
-    async def evaluate_capability(capability: str) -> str:
-        """Evaluate whether a new khonliang feature could improve the researcher.
-
-        Pass a description of a completed or in-progress khonliang feature
-        (e.g., 'KH-5+7: Persistent embedding-aware blackboard with SQLite
-        persistence and semantic search'). Returns an assessment of how the
-        researcher pipeline could leverage it, with suggested FRs.
-        """
+    async def evaluate_capability(capability: str, detail: str = "brief") -> str:
+        """Evaluate if a khonliang feature benefits researcher. detail: compact|brief|full."""
         result = await pipeline.evaluate_capability(capability)
 
         if "error" in result:
             return f"Error: {result['error']}\n{result.get('raw', '')}"
 
-        lines = [f"applicable:{result.get('applicable','?')} score:{result.get('score',0):.0%} | {result.get('summary','')}"]
+        applicable = result.get("applicable", "?")
+        score = result.get("score", 0)
 
-        for label, key in [("uses", "direct_uses"), ("improves", "improvements"), ("unlocks", "new_features")]:
-            items = result.get(key, [])
-            if items:
-                lines.append(f"{label}: {'; '.join(truncate(i, 80) for i in items)}")
+        def compact():
+            return f"applicable={applicable}|score={score:.0%}|frs={len(result.get('suggested_frs', []))}"
 
-        if result.get("integration_notes"):
-            lines.append(f"integration: {truncate(result['integration_notes'], 150)}")
+        def brief():
+            lines = [f"applicable:{applicable} score:{score:.0%} | {result.get('summary','')}"]
+            for fr in result.get("suggested_frs", []):
+                dep = f" (needs {fr['depends_on']})" if fr.get("depends_on") else ""
+                lines.append(f"  FR [{fr.get('priority','?')}] {fr.get('title','?')}{dep}")
+            return "\n".join(lines)
 
-        for fr in result.get("suggested_frs", []):
-            dep = f" (needs {fr['depends_on']})" if fr.get("depends_on") else ""
-            lines.append(f"  FR [{fr.get('priority','?')}] {fr.get('title','?')}{dep}")
+        def full():
+            lines = [f"applicable:{applicable} score:{score:.0%} | {result.get('summary','')}"]
+            for label, key in [("uses", "direct_uses"), ("improves", "improvements"), ("unlocks", "new_features")]:
+                items = result.get(key, [])
+                if items:
+                    lines.append(f"{label}: {'; '.join(truncate(i, 80) for i in items)}")
+            if result.get("integration_notes"):
+                lines.append(f"integration: {truncate(result['integration_notes'], 150)}")
+            for fr in result.get("suggested_frs", []):
+                dep = f" (needs {fr['depends_on']})" if fr.get("depends_on") else ""
+                lines.append(f"  FR [{fr.get('priority','?')}] {fr.get('title','?')}{dep}")
+            return "\n".join(lines)
 
-        return "\n".join(lines)
+        return format_response(compact, brief, full, detail)
 
     @mcp.tool()
     def feature_requests(target: str = "", detail: str = "brief") -> str:
@@ -1347,24 +1436,41 @@ Completing an FR automatically records the capability as "exists" for the target
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    async def synthesize_topic(topic: str) -> str:
-        """Generate a combined summary of papers related to a topic.
-
-        Searches distilled papers matching the topic and produces a
-        cross-paper analysis covering themes, methods, gaps, and connections.
-        """
+    async def synthesize_topic(topic: str, detail: str = "brief") -> str:
+        """Synthesize papers on a topic. detail: compact|brief|full."""
         result = await synthesizer.topic_summary(topic)
         if not result.success:
             return result.content
-        return f"# Topic: {topic} ({result.paper_count} papers)\n\n{result.content}"
+
+        content = result.content
+        count = result.paper_count
+
+        def compact():
+            # Extract key lines: count + first substantive bullet points
+            lines = [l.strip() for l in content.split("\n") if l.strip() and not l.startswith("#")]
+            top = [truncate(l.lstrip("- "), 80) for l in lines[:5]]
+            return f"topic={topic}|papers={count}|" + "; ".join(top)
+
+        def brief():
+            # Structured bullets, no narrative
+            lines = [f"{topic} ({count} papers)"]
+            for line in content.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                lines.append(truncate(line, 120))
+                if len(lines) > 15:
+                    break
+            return "\n".join(lines)
+
+        def full():
+            return f"# Topic: {topic} ({count} papers)\n\n{content}"
+
+        return format_response(compact, brief, full, detail)
 
     @mcp.tool()
-    async def synthesize_project(project: str = "autostock") -> str:
-        """Generate an applicability brief for a project.
-
-        Analyzes all distilled papers and ranks them by relevance to the
-        specified project (from config.yaml). Returns prioritized recommendations.
-        """
+    async def synthesize_project(project: str = "autostock", detail: str = "brief") -> str:
+        """Project applicability brief. detail: compact|brief|full."""
         projects = pipeline.config.get("projects", {})
         if project not in projects:
             available = ", ".join(projects.keys()) or "none configured"
@@ -1376,19 +1482,61 @@ Completing an FR automatically records the capability as "exists" for the target
         )
         if not result.success:
             return result.content
-        return f"# {project} Brief ({result.paper_count} papers)\n\n{result.content}"
+
+        content = result.content
+        count = result.paper_count
+
+        def compact():
+            lines = [l.strip() for l in content.split("\n") if l.strip() and not l.startswith("#")]
+            top = [truncate(l.lstrip("- "), 80) for l in lines[:5]]
+            return f"project={project}|papers={count}|" + "; ".join(top)
+
+        def brief():
+            lines = [f"{project} ({count} papers)"]
+            for line in content.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                lines.append(truncate(line, 120))
+                if len(lines) > 15:
+                    break
+            return "\n".join(lines)
+
+        def full():
+            return f"# {project} Brief ({count} papers)\n\n{content}"
+
+        return format_response(compact, brief, full, detail)
 
     @mcp.tool()
-    async def synthesize_landscape() -> str:
-        """Generate a research landscape overview across all distilled papers.
-
-        Maps major directions, emerging trends, consensus views,
-        contested areas, and gaps in the literature.
-        """
+    async def synthesize_landscape(detail: str = "brief") -> str:
+        """Research landscape overview. detail: compact|brief|full."""
         result = await synthesizer.landscape()
         if not result.success:
             return result.content
-        return f"# Research Landscape ({result.paper_count} papers)\n\n{result.content}"
+
+        content = result.content
+        count = result.paper_count
+
+        def compact():
+            lines = [l.strip() for l in content.split("\n") if l.strip() and not l.startswith("#")]
+            top = [truncate(l.lstrip("- "), 80) for l in lines[:5]]
+            return f"landscape|papers={count}|" + "; ".join(top)
+
+        def brief():
+            lines = [f"Landscape ({count} papers)"]
+            for line in content.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                lines.append(truncate(line, 120))
+                if len(lines) > 15:
+                    break
+            return "\n".join(lines)
+
+        def full():
+            return f"# Research Landscape ({count} papers)\n\n{content}"
+
+        return format_response(compact, brief, full, detail)
 
     @mcp.tool()
     def project_capabilities(target: str = "") -> str:
