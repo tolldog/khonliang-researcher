@@ -2,7 +2,7 @@
 
 Uses khonliang's OllamaClient to generate cross-paper analysis:
   - Topic summaries: "What do these papers say about consensus?"
-  - Project briefs: "What's applicable to developer?"
+  - Project briefs: "What's applicable to the developer project?"
   - Landscape overviews: "What are the main themes and gaps?"
   - Idea briefs: "Do these papers support or contradict this idea?"
   - Relationship maps: "How do these papers connect?"

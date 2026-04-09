@@ -578,7 +578,7 @@ Most tools accept detail="compact|brief|full":
         feature_requests(target=...).
 
         Args:
-            target: Project name (khonliang, developer, genealogy)
+            target: Project name (e.g. khonliang, developer, genealogy — must be a key in config.yaml `projects`)
             title: Short FR title
             description: Full FR description with design, motivation, acceptance criteria
             priority: high, medium, or low
