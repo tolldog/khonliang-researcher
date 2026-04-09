@@ -578,7 +578,7 @@ Most tools accept detail="compact|brief|full":
         feature_requests(target=...).
 
         Args:
-            target: Project name (khonliang, autostock, genealogy)
+            target: Project name (khonliang, developer, genealogy)
             title: Short FR title
             description: Full FR description with design, motivation, acceptance criteria
             priority: high, medium, or low
@@ -652,7 +652,7 @@ Most tools accept detail="compact|brief|full":
 6. `update_fr_status(fr_id, "in_progress", branch="fr/fr_id_short")` — start work
 7. Create a worktree or branch for the FR
 8. Implement, referencing only your project and its dependencies (e.g. khonliang)
-9. Do NOT reference sibling projects (autostock cannot mention genealogy)
+9. Do NOT reference sibling projects (developer cannot mention genealogy)
 
 ## Completion
 10. `update_fr_status(fr_id, "completed", notes="PR #N merged")` — mark done, unblocks dependents
@@ -1511,7 +1511,7 @@ Completing an FR automatically records the capability as "exists" for the target
         return format_response(compact, brief, full, detail)
 
     @mcp.tool()
-    async def synthesize_project(project: str = "autostock", detail: str = "brief") -> str:
+    async def synthesize_project(project: str = "khonliang", detail: str = "brief") -> str:
         """Project applicability brief. detail: compact|brief|full."""
         projects = pipeline.config.get("projects", {})
         if project not in projects:

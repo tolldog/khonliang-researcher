@@ -9,7 +9,7 @@ Your job: for each research concept, decide WHERE it belongs and generate a feat
 
 - **library** — The concept is general-purpose infrastructure that 2+ applications would use. It should be built into khonliang. Examples: improved consensus algorithms, better knowledge store indexing, new routing strategies.
 - **library+app** — The concept needs a library-level primitive AND app-level integration. Generate an FR for khonliang (the capability) AND for each relevant app (how they'd use it). Examples: adaptive routing (khonliang provides the router, app configures agent weights).
-- **app** — The concept is domain-specific business logic for one application. It stays in that app. Examples: trading strategies for autostock, GEDCOM parsing for genealogy.
+- **app** — The concept is domain-specific business logic for one application. It stays in that app. Examples: GEDCOM parsing for genealogy, worktree orchestration for developer.
 
 ## For each concept, produce:
 
@@ -17,7 +17,7 @@ Your job: for each research concept, decide WHERE it belongs and generate a feat
 {
   "concept": "concept name",
   "classification": "library | library+app | app",
-  "targets": ["khonliang", "autostock", ...],
+  "targets": ["khonliang", "developer", ...],
   "feature_requests": [
     {
       "target": "khonliang",

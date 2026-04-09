@@ -5,3 +5,8 @@ __pycache__/
 dist/
 build/
 .venv/
+
+# Local config — contains absolute, machine-specific paths and may
+# reference private projects. Copy config.example.yaml to config.yaml
+# and edit for your environment.
+config.yaml

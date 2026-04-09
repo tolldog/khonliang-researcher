@@ -456,7 +456,7 @@ def synth_topic(ctx, topic):
 
 
 @synthesize.command("project")
-@click.argument("project", default="autostock")
+@click.argument("project", default="khonliang")
 @click.pass_context
 def synth_project(ctx, project):
     """Generate applicability brief for a project."""
