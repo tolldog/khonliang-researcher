@@ -15,7 +15,7 @@ Usage::
     # Uninstall
     python -m researcher.agent uninstall --id researcher-primary --bus http://localhost:8787
 
-The agent wraps all 46 MCP tools from ``create_research_server`` as bus
+The agent wraps all MCP tools from ``create_research_server`` as bus
 handlers via ``BaseAgent.from_mcp()``. Tool code is identical — only the
 transport changes from stdio to bus HTTP.
 """
@@ -56,8 +56,12 @@ def create_researcher_agent(
         config_path=config_path,
     )
 
-    # Attach version from the pipeline's config or package
-    agent.version = pipeline.config.get("version", "0.6.4")
+    # Derive version from installed package metadata
+    try:
+        from importlib.metadata import version
+        agent.version = version("khonliang-researcher")
+    except Exception:
+        agent.version = "0.0.0"
 
     logger.info(
         "Researcher agent %s created with %d skills",
@@ -90,17 +94,12 @@ def main():
     if args.command in ("install", "uninstall"):
         # Use BaseAgent's CLI handling for install/uninstall
         # (lightweight — doesn't build the full pipeline)
-        agent = BaseAgent(
-            agent_id=args.id,
-            bus_url=args.bus,
-            config_path=args.config,
-        )
-        agent.agent_type = "researcher"
-        agent.module_name = "researcher.agent"
-        if args.command == "install":
-            agent._do_install()
-        else:
-            agent._do_uninstall()
+        BaseAgent.from_cli([
+            args.command,
+            "--id", args.id,
+            "--bus", args.bus,
+            "--config", args.config,
+        ])
         return
 
     # Full agent startup — builds pipeline, wraps MCP tools
