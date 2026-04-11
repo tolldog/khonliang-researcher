@@ -13,6 +13,7 @@ dependencies = [
     "pymupdf>=1.24",
     "markdownify>=0.12",
     "mcp>=1.0.0",
+    "khonliang-bus-lib",
 ]
 
 [project.scripts]
