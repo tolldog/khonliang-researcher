@@ -1250,15 +1250,16 @@ Completing an FR automatically records the capability as "exists" for the target
                     neighbors[ids[j]].add(ids[i])
 
         # Connected components (simple BFS)
+        from collections import deque
         visited = set()
         clusters = []
         for fid in ids:
             if fid in visited or not neighbors[fid]:
                 continue
             cluster = []
-            queue = [fid]
+            queue = deque([fid])
             while queue:
-                current = queue.pop(0)
+                current = queue.popleft()
                 if current in visited:
                     continue
                 visited.add(current)
@@ -1331,8 +1332,11 @@ Completing an FR automatically records the capability as "exists" for the target
 
         try:
             fr_data = json.loads(entry.content)
-        except json.JSONDecodeError:
-            fr_data = {}
+        except (json.JSONDecodeError, TypeError):
+            return f"FR {fr_id} has malformed content — cannot modify safely."
+
+        if priority and priority not in ("high", "medium", "low"):
+            return f"Invalid priority '{priority}'. Must be high, medium, or low."
 
         changes = []
         if title:
@@ -1342,7 +1346,7 @@ Completing an FR automatically records the capability as "exists" for the target
         if description:
             fr_data["description"] = description
             changes.append("description updated")
-        if priority and priority in ("high", "medium", "low"):
+        if priority:
             fr_data["priority"] = priority
             entry.metadata["priority"] = priority
             changes.append(f"priority → {priority}")
