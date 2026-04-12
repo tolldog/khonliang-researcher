@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import asyncio
+from collections import deque
 import json
 import logging
 import sys
@@ -1250,7 +1251,6 @@ Completing an FR automatically records the capability as "exists" for the target
                     neighbors[ids[j]].add(ids[i])
 
         # Connected components (simple BFS)
-        from collections import deque
         visited = set()
         clusters = []
         for fid in ids:
