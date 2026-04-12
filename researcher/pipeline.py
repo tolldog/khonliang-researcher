@@ -700,6 +700,46 @@ class ResearchPipeline:
     # Synergize
     # ------------------------------------------------------------------
 
+    async def synergize_concepts(
+        self, min_score: float = 0.5, max_concepts: int = 10
+    ) -> Dict[str, Any]:
+        """Find conceptual connections across the corpus. Returns bundles, NOT FRs.
+
+        Generic, domain-agnostic concept bundling. Groups related concepts
+        based on shared themes, methods, or complementary findings. The
+        caller (developer) decides what to do with the bundles.
+        """
+        from researcher.synthesizer import Synthesizer
+
+        synth = Synthesizer(self.knowledge, self.triples, self.pool)
+        n_samples = self.config.get("synergize_samples", 1)
+
+        result = await synth.synergize_concepts(
+            min_score=min_score,
+            max_concepts=max_concepts,
+            n_samples=n_samples,
+        )
+
+        if not result.success:
+            return {"error": result.content}
+
+        content = result.content.strip()
+        if content.startswith("```"):
+            content = "\n".join(content.split("\n")[1:])
+        if content.endswith("```"):
+            content = "\n".join(content.split("\n")[:-1])
+
+        try:
+            bundles = json.loads(content)
+        except json.JSONDecodeError:
+            return {"error": "LLM returned non-JSON", "raw": result.content}
+
+        return {
+            "bundles": bundles,
+            "concept_count": len(bundles),
+            "paper_count": result.paper_count,
+        }
+
     async def synergize(
         self, min_score: float = 0.5, max_concepts: int = 10
     ) -> Dict[str, Any]:

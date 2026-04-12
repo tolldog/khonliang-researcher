@@ -1599,8 +1599,57 @@ Completing an FR automatically records the capability as "exists" for the target
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    async def synergize_concepts(min_score: float = 0.5, max_concepts: int = 10, detail: str = "brief") -> str:
+        """Find conceptual connections, return bundles (no FRs). detail: compact|brief|full.
+
+        Generic concept bundling — groups related concepts based on shared
+        themes, methods, or complementary findings. What to DO with the
+        bundles (FRs, research leads) is the caller's decision.
+        """
+        result = await pipeline.synergize_concepts(min_score=min_score, max_concepts=max_concepts)
+        if "error" in result:
+            raw = result.get("raw", "")
+            return f"Error: {result['error']}\n{raw}" if raw else f"Error: {result['error']}"
+
+        bundles = result.get("bundles", [])
+        count = result.get("concept_count", 0)
+        papers = result.get("paper_count", 0)
+
+        def compact():
+            names = [b.get("name", "?") for b in bundles] if isinstance(bundles, list) else []
+            return f"bundles={count}|papers={papers}|" + "; ".join(names[:5])
+
+        def brief():
+            if not isinstance(bundles, list):
+                return str(bundles)
+            lines = [f"{count} concept bundles from {papers} papers"]
+            for b in bundles:
+                strength = b.get("strength", 0)
+                lines.append(f"\n{b.get('name', '?')} (strength: {strength:.0%})")
+                lines.append(f"  concepts: {', '.join(b.get('concepts', []))}")
+                lines.append(f"  {b.get('summary', '')}")
+            return "\n".join(lines)
+
+        def full():
+            if not isinstance(bundles, list):
+                return str(bundles)
+            lines = [f"{count} concept bundles from {papers} papers"]
+            for b in bundles:
+                strength = b.get("strength", 0)
+                lines.append(f"\n## {b.get('name', '?')} (strength: {strength:.0%})")
+                lines.append(f"Concepts: {', '.join(b.get('concepts', []))}")
+                lines.append(f"Connection: {b.get('connection', '?')}")
+                lines.append(f"Summary: {b.get('summary', '')}")
+                papers_list = b.get("papers", [])
+                if papers_list:
+                    lines.append(f"Papers: {', '.join(papers_list)}")
+            return "\n".join(lines)
+
+        return format_response(compact, brief, full, detail)
+
+    @mcp.tool()
     async def synergize(min_score: float = 0.5, max_concepts: int = 10, detail: str = "brief") -> str:
-        """Classify concepts and generate FRs. detail: compact|brief|full."""
+        """Classify concepts and generate FRs (developer-specific). detail: compact|brief|full."""
         result = await pipeline.synergize(min_score=min_score, max_concepts=max_concepts)
         if "error" in result:
             raw = result.get("raw", "")

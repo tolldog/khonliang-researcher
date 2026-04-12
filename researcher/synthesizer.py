@@ -109,6 +109,44 @@ Papers:
 {summaries}
 """
 
+_SYNERGIZE_CONCEPTS_PROMPT = """\
+You are analyzing research concepts from a paper corpus. Your job is to find
+what goes together conceptually — group related concepts into bundles based
+on shared themes, methods, or complementary findings.
+
+CONCEPTS WITH SCORES:
+{concepts}
+
+BACKING PAPER SUMMARIES:
+{summaries}
+
+Group these concepts into bundles of related ideas. For each bundle:
+
+1. **Name**: A short label for the bundle (2-5 words)
+2. **Concepts**: Which concepts belong in this bundle
+3. **Connection**: WHY these concepts go together (shared method, complementary findings, same problem from different angles)
+4. **Strength**: How strong is the evidence for this grouping (number of independent papers, consistency of findings)
+5. **Summary**: One sentence describing what this bundle represents
+6. **Papers**: Key papers backing this bundle
+
+Do NOT generate feature requests, priorities, targets, or classifications.
+Just group what goes together and explain why.
+
+Respond with a JSON array:
+[
+  {{
+    "name": "short bundle name",
+    "concepts": ["concept1", "concept2"],
+    "connection": "why these go together",
+    "strength": 0.0-1.0,
+    "summary": "one line describing the bundle",
+    "papers": ["paper title 1", "paper title 2"]
+  }}
+]
+
+Only output the JSON array. No other text.
+"""
+
 _SYNERGIZE_PROMPT = """\
 You are analyzing research concepts for a software ecosystem with a shared library and multiple applications.
 
@@ -661,6 +699,112 @@ class Synthesizer:
             len(ranked), len(diverse), len(clusters),
         )
         return diverse
+
+    async def synergize_concepts(
+        self,
+        min_score: float = 0.5,
+        max_concepts: int = 10,
+        n_samples: int = 1,
+        compare: bool = False,
+    ) -> SynthesisResult:
+        """Find conceptual connections across the corpus. Returns bundles, NOT FRs.
+
+        This is the generic, domain-agnostic version of synergize. It groups
+        related concepts based on shared themes, methods, or complementary
+        findings. What to DO with the bundles (FRs, research leads, evidence
+        reports) is the caller's decision — not the researcher's.
+
+        The FR-generating ``synergize()`` method is the developer-specific
+        version that adds classification, targeting, and FR output. It stays
+        for backward compatibility but the clean path is:
+          researcher.synergize_concepts() → developer.process_bundles()
+        """
+        from khonliang_researcher import build_project_scores
+
+        concept_scores = build_project_scores(self.knowledge, self.triples, min_score=min_score)
+        if not concept_scores:
+            return SynthesisResult(
+                query="synergize_concepts", synthesis_type="concept_bundles",
+                content="No concept scores available. Distill papers first.",
+                paper_count=0, success=False,
+            )
+
+        # Filter and rank
+        qualified = {
+            concept: scores
+            for concept, scores in concept_scores.items()
+            if max(scores.values()) >= min_score
+        }
+
+        ranked = sorted(
+            qualified.items(),
+            key=lambda x: sum(x[1].values()),
+            reverse=True,
+        )
+
+        ranked = await self._deduplicate_concepts(ranked, max_per_cluster=2)
+        ranked = ranked[:max_concepts]
+
+        if not ranked:
+            return SynthesisResult(
+                query="synergize_concepts", synthesis_type="concept_bundles",
+                content="No concepts meet the score threshold.",
+                paper_count=0, success=False,
+            )
+
+        # Find backing papers via triples
+        concept_papers: Dict[str, List[str]] = defaultdict(list)
+        all_triples = self.triples.get(min_confidence=0.3, limit=5000)
+        for t in all_triples:
+            source = t.source or ""
+            if source.startswith("paper:"):
+                paper_id = source.replace("paper:", "")
+                if t.subject in qualified:
+                    concept_papers[t.subject].append(paper_id)
+                if t.object in qualified:
+                    concept_papers[t.object].append(paper_id)
+
+        # Gather paper summaries
+        paper_ids_needed = set()
+        for ids in concept_papers.values():
+            paper_ids_needed.update(ids)
+
+        summaries = self._get_distilled_summaries(limit=100)
+        summary_by_parent = {}
+        for s in summaries:
+            pid = s["parent_id"]
+            if pid in paper_ids_needed:
+                summary_by_parent[pid] = s
+
+        # Format concepts for prompt
+        concept_lines = []
+        for concept, scores in ranked:
+            score_str = ", ".join(f"{p}: {s:.0%}" for p, s in sorted(scores.items(), key=lambda x: -x[1]))
+            papers = concept_papers.get(concept, [])
+            paper_titles = [summary_by_parent[pid]["title"] for pid in papers[:3] if pid in summary_by_parent]
+            papers_str = "; ".join(paper_titles) if paper_titles else "no direct papers"
+            concept_lines.append(f"- {concept} [{score_str}] — papers: {papers_str}")
+
+        formatted_summaries = self._format_summaries(
+            [summary_by_parent[pid] for pid in list(summary_by_parent.keys())[:20]],
+            max_chars=6000,
+        )
+
+        prompt = _SYNERGIZE_CONCEPTS_PROMPT.format(
+            concepts="\n".join(concept_lines),
+            summaries=formatted_summaries,
+        )
+
+        content = await self._generate(prompt, n_samples=n_samples, compare=compare)
+
+        return SynthesisResult(
+            query="synergize_concepts",
+            synthesis_type="concept_bundles",
+            content=content,
+            paper_count=len(summary_by_parent),
+            paper_ids=list(summary_by_parent.keys()),
+            success=True,
+        )
 
     async def synergize(
         self,
