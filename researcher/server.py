@@ -1065,6 +1065,316 @@ Completing an FR automatically records the capability as "exists" for the target
         )
 
     # ------------------------------------------------------------------
+    # FR pipeline improvements
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def auto_deduplicate_frs(
+        target: str = "",
+        threshold: float = 0.85,
+        dry_run: bool = True,
+        detail: str = "brief",
+    ) -> str:
+        """Auto-deduplicate FRs by merging high-similarity pairs.
+
+        Finds all FR pairs above the similarity threshold and merges them,
+        keeping the FR with the higher priority (or the one with more
+        backing papers as tiebreaker). Run with dry_run=true first to
+        preview what would be merged.
+
+        Args:
+            target: Filter to FRs for this target (empty = all)
+            threshold: Similarity threshold (default 0.85 — higher than
+                       fr_overlaps default to avoid false merges)
+            dry_run: If true, just report what would be merged
+            detail: compact|brief|full
+        """
+        frs = pipeline.get_feature_requests(target=target or None)
+        if len(frs) < 2:
+            return "Need at least 2 FRs to deduplicate."
+
+        # Embed all FRs
+        embeddings = {}
+        for fr in frs:
+            text = f"{fr.get('title', '')}\n{fr.get('description', '')[:500]}"
+            emb = await pipeline.relevance._embed(text)
+            if emb:
+                embeddings[fr["id"]] = (fr, emb)
+
+        if len(embeddings) < 2:
+            return "Could not embed enough FRs to compare."
+
+        # Find overlapping pairs
+        from khonliang_researcher import cosine_similarity
+        pairs = []
+        ids = list(embeddings.keys())
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                fr_a, emb_a = embeddings[ids[i]]
+                fr_b, emb_b = embeddings[ids[j]]
+                sim = cosine_similarity(emb_a, emb_b)
+                if sim >= threshold:
+                    pairs.append((sim, fr_a, fr_b))
+
+        pairs.sort(key=lambda x: -x[0])
+
+        if not pairs:
+            return f"No duplicates above {threshold:.0%}."
+
+        # Decide which to keep in each pair (higher priority wins,
+        # then more backing papers, then alphabetical ID)
+        PRIORITY_ORDER = {"high": 3, "medium": 2, "low": 1}
+        merges = []
+        already_merged = set()
+
+        for sim, fr_a, fr_b in pairs:
+            if fr_a["id"] in already_merged or fr_b["id"] in already_merged:
+                continue
+
+            score_a = PRIORITY_ORDER.get(fr_a.get("priority", "medium"), 2)
+            score_b = PRIORITY_ORDER.get(fr_b.get("priority", "medium"), 2)
+            papers_a = len(fr_a.get("backing_papers", []))
+            papers_b = len(fr_b.get("backing_papers", []))
+
+            if score_a > score_b or (score_a == score_b and papers_a >= papers_b):
+                keep, merge = fr_a, fr_b
+            else:
+                keep, merge = fr_b, fr_a
+
+            merges.append({"keep": keep["id"], "merge": merge["id"], "similarity": sim,
+                           "keep_title": keep.get("title", "?"), "merge_title": merge.get("title", "?")})
+            already_merged.add(merge["id"])
+
+        if not dry_run:
+            from khonliang.knowledge.store import EntryStatus
+            merged_count = 0
+            for m in merges:
+                keep_entry = pipeline.knowledge.get(m["keep"])
+                merge_entry = pipeline.knowledge.get(m["merge"])
+                if not keep_entry or not merge_entry:
+                    continue
+
+                # Collect backing papers
+                keep_papers = set(keep_entry.metadata.get("backing_papers", []))
+                keep_papers.update(merge_entry.metadata.get("backing_papers", []))
+                keep_entry.metadata["backing_papers"] = list(keep_papers)
+                keep_entry.metadata.setdefault("merged_from", []).append(m["merge"])
+                pipeline.knowledge.add(keep_entry)
+
+                # Archive the merged FR
+                merge_entry.status = EntryStatus.ARCHIVED
+                merge_entry.tags = [t for t in (merge_entry.tags or []) if t != "fr"] + ["fr:archived", f"merged_into:{m['keep']}"]
+                pipeline.knowledge.add(merge_entry)
+                merged_count += 1
+
+            pipeline.digest.record(
+                summary=f"Auto-deduplicated: {merged_count} FRs merged (threshold={threshold:.0%})",
+                source="pipeline", audience="research",
+                tags=["fr", "dedup"],
+            )
+
+        def compact():
+            return f"duplicates={len(merges)}|threshold={threshold:.0%}|dry_run={dry_run}"
+
+        def brief():
+            mode = "DRY RUN — " if dry_run else ""
+            lines = [f"{mode}{len(merges)} merges at {threshold:.0%} threshold"]
+            for m in merges[:15]:
+                lines.append(f"  {m['similarity']:.0%}: keep [{m['keep'][:20]}] merge [{m['merge'][:20]}]")
+            if len(merges) > 15:
+                lines.append(f"  +{len(merges)-15} more")
+            if dry_run:
+                lines.append("\nRun with dry_run=false to execute.")
+            return "\n".join(lines)
+
+        def full():
+            mode = "DRY RUN\n\n" if dry_run else "EXECUTED\n\n"
+            lines = [f"{mode}{len(merges)} merges at {threshold:.0%} threshold\n"]
+            for m in merges:
+                lines.append(f"**{m['similarity']:.0%}:** keep {m['keep']}")
+                lines.append(f"  → {m['keep_title']}")
+                lines.append(f"  merge {m['merge']}")
+                lines.append(f"  → {m['merge_title']}")
+                lines.append("")
+            return "\n".join(lines)
+
+        return format_response(compact, brief, full, detail)
+
+    @mcp.tool()
+    async def cluster_frs(
+        target: str = "",
+        min_cluster_size: int = 2,
+        threshold: float = 0.7,
+        detail: str = "brief",
+    ) -> str:
+        """Group related FRs into clusters via embedding similarity.
+
+        Unlike fr_overlaps (pairwise), this groups FRs into neighborhoods
+        where all members are above the threshold with at least one other
+        member. Useful for seeing which FRs should be bundled into a single
+        work unit or milestone.
+
+        Args:
+            target: Filter to FRs for this target (empty = all)
+            min_cluster_size: Minimum FRs in a cluster to report
+            threshold: Similarity threshold for cluster membership
+            detail: compact|brief|full
+        """
+        frs = pipeline.get_feature_requests(target=target or None)
+        if len(frs) < 2:
+            return "Need at least 2 FRs to cluster."
+
+        # Embed all FRs
+        embeddings = {}
+        for fr in frs:
+            text = f"{fr.get('title', '')}\n{fr.get('description', '')[:500]}"
+            emb = await pipeline.relevance._embed(text)
+            if emb:
+                embeddings[fr["id"]] = (fr, emb)
+
+        if len(embeddings) < 2:
+            return "Could not embed enough FRs."
+
+        # Build adjacency: which FRs are similar to which
+        from khonliang_researcher import cosine_similarity
+        ids = list(embeddings.keys())
+        neighbors: dict[str, set[str]] = {fid: set() for fid in ids}
+
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                _, emb_a = embeddings[ids[i]]
+                _, emb_b = embeddings[ids[j]]
+                sim = cosine_similarity(emb_a, emb_b)
+                if sim >= threshold:
+                    neighbors[ids[i]].add(ids[j])
+                    neighbors[ids[j]].add(ids[i])
+
+        # Connected components (simple BFS)
+        visited = set()
+        clusters = []
+        for fid in ids:
+            if fid in visited or not neighbors[fid]:
+                continue
+            cluster = []
+            queue = [fid]
+            while queue:
+                current = queue.pop(0)
+                if current in visited:
+                    continue
+                visited.add(current)
+                cluster.append(current)
+                for n in neighbors[current]:
+                    if n not in visited:
+                        queue.append(n)
+            if len(cluster) >= min_cluster_size:
+                clusters.append(cluster)
+
+        if not clusters:
+            return f"No clusters of {min_cluster_size}+ FRs at {threshold:.0%} threshold."
+
+        # Sort clusters by size (largest first)
+        clusters.sort(key=len, reverse=True)
+
+        def compact():
+            return f"clusters={len(clusters)}|total_frs={sum(len(c) for c in clusters)}|threshold={threshold:.0%}"
+
+        def brief():
+            lines = [f"{len(clusters)} clusters ({sum(len(c) for c in clusters)} FRs) at {threshold:.0%}"]
+            for i, cluster in enumerate(clusters, 1):
+                fr_titles = [truncate(embeddings[fid][0].get("title", "?"), 50) for fid in cluster]
+                targets = set(embeddings[fid][0].get("target", "?") for fid in cluster)
+                lines.append(f"\n  Cluster {i} ({len(cluster)} FRs, targets: {','.join(targets)}):")
+                for title in fr_titles[:5]:
+                    lines.append(f"    - {title}")
+                if len(fr_titles) > 5:
+                    lines.append(f"    +{len(fr_titles)-5} more")
+            return "\n".join(lines)
+
+        def full():
+            lines = [f"# FR Clusters ({len(clusters)} clusters, {sum(len(c) for c in clusters)} FRs)\n"]
+            for i, cluster in enumerate(clusters, 1):
+                targets = set(embeddings[fid][0].get("target", "?") for fid in cluster)
+                lines.append(f"## Cluster {i} ({len(cluster)} FRs, targets: {','.join(targets)})")
+                for fid in cluster:
+                    fr = embeddings[fid][0]
+                    lines.append(f"  [{fid}] {fr.get('title', '?')} → {fr.get('target', '?')} [{fr.get('priority', '?')}]")
+                lines.append("")
+            return "\n".join(lines)
+
+        return format_response(compact, brief, full, detail)
+
+    @mcp.tool()
+    def update_fr(
+        fr_id: str,
+        title: str = "",
+        description: str = "",
+        priority: str = "",
+        target: str = "",
+        notes: str = "",
+    ) -> str:
+        """Modify an existing FR in-place.
+
+        Updates the specified fields without creating a new FR. Unchanged
+        fields are left as-is. Records the modification in the digest.
+
+        Args:
+            fr_id: The FR to modify
+            title: New title (empty = keep current)
+            description: New description (empty = keep current)
+            priority: New priority: high, medium, low (empty = keep current)
+            target: New target project (empty = keep current)
+            notes: Reason for the change (recorded in digest)
+        """
+        entry = pipeline.knowledge.get(fr_id)
+        if not entry:
+            return f"FR {fr_id} not found."
+
+        try:
+            fr_data = json.loads(entry.content)
+        except json.JSONDecodeError:
+            fr_data = {}
+
+        changes = []
+        if title:
+            entry.title = title
+            fr_data["title"] = title
+            changes.append(f"title → {title}")
+        if description:
+            fr_data["description"] = description
+            changes.append("description updated")
+        if priority and priority in ("high", "medium", "low"):
+            fr_data["priority"] = priority
+            entry.metadata["priority"] = priority
+            changes.append(f"priority → {priority}")
+        if target:
+            fr_data["target"] = target
+            entry.metadata["target"] = target
+            # Update tags
+            entry.tags = [t for t in (entry.tags or []) if not t.startswith("target:")] + [f"target:{target}"]
+            changes.append(f"target → {target}")
+
+        if not changes:
+            return f"No changes specified for {fr_id}."
+
+        entry.content = json.dumps(fr_data, indent=2)
+        pipeline.knowledge.add(entry)
+
+        pipeline.digest.record(
+            summary=f"FR modified: {fr_id} — {', '.join(changes)}",
+            source="pipeline",
+            audience="research",
+            tags=["fr", "modified"],
+            metadata={"fr_id": fr_id, "changes": changes, "notes": notes},
+        )
+
+        return (
+            f"Updated {fr_id}:\n"
+            f"  Changes: {', '.join(changes)}\n"
+            f"  Title: {entry.title}\n"
+            + (f"  Notes: {notes}\n" if notes else "")
+        )
+
+    # ------------------------------------------------------------------
     # Relevance scoring tools
     # ------------------------------------------------------------------
 
