@@ -40,6 +40,22 @@ feeds_opml: feeds.opml
 
 db_path: data/researcher.db
 
+# Domain rules — optional. When set, these rules are appended to the
+# summarizer, extractor, and assessor system prompts so the distillation
+# LLMs evaluate papers through a domain-specific lens. Leave unset for
+# generic researcher behavior.
+#
+# Each domain instance runs the same code against the same base prompts;
+# only the rules differ. Run multiple instances with different configs
+# (and different db_paths) to scope a corpus to a domain.
+#
+# domain:
+#   name: developer
+#   rules:
+#     - "Prioritize papers that describe concrete engineering practices over theoretical surveys."
+#     - "Score multi-agent orchestration frameworks by whether they cleanly separate routing from execution."
+#     - "Penalize papers whose only contribution is a benchmark without a reusable mechanism."
+
 # Projects this researcher instance scores papers against. Edit the
 # `repo` paths to match your local checkout layout.
 projects:
