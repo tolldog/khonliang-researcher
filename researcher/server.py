@@ -1619,13 +1619,13 @@ Completing an FR automatically records the capability as "exists" for the target
 
         def brief():
             lag = f["lag_seconds"]
-            lag_txt = f"{lag / 3600:.1f}h" if lag is not None else "n/a"
+            activity_txt = f"{lag / 3600:.1f}h ago" if lag is not None else "none yet"
             status = "fresh" if f["fresh"] else f"stale ({f['pending_distilled']} pending)"
             return (
                 f"Concept map: {status}\n"
                 f"  triples: {f['totals']['triples']}\n"
                 f"  distilled papers: {f['totals']['distilled_papers']}\n"
-                f"  last triple activity: {lag_txt} ago"
+                f"  last triple activity: {activity_txt}"
             )
 
         def full():

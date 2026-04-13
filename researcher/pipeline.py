@@ -755,16 +755,14 @@ class ResearchPipeline:
         k_conn = _ro_conn(self.knowledge.db_path)
         try:
             row = k_conn.execute(
-                "SELECT COUNT(*), MAX(updated_at) FROM knowledge WHERE status = ?",
-                (EntryStatus.DISTILLED,),
+                "SELECT COUNT(*), MAX(updated_at), "
+                "SUM(CASE WHEN updated_at > ? THEN 1 ELSE 0 END) "
+                "FROM knowledge WHERE status = ?",
+                (last_triple, EntryStatus.DISTILLED),
             ).fetchone()
             total_distilled = row[0] or 0
             last_distilled = row[1] or 0.0
-
-            pending = k_conn.execute(
-                "SELECT COUNT(*) FROM knowledge WHERE status = ? AND updated_at > ?",
-                (EntryStatus.DISTILLED, last_triple),
-            ).fetchone()[0]
+            pending = row[2] or 0
         finally:
             k_conn.close()
 
