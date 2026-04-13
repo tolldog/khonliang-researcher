@@ -842,11 +842,15 @@ class ResearchPipeline:
         This method will be removed once developer's consumer lands.
         """
         import warnings
+        # FutureWarning rather than DeprecationWarning: DeprecationWarning is
+        # hidden under Python's default filters in library code, which would
+        # defeat the intent of notifying every caller. FutureWarning is shown
+        # by default.
         warnings.warn(
             "ResearchPipeline.synergize() is deprecated. Use "
             "synergize_concepts() for concept bundles; FR generation "
             "moves to developer (fr_developer_4724d49d).",
-            DeprecationWarning,
+            FutureWarning,
             stacklevel=2,
         )
         from researcher.synthesizer import Synthesizer
