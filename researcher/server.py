@@ -1688,11 +1688,27 @@ Completing an FR automatically records the capability as "exists" for the target
 
     @mcp.tool()
     async def synergize(min_score: float = 0.5, max_concepts: int = 10, detail: str = "brief") -> str:
-        """Classify concepts and generate FRs (developer-specific). detail: compact|brief|full."""
+        """[DEPRECATED] Classify concepts and generate FRs. detail: compact|brief|full.
+
+        Researcher is the knowledge layer; FR generation belongs to developer.
+        Use `synergize_concepts` for concept bundles (no FRs). FR generation
+        via developer is tracked as fr_developer_4724d49d; this tool will be
+        removed once developer's consumer lands.
+        """
         result = await pipeline.synergize(min_score=min_score, max_concepts=max_concepts)
+
+        # Visible deprecation notice for MCP consumers — Python warnings don't
+        # cross the bus. Prepended to every response so callers see it at use.
+        _DEPRECATION_NOTICE = (
+            "[deprecated] researcher.synergize emits FRs — that role is moving "
+            "to developer. Use synergize_concepts for bundles; FR generation "
+            "will be handled by developer (fr_developer_4724d49d).\n\n"
+        )
+
         if "error" in result:
             raw = result.get("raw", "")
-            return f"Error: {result['error']}\n\n{raw}" if raw else f"Error: {result['error']}"
+            error_txt = f"Error: {result['error']}\n\n{raw}" if raw else f"Error: {result['error']}"
+            return _DEPRECATION_NOTICE + error_txt
 
         concepts = result["concept_count"]
         fr_count = result["fr_count"]
@@ -1732,7 +1748,7 @@ Completing an FR automatically records the capability as "exists" for the target
                     lines.append(f"  papers: {', '.join(str(p) for p in papers)}")
             return "\n".join(lines)
 
-        return format_response(compact, brief, full, detail)
+        return _DEPRECATION_NOTICE + format_response(compact, brief, full, detail)
 
     @mcp.tool()
     async def synergize_compare(min_score: float = 0.5, max_concepts: int = 10) -> str:

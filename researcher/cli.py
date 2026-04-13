@@ -512,10 +512,22 @@ def synth_landscape(ctx):
 @click.option("--max-concepts", default=30, help="Max concepts to analyze")
 @click.pass_context
 def synergize_cmd(ctx, min_score, max_concepts):
-    """Classify concepts and generate FRs across the ecosystem."""
+    """[DEPRECATED] Classify concepts and generate FRs across the ecosystem.
+
+    FR generation is moving from researcher to developer. No CLI equivalent
+    ships here; use the `synergize_concepts` MCP tool or
+    `ResearchPipeline.synergize_concepts()` Python API for concept bundles.
+    FR generation via developer is tracked as fr_developer_4724d49d.
+    """
     pipeline = _get_pipeline(ctx)
 
     async def _synergize():
+        click.echo(
+            "[deprecated] researcher.synergize emits FRs — that role moves to "
+            "developer. For concept bundles, use the `synergize_concepts` MCP "
+            "tool or `ResearchPipeline.synergize_concepts()` (no CLI equivalent).",
+            err=True,
+        )
         click.echo("Analyzing concepts across projects...")
         result = await pipeline.synergize(min_score=min_score, max_concepts=max_concepts)
         if "error" in result:
