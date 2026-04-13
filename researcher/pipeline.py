@@ -825,11 +825,30 @@ class ResearchPipeline:
     async def synergize(
         self, min_score: float = 0.5, max_concepts: int = 10
     ) -> Dict[str, Any]:
-        """Classify concepts and generate targeted FRs across the ecosystem.
+        """DEPRECATED — FR generation is moving out of researcher.
 
-        Returns parsed JSON with concept classifications and feature requests,
-        or raw content if JSON parsing fails.
+        Classify concepts and generate targeted FRs across the ecosystem.
+        Returns parsed JSON with concept classifications and feature
+        requests, or raw content if JSON parsing fails.
+
+        Researcher is the knowledge layer (ingest, distill, suggest).
+        FR generation belongs to the action layer (developer). Consumers
+        should migrate to:
+
+        - ``synergize_concepts`` for the concept-bundling half (no FRs)
+        - developer's forthcoming FR-generation pipeline for the
+          bundle-to-FR half (tracked as fr_developer_4724d49d)
+
+        This method will be removed once developer's consumer lands.
         """
+        import warnings
+        warnings.warn(
+            "ResearchPipeline.synergize() is deprecated. Use "
+            "synergize_concepts() for concept bundles; FR generation "
+            "moves to developer (fr_developer_4724d49d).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         from researcher.synthesizer import Synthesizer
 
         synth = Synthesizer(self.knowledge, self.triples, self.pool)
