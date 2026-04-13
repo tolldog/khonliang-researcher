@@ -1594,6 +1594,45 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return format_response(compact, brief, full, detail)
 
+    @mcp.tool()
+    def concept_map_freshness(detail: str = "brief") -> str:
+        """Freshness signal for the concept graph relative to distilled papers.
+
+        Cheap — aggregate queries only, no corpus scan. Consumers (e.g.
+        developer's milestone planner) use this to decide whether current
+        concept neighborhoods are fresh enough to drive sequencing, or
+        whether to trigger a re-ingestion first.
+
+        detail=compact  pipe-delimited key=value, for agent loops
+        detail=brief    structured summary (default)
+        detail=full     same summary plus raw timestamps
+        """
+        f = pipeline.concept_map_freshness()
+
+        def compact():
+            return (
+                f"fresh={str(f['fresh']).lower()}|"
+                f"pending={f['pending_distilled']}|"
+                f"triples={f['totals']['triples']}|"
+                f"distilled={f['totals']['distilled_papers']}"
+            )
+
+        def brief():
+            lag = f["lag_seconds"]
+            lag_txt = f"{lag / 3600:.1f}h" if lag is not None else "n/a"
+            status = "fresh" if f["fresh"] else f"stale ({f['pending_distilled']} pending)"
+            return (
+                f"Concept map: {status}\n"
+                f"  triples: {f['totals']['triples']}\n"
+                f"  distilled papers: {f['totals']['distilled_papers']}\n"
+                f"  last triple activity: {lag_txt} ago"
+            )
+
+        def full():
+            return json.dumps(f, indent=2, default=str)
+
+        return format_response(compact, brief, full, detail)
+
     # ------------------------------------------------------------------
     # Synergize tools
     # ------------------------------------------------------------------

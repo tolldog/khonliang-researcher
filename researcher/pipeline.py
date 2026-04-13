@@ -717,6 +717,70 @@ class ResearchPipeline:
         return result.content if result.success else f"Brief generation failed: {result.content}"
 
     # ------------------------------------------------------------------
+    # Concept graph freshness
+    # ------------------------------------------------------------------
+
+    def concept_map_freshness(self) -> Dict[str, Any]:
+        """Cheap signal: is the concept graph current relative to distilled papers?
+
+        Consumers (e.g. developer's milestone planner) use this to decide
+        whether to act on current concept neighborhoods or request a rebuild.
+        Does not scan the full corpus — single aggregate queries only.
+
+        Returns:
+            fresh: bool — no distilled papers newer than the latest triple
+            pending_distilled: int — distilled entries updated after last triple
+            last_triple_at: float | None — newest triple updated_at
+            last_distilled_at: float | None — newest distilled entry updated_at
+            lag_seconds: float | None — now - last_triple_at
+            totals: counts of triples and distilled papers
+        """
+        import sqlite3
+
+        def _ro_conn(path: str) -> sqlite3.Connection:
+            return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+        last_triple = 0.0
+        total_triples = 0
+        t_conn = _ro_conn(self.triples.db_path)
+        try:
+            row = t_conn.execute(
+                "SELECT COUNT(*), MAX(updated_at) FROM triples"
+            ).fetchone()
+            total_triples = row[0] or 0
+            last_triple = row[1] or 0.0
+        finally:
+            t_conn.close()
+
+        k_conn = _ro_conn(self.knowledge.db_path)
+        try:
+            row = k_conn.execute(
+                "SELECT COUNT(*), MAX(updated_at) FROM knowledge WHERE status = ?",
+                (EntryStatus.DISTILLED,),
+            ).fetchone()
+            total_distilled = row[0] or 0
+            last_distilled = row[1] or 0.0
+
+            pending = k_conn.execute(
+                "SELECT COUNT(*) FROM knowledge WHERE status = ? AND updated_at > ?",
+                (EntryStatus.DISTILLED, last_triple),
+            ).fetchone()[0]
+        finally:
+            k_conn.close()
+
+        return {
+            "fresh": pending == 0,
+            "pending_distilled": pending,
+            "last_triple_at": last_triple or None,
+            "last_distilled_at": last_distilled or None,
+            "lag_seconds": (time.time() - last_triple) if last_triple else None,
+            "totals": {
+                "triples": total_triples,
+                "distilled_papers": total_distilled,
+            },
+        }
+
+    # ------------------------------------------------------------------
     # Synergize
     # ------------------------------------------------------------------
 
