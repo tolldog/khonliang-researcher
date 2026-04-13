@@ -52,13 +52,10 @@ class SummarizerRole(BaseRole):
     """
 
     def __init__(self, model_pool, domain_rules: Optional[str] = None, **kwargs):
-        prompt = _load_prompt("summarizer.md")
-        if domain_rules:
-            prompt = f"{prompt}\n\n{domain_rules}"
         super().__init__(
             role="summarizer",
             model_pool=model_pool,
-            system_prompt=prompt,
+            system_prompt=_build_system_prompt("summarizer.md", domain_rules),
             **kwargs,
         )
 
@@ -113,13 +110,10 @@ class ExtractorRole(BaseRole):
     """Extract semantic triples from a paper summary."""
 
     def __init__(self, model_pool, domain_rules: Optional[str] = None, **kwargs):
-        prompt = _load_prompt("extractor.md")
-        if domain_rules:
-            prompt = f"{prompt}\n\n{domain_rules}"
         super().__init__(
             role="extractor",
             model_pool=model_pool,
-            system_prompt=prompt,
+            system_prompt=_build_system_prompt("extractor.md", domain_rules),
             **kwargs,
         )
 
@@ -151,13 +145,10 @@ class AssessorRole(BaseRole):
     """Score a paper's applicability to a specific project."""
 
     def __init__(self, model_pool, domain_rules: Optional[str] = None, **kwargs):
-        prompt = _load_prompt("assessor.md")
-        if domain_rules:
-            prompt = f"{prompt}\n\n{domain_rules}"
         super().__init__(
             role="assessor",
             model_pool=model_pool,
-            system_prompt=prompt,
+            system_prompt=_build_system_prompt("assessor.md", domain_rules),
             **kwargs,
         )
 
@@ -215,3 +206,11 @@ def _load_prompt(filename: str) -> str:
         return path.read_text().strip()
     logger.warning("Prompt file not found: %s", path)
     return f"You are a research paper {filename.replace('.md', '')}."
+
+
+def _build_system_prompt(filename: str, domain_rules: Optional[str]) -> str:
+    """Load a role's base prompt and append optional domain rules."""
+    base = _load_prompt(filename)
+    if domain_rules:
+        return f"{base}\n\n{domain_rules}"
+    return base

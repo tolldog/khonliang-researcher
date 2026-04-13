@@ -121,10 +121,18 @@ class ResearchPipeline:
 
         # Domain rules — injected into LLM prompts for domain-specific evaluation.
         # Generic researcher has no rules; domain researchers add them via config.
-        domain_cfg = self.config.get("domain", {})
-        domain_rules_list = domain_cfg.get("rules", [])
+        # Defensive: `domain:` may be null or malformed in user-written YAML.
+        domain_cfg = self.config.get("domain") or {}
+        if not isinstance(domain_cfg, dict):
+            domain_cfg = {}
+        raw_rules = domain_cfg.get("rules") or []
+        if isinstance(raw_rules, str):
+            raw_rules = [raw_rules]
+        elif not isinstance(raw_rules, list):
+            raw_rules = []
+        domain_rules_list = [str(r).strip() for r in raw_rules if str(r).strip()]
         if domain_rules_list:
-            domain_name = domain_cfg.get("name", "domain")
+            domain_name = domain_cfg.get("name") or "domain"
             domain_rules_text = f"Domain rules ({domain_name}):\n" + "\n".join(
                 f"- {r}" for r in domain_rules_list
             )
