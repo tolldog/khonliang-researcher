@@ -565,7 +565,7 @@ Most tools accept detail="compact|brief|full":
     # These functions are intentionally not registered as MCP tools.
     # Developer owns active FR lifecycle and skill registration; researcher
     # keeps historical FR data only so papers/evidence can still reference
-    # stable FR ids.
+    # stable FR IDs.
 
     def promote_fr(
         target: str,
@@ -580,7 +580,7 @@ Most tools accept detail="compact|brief|full":
 
         Use this after discussing and refining a concept — this stores it
         as a proper FR that target project Claudes can pick up via
-        feature_requests(target=...).
+        the developer FR lifecycle surface.
 
         Args:
             target: Project name (e.g. khonliang, developer, genealogy — must be a key in config.yaml `projects`)
@@ -633,7 +633,7 @@ Most tools accept detail="compact|brief|full":
             metadata={"fr_id": fr_id, "target": target},
         )
 
-        return f"FR promoted: {title}\nID: {fr_id}\nTarget: {target}\nPriority: {priority}\n\nProject Claudes can now pick this up via feature_requests(target='{target}')"
+        return f"FR promoted: {title}\nID: {fr_id}\nTarget: {target}\nPriority: {priority}\n\nProject Claudes can now pick this up via the developer FR lifecycle surface for target '{target}'"
 
     def fr_workflow() -> str:
         """Get the FR workflow protocol for project Claudes.
