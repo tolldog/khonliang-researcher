@@ -1193,188 +1193,185 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         """
         import hashlib
         from researcher.synthesizer import Synthesizer
-        from researcher.util import github_repo_key, repo_tree
+        from researcher.util import RepoTreeError, github_repo_key, repo_tree
 
-        repo_key = github_repo_key(repo_url)
-        if not repo_key:
+        try:
+            repo_key = github_repo_key(repo_url)
+        except ValueError as e:
+            return {"error": str(e)}
+        if repo_key is None:
             return {"error": f"Invalid GitHub URL: {repo_url}"}
         entry_id = f"ghrepo_{hashlib.sha256(repo_key.encode()).hexdigest()[:12]}"
 
         try:
-            tree = repo_tree(repo_url, prefix="researcher_gh_")
-            repo_path = tree.__enter__()
-        except (FileNotFoundError, RuntimeError, ValueError) as e:
-            return {"error": str(e)}
+            with repo_tree(repo_url, prefix="researcher_gh_") as repo_path:
+                # Extract package metadata
+                pkg_meta = self._extract_package_metadata(repo_path)
+                if not label and pkg_meta["description"]:
+                    label = pkg_meta["description"]
 
-        try:
-            # Extract package metadata
-            pkg_meta = self._extract_package_metadata(repo_path)
-            if not label and pkg_meta["description"]:
-                label = pkg_meta["description"]
-
-            # Read README
-            readme = ""
-            for name in ["README.md", "readme.md", "README.rst", "README"]:
-                p = repo_path / name
-                if p.exists():
-                    readme = p.read_text(errors="replace")[:4000]
-                    break
-
-            code_capabilities = []
-            readme_claims = []
-            imports_from = {}
-            architecture = ""
-
-            # Extract README claims via LLM
-            if readme:
-                readme_claims = await self._extract_readme_claims(readme)
-
-            if depth in ("readme+code", "full"):
-                # AST scan — same as scan_codebase but on temp dir
-                synth = Synthesizer(self.knowledge, self.triples, self.pool)
-                result = await synth.scan_codebase(
-                    project_name=repo_key,
-                    repo_path=str(repo_path),
-                    description=label or readme[:500],
-                    dependencies=", ".join(pkg_meta["dependencies"][:15]),
-                )
-                if result.success:
-                    content = result.content.strip()
-                    if content.startswith("```"):
-                        content = "\n".join(content.split("\n")[1:])
-                    if content.endswith("```"):
-                        content = "\n".join(content.split("\n")[:-1])
-                    try:
-                        scan_data = json.loads(content)
-                        code_capabilities = scan_data.get("capabilities", [])
-                        imports_from = scan_data.get("imports_from", {})
-                        architecture = scan_data.get("architecture", "")
-                    except json.JSONDecodeError:
-                        pass
-
-            # Scan documentation files for full depth
-            doc_summary = ""
-            if depth == "full":
-                doc_files = []
-                for doc_name in ["ARCHITECTURE.md", "CONTRIBUTING.md", "API.md", "DESIGN.md"]:
-                    p = repo_path / doc_name
+                # Read README
+                readme = ""
+                for name in ["README.md", "readme.md", "README.rst", "README"]:
+                    p = repo_path / name
                     if p.exists():
-                        doc_files.append((doc_name, p.read_text(errors="replace")[:3000]))
-                docs_dir = repo_path / "docs"
-                if docs_dir.is_dir():
-                    for doc_path in sorted(docs_dir.rglob("*.md"))[:10]:
-                        rel = doc_path.relative_to(repo_path)
-                        doc_files.append((str(rel), doc_path.read_text(errors="replace")[:2000]))
-                if doc_files:
-                    doc_texts = [f"--- {name} ---\n{content}" for name, content in doc_files[:8]]
-                    combined = "\n\n".join(doc_texts)[:8000]
-                    client = self.pool.get_client("extractor")
-                    try:
-                        doc_summary = await client.generate(
-                            prompt=f"Summarize the key technical decisions, patterns, and capabilities described in these project documents:\n\n{combined}",
-                            system="Summarize technical documentation concisely. Focus on architecture, APIs, and design decisions.",
-                            temperature=0.1,
-                            max_tokens=1000,
-                        )
-                        doc_summary = doc_summary.strip()
-                    except Exception:
-                        pass
+                        readme = p.read_text(errors="replace")[:4000]
+                        break
 
-            # Merge capabilities: code-verified first, then README-only claims
-            code_set = {c.lower() for c in code_capabilities}
-            readme_only = [c for c in readme_claims if c.lower() not in code_set]
-            capabilities = code_capabilities + readme_only
+                code_capabilities = []
+                readme_claims = []
+                imports_from = {}
+                architecture = ""
 
-            # Build concept summary (no code stored)
-            summary_parts = [f"GitHub: {repo_key}"]
-            if label:
-                summary_parts.append(f"Description: {label}")
-            if readme:
-                # Distill README to first paragraph
-                first_para = readme.split("\n\n")[0][:500] if readme else ""
-                summary_parts.append(f"README: {first_para}")
-            if capabilities:
-                summary_parts.append(f"Capabilities: {', '.join(capabilities)}")
-            if architecture:
-                summary_parts.append(f"Architecture: {architecture}")
-            if pkg_meta["entry_points"]:
-                summary_parts.append(f"Entry points: {', '.join(pkg_meta['entry_points'])}")
-            if pkg_meta["mcp_tools"]:
-                summary_parts.append(f"MCP tools: {', '.join(pkg_meta['mcp_tools'])}")
-            if doc_summary:
-                summary_parts.append(f"Documentation: {doc_summary[:1000]}")
+                # Extract README claims via LLM
+                if readme:
+                    readme_claims = await self._extract_readme_claims(readme)
 
-            # Store as knowledge entry
-            entry = KnowledgeEntry(
-                id=entry_id,
-                tier=Tier.DERIVED,
-                title=f"GitHub: {repo_key}",
-                content="\n".join(summary_parts),
-                source=repo_url,
-                scope="external",
-                tags=["github", "external", "concepts"],
-                status=EntryStatus.DISTILLED,
-                metadata={
+                if depth in ("readme+code", "full"):
+                    # AST scan — same as scan_codebase but on temp dir
+                    synth = Synthesizer(self.knowledge, self.triples, self.pool)
+                    result = await synth.scan_codebase(
+                        project_name=repo_key,
+                        repo_path=str(repo_path),
+                        description=label or readme[:500],
+                        dependencies=", ".join(pkg_meta["dependencies"][:15]),
+                    )
+                    if result.success:
+                        content = result.content.strip()
+                        if content.startswith("```"):
+                            content = "\n".join(content.split("\n")[1:])
+                        if content.endswith("```"):
+                            content = "\n".join(content.split("\n")[:-1])
+                        try:
+                            scan_data = json.loads(content)
+                            code_capabilities = scan_data.get("capabilities", [])
+                            imports_from = scan_data.get("imports_from", {})
+                            architecture = scan_data.get("architecture", "")
+                        except json.JSONDecodeError:
+                            pass
+
+                # Scan documentation files for full depth
+                doc_summary = ""
+                if depth == "full":
+                    doc_files = []
+                    for doc_name in ["ARCHITECTURE.md", "CONTRIBUTING.md", "API.md", "DESIGN.md"]:
+                        p = repo_path / doc_name
+                        if p.exists():
+                            doc_files.append((doc_name, p.read_text(errors="replace")[:3000]))
+                    docs_dir = repo_path / "docs"
+                    if docs_dir.is_dir():
+                        for doc_path in sorted(docs_dir.rglob("*.md"))[:10]:
+                            rel = doc_path.relative_to(repo_path)
+                            doc_files.append((str(rel), doc_path.read_text(errors="replace")[:2000]))
+                    if doc_files:
+                        doc_texts = [f"--- {name} ---\n{content}" for name, content in doc_files[:8]]
+                        combined = "\n\n".join(doc_texts)[:8000]
+                        client = self.pool.get_client("extractor")
+                        try:
+                            doc_summary = await client.generate(
+                                prompt=f"Summarize the key technical decisions, patterns, and capabilities described in these project documents:\n\n{combined}",
+                                system="Summarize technical documentation concisely. Focus on architecture, APIs, and design decisions.",
+                                temperature=0.1,
+                                max_tokens=1000,
+                            )
+                            doc_summary = doc_summary.strip()
+                        except Exception:
+                            pass
+
+                # Merge capabilities: code-verified first, then README-only claims
+                code_set = {c.lower() for c in code_capabilities}
+                readme_only = [c for c in readme_claims if c.lower() not in code_set]
+                capabilities = code_capabilities + readme_only
+
+                # Build concept summary (no code stored)
+                summary_parts = [f"GitHub: {repo_key}"]
+                if label:
+                    summary_parts.append(f"Description: {label}")
+                if readme:
+                    # Distill README to first paragraph
+                    first_para = readme.split("\n\n")[0][:500] if readme else ""
+                    summary_parts.append(f"README: {first_para}")
+                if capabilities:
+                    summary_parts.append(f"Capabilities: {', '.join(capabilities)}")
+                if architecture:
+                    summary_parts.append(f"Architecture: {architecture}")
+                if pkg_meta["entry_points"]:
+                    summary_parts.append(f"Entry points: {', '.join(pkg_meta['entry_points'])}")
+                if pkg_meta["mcp_tools"]:
+                    summary_parts.append(f"MCP tools: {', '.join(pkg_meta['mcp_tools'])}")
+                if doc_summary:
+                    summary_parts.append(f"Documentation: {doc_summary[:1000]}")
+
+                # Store as knowledge entry
+                entry = KnowledgeEntry(
+                    id=entry_id,
+                    tier=Tier.DERIVED,
+                    title=f"GitHub: {repo_key}",
+                    content="\n".join(summary_parts),
+                    source=repo_url,
+                    scope="external",
+                    tags=["github", "external", "concepts"],
+                    status=EntryStatus.DISTILLED,
+                    metadata={
+                        "repo": repo_key,
+                        "url": repo_url,
+                        "capabilities": capabilities,
+                        "code_capabilities": code_capabilities,
+                        "readme_claims": readme_claims,
+                        "readme_only_claims": readme_only,
+                        "imports_from": imports_from,
+                        "architecture": architecture,
+                        "package": pkg_meta,
+                        "doc_summary": doc_summary or None,
+                        "depth": depth,
+                    },
+                )
+                self.knowledge.add(entry)
+
+                # Score relevance against configured projects
+                scores = await self.score_relevance(entry_id)
+
+                # Store triples — differentiate code-verified vs README claims
+                readme_set = {c.lower() for c in readme_claims}
+                for cap in code_capabilities:
+                    self.triples.add(
+                        subject=repo_key,
+                        predicate="implements",
+                        obj=cap,
+                        confidence=0.95 if cap.lower() in readme_set else 0.85,
+                        source=f"github:{repo_key}",
+                    )
+                for claim in readme_only:
+                    self.triples.add(
+                        subject=repo_key,
+                        predicate="claims",
+                        obj=claim,
+                        confidence=0.6,
+                        source=f"github:{repo_key}",
+                    )
+
+                self.digest.record(
+                    summary=f"Ingested GitHub repo {repo_key}: {len(capabilities)} capabilities extracted",
+                    source="pipeline",
+                    audience="research",
+                    tags=["github", "ingest"],
+                    metadata={"repo": repo_key, "cap_count": len(capabilities)},
+                )
+
+                return {
                     "repo": repo_key,
-                    "url": repo_url,
+                    "entry_id": entry_id,
                     "capabilities": capabilities,
                     "code_capabilities": code_capabilities,
                     "readme_claims": readme_claims,
                     "readme_only_claims": readme_only,
                     "imports_from": imports_from,
                     "architecture": architecture,
-                    "package": pkg_meta,
-                    "doc_summary": doc_summary or None,
                     "depth": depth,
-                },
-            )
-            self.knowledge.add(entry)
-
-            # Score relevance against configured projects
-            scores = await self.score_relevance(entry_id)
-
-            # Store triples — differentiate code-verified vs README claims
-            readme_set = {c.lower() for c in readme_claims}
-            for cap in code_capabilities:
-                self.triples.add(
-                    subject=repo_key,
-                    predicate="implements",
-                    obj=cap,
-                    confidence=0.95 if cap.lower() in readme_set else 0.85,
-                    source=f"github:{repo_key}",
-                )
-            for claim in readme_only:
-                self.triples.add(
-                    subject=repo_key,
-                    predicate="claims",
-                    obj=claim,
-                    confidence=0.6,
-                    source=f"github:{repo_key}",
-                )
-
-            self.digest.record(
-                summary=f"Ingested GitHub repo {repo_key}: {len(capabilities)} capabilities extracted",
-                source="pipeline",
-                audience="research",
-                tags=["github", "ingest"],
-                metadata={"repo": repo_key, "cap_count": len(capabilities)},
-            )
-
-            return {
-                "repo": repo_key,
-                "entry_id": entry_id,
-                "capabilities": capabilities,
-                "code_capabilities": code_capabilities,
-                "readme_claims": readme_claims,
-                "readme_only_claims": readme_only,
-                "imports_from": imports_from,
-                "architecture": architecture,
-                "depth": depth,
-                "relevance_scores": scores,
-            }
-
-        finally:
-            tree.__exit__(None, None, None)
+                    "relevance_scores": scores,
+                }
+        except (FileNotFoundError, RepoTreeError) as e:
+            return {"error": str(e)}
 
     async def scan_codebase(self, project: str) -> Dict[str, Any]:
         """Scan a project's codebase and store discovered capabilities.
