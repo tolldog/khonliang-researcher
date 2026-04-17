@@ -37,10 +37,6 @@ def _compact_field(value: Any, limit: int = 80) -> str:
     return truncate(text.strip(), limit)
 
 
-def _split_csv(value: str) -> list[str]:
-    return [part.strip() for part in str(value or "").split(",") if part.strip()]
-
-
 def _filter_taxonomy(taxonomy: dict[str, Any], audience: str = "") -> tuple[list[dict], list[dict]]:
     groups = list(taxonomy.get("groups", []))
     relationships = list(taxonomy.get("relationships", []))
@@ -64,10 +60,6 @@ def _filter_taxonomy(taxonomy: dict[str, Any], audience: str = "") -> tuple[list
     )
 
 
-def _format_concept_taxonomy(taxonomy: dict[str, Any], *, audience: str = "", detail: str = "brief") -> str:
-    return _format_concept_taxonomy_limited(taxonomy, audience=audience, detail=detail, limit=50)
-
-
 def _format_concept_taxonomy_limited(
     taxonomy: dict[str, Any],
     *,
@@ -86,12 +78,18 @@ def _format_concept_taxonomy_limited(
     total_groups = len(groups)
     max_groups = max(1, int(limit))
     shown_groups = groups[:max_groups]
+    shown_group_codes = {g.get("code") for g in shown_groups}
+    relationships = [
+        rel
+        for rel in relationships
+        if rel.get("source") in shown_group_codes and rel.get("target") in shown_group_codes
+    ]
 
     def compact():
         return "\n".join(
             f"{g['code']}|{_compact_field(g.get('audience'), 32)}|"
             f"{_compact_field(g.get('label'), 60)}|entities={len(g.get('entities', []))}"
-            for g in shown_groups[:30]
+            for g in shown_groups
         )
 
     def brief():
@@ -1660,11 +1658,12 @@ Completing an FR automatically records the capability as "exists" for the target
         when ``universal_concepts`` names those parent patterns.
         """
         from khonliang_researcher import build_concept_graph, build_concept_taxonomy
+        from researcher.util import split_csv
 
         graph = build_concept_graph(pipeline.triples, knowledge=pipeline.knowledge)
         taxonomy = build_concept_taxonomy(
             graph,
-            universal_concepts=_split_csv(universal_concepts),
+            universal_concepts=split_csv(universal_concepts),
         )
         return _format_concept_taxonomy_limited(
             taxonomy,

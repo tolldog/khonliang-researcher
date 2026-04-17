@@ -1180,18 +1180,15 @@ def graph_project(ctx, project, min_score, limit):
 def graph_taxonomy(ctx, audience, universal, limit):
     """Show audience-scoped concept taxonomy groups."""
     from khonliang_researcher import build_concept_graph, build_concept_taxonomy
+    from researcher.util import split_csv
 
     pipeline = _get_pipeline(ctx)
     graph_data = build_concept_graph(pipeline.triples, knowledge=pipeline.knowledge)
     taxonomy = build_concept_taxonomy(
         graph_data,
-        universal_concepts=_split_csv(universal),
+        universal_concepts=split_csv(universal),
     )
     click.echo(_format_taxonomy(taxonomy, audience=audience, limit=limit))
-
-
-def _split_csv(value):
-    return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
 def _format_taxonomy(taxonomy, *, audience="", limit=50):
@@ -1220,6 +1217,11 @@ def _format_taxonomy(taxonomy, *, audience="", limit=50):
     total_groups = len(groups)
     groups = sorted(groups, key=lambda g: (g.get("audience", ""), g.get("code", "")))
     groups = groups[:max(1, int(limit))]
+    displayed_codes = {group["code"] for group in groups}
+    relationships = [
+        rel for rel in relationships
+        if rel.get("source") in displayed_codes and rel.get("target") in displayed_codes
+    ]
 
     lines = [f"Concept taxonomy ({total_groups} groups, showing {len(groups)})"]
     current_audience = ""
