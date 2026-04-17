@@ -1192,34 +1192,21 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         depth: "readme" (README only), "readme+code" (AST scan), "full" (README + code + docs)
         """
         import hashlib
-        import shutil
-        import subprocess
-        import tempfile
         from researcher.synthesizer import Synthesizer
+        from researcher.util import github_repo_key, repo_tree
 
-        # Parse repo URL
-        repo_url = repo_url.rstrip("/")
-        if repo_url.endswith(".git"):
-            repo_url = repo_url[:-4]
-        parts = repo_url.replace("https://github.com/", "").replace("http://github.com/", "").split("/")
-        if len(parts) < 2:
+        repo_key = github_repo_key(repo_url)
+        if not repo_key:
             return {"error": f"Invalid GitHub URL: {repo_url}"}
-        owner, repo_name = parts[0], parts[1]
-        repo_key = f"{owner}/{repo_name}"
         entry_id = f"ghrepo_{hashlib.sha256(repo_key.encode()).hexdigest()[:12]}"
 
-        # Clone to temp dir (shallow)
-        tmp_dir = tempfile.mkdtemp(prefix="researcher_gh_")
         try:
-            proc = subprocess.run(
-                ["git", "clone", "--depth=1", f"https://github.com/{repo_key}.git", tmp_dir],
-                capture_output=True, text=True, timeout=120,
-            )
-            if proc.returncode != 0:
-                return {"error": f"Clone failed: {proc.stderr[:200]}"}
+            tree = repo_tree(repo_url, prefix="researcher_gh_")
+            repo_path = tree.__enter__()
+        except (FileNotFoundError, RuntimeError, ValueError) as e:
+            return {"error": str(e)}
 
-            repo_path = Path(tmp_dir)
-
+        try:
             # Extract package metadata
             pkg_meta = self._extract_package_metadata(repo_path)
             if not label and pkg_meta["description"]:
@@ -1387,8 +1374,7 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
             }
 
         finally:
-            # Always delete the clone — cleanroom
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            tree.__exit__(None, None, None)
 
     async def scan_codebase(self, project: str) -> Dict[str, Any]:
         """Scan a project's codebase and store discovered capabilities.

@@ -57,7 +57,9 @@ db_path: data/researcher.db
 #     - "Penalize papers whose only contribution is a benchmark without a reusable mechanism."
 
 # Projects this researcher instance scores papers against. Edit the
-# `repo` paths to match your local checkout layout.
+# `repo` accepts either a local checkout path or a GitHub repository URL.
+# GitHub URLs are the default for portable agent/runtime configuration;
+# local paths are still useful for active development.
 projects:
   khonliang:
     description: >
@@ -65,7 +67,7 @@ projects:
       knowledge stores, triple stores, digest synthesis, and MCP server.
     scope: library
     depends_on: []
-    repo: /path/to/ollama-khonliang
+    repo: https://github.com/tolldog/ollama-khonliang
   genealogy:
     description: >
       Family history research tool using khonliang. Multi-agent system with
@@ -74,7 +76,7 @@ projects:
       RAG for historical records, WebSocket chat with session context.
     scope: genealogy
     depends_on: [khonliang]
-    repo: /path/to/genealogy
+    repo: https://github.com/tolldog/genealogy
   researcher-lib:
     description: >
       Shared research/evaluation primitives library. Provides RelevanceScorer,
@@ -83,7 +85,7 @@ projects:
       world) and developer (create artifacts) apps.
     scope: library
     depends_on: [khonliang]
-    repo: /path/to/khonliang-researcher-lib
+    repo: https://github.com/tolldog/khonliang-researcher-lib
   khonliang-bus:
     description: >
       Cross-app event bus and service registry. Go server with Python+Go
@@ -92,7 +94,7 @@ projects:
       push notifications and service discovery.
     scope: infrastructure
     depends_on: [khonliang]
-    repo: /path/to/khonliang-bus
+    repo: https://github.com/tolldog/khonliang-bus
   researcher:
     description: >
       Automated research pipeline: RSS/search -> fetch -> distill ->
@@ -100,7 +102,7 @@ projects:
       project Claudes to consume research insights.
     scope: research
     depends_on: [khonliang, researcher-lib]
-    repo: /path/to/khonliang-researcher
+    repo: https://github.com/tolldog/khonliang-researcher
   developer:
     description: >
       Development lifecycle MCP server. Inverse of researcher: ingests
@@ -112,4 +114,4 @@ projects:
       focus purely on code and code review.
     scope: development
     depends_on: [khonliang, researcher-lib, khonliang-bus]
-    repo: /path/to/khonliang-developer
+    repo: https://github.com/tolldog/khonliang-developer

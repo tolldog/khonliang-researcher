@@ -1113,149 +1113,156 @@ class Synthesizer:
         import ast
         import os
         from pathlib import Path
+        from researcher.util import repo_tree
 
-        repo = Path(repo_path)
-        if not repo.is_dir():
+        try:
+            tree_ctx = repo_tree(repo_path, prefix="researcher_scan_")
+            repo_context = tree_ctx.__enter__()
+        except (FileNotFoundError, RuntimeError, ValueError) as e:
             return SynthesisResult(
                 query="scan", synthesis_type="scan",
-                content=f"Directory not found: {repo_path}",
+                content=str(e),
                 paper_count=0, success=False,
             )
 
-        # ---- Phase 1: AST extraction ----
-        skip_dirs = {"__pycache__", ".venv", "venv", "node_modules", ".git",
-                      "dist", "build", ".eggs", "tests", "test"}
-        module_map = []
+        try:
+            repo = Path(repo_context)
+            # ---- Phase 1: AST extraction ----
+            skip_dirs = {"__pycache__", ".venv", "venv", "node_modules", ".git",
+                          "dist", "build", ".eggs", "tests", "test"}
+            module_map = []
 
-        for root, dirs, files in os.walk(repo):
-            dirs[:] = [d for d in dirs
-                       if not d.startswith(".") and d not in skip_dirs
-                       and not d.endswith(".egg-info")]
-            for f in sorted(files):
-                if not f.endswith(".py"):
-                    continue
-                abs_path = os.path.join(root, f)
-                rel_path = os.path.relpath(abs_path, repo)
+            for root, dirs, files in os.walk(repo):
+                dirs[:] = [d for d in dirs
+                           if not d.startswith(".") and d not in skip_dirs
+                           and not d.endswith(".egg-info")]
+                for f in sorted(files):
+                    if not f.endswith(".py"):
+                        continue
+                    abs_path = os.path.join(root, f)
+                    rel_path = os.path.relpath(abs_path, repo)
+                    try:
+                        source = Path(abs_path).read_text(errors="replace")
+                        ast_tree = ast.parse(source)
+                    except (SyntaxError, ValueError):
+                        continue
+
+                    info = self._extract_ast_info(ast_tree)
+                    if not info["classes"] and not info["functions"] and not info["imports"]:
+                        continue
+                    module_map.append((rel_path, info))
+
+            # Build set of all project-defined names for call graph filtering
+            project_names = set()
+            for _, info in module_map:
+                for cls in info["classes"]:
+                    project_names.add(cls["name"])
+                    for m in cls["methods"]:
+                        project_names.add(m["name"])
+                for func in info["functions"]:
+                    project_names.add(func["name"])
+
+            _STDLIB_PREFIXES = ("os", "sys", "json", "logging", "typing",
+                                "dataclasses", "pathlib", "collections", "abc",
+                                "enum", "time", "datetime", "re", "hashlib",
+                                "math", "functools", "asyncio", "uuid",
+                                "sqlite3", "inspect", "textwrap", "contextlib",
+                                "copy", "io", "threading", "concurrent")
+
+            # Format module map: compact one line per module.
+            lines = []
+            for rel_path, info in module_map:
+                doc = info.get("docstring", "")
+                parts = [rel_path]
+                if doc:
+                    parts.append(f'"{doc}"')
+                for cls in info["classes"]:
+                    bases = f"({', '.join(cls['bases'])})" if cls["bases"] else ""
+                    methods = ", ".join(m["name"] for m in cls["methods"])
+                    parts.append(f"class {cls['name']}{bases} [{methods}]" if methods
+                                 else f"class {cls['name']}{bases}")
+                for func in info["functions"]:
+                    parts.append(f"{'async ' if func.get('is_async') else ''}def {func['name']}")
+                # External imports only (skip stdlib)
+                ext_imports = [i for i in info["imports"]
+                               if not i.startswith(_STDLIB_PREFIXES)]
+                if ext_imports:
+                    parts.append(f"imports: {', '.join(ext_imports[:3])}")
+                # Intra-project calls (intersection of callee names with project definitions)
+                # Filter out generic names that don't convey architecture
+                _GENERIC = {"__init__", "handle", "run", "start", "stop", "close",
+                            "get", "set", "add", "remove", "update", "delete",
+                            "read", "write", "load", "save", "open", "parse",
+                            "format", "build", "create", "make", "init", "setup"}
+                project_calls = sorted(
+                    (info.get("calls", set()) & project_names) - _GENERIC
+                )
+                if project_calls:
+                    parts.append(f"calls: {', '.join(project_calls[:8])}")
+                lines.append(" | ".join(parts))
+
+            logger.info("AST scan: %d modules, %d chars for %s",
+                         len(module_map), sum(len(l) for l in lines), project_name)
+
+            # ---- Phase 2: Chunked LLM calls ----
+            # Split modules into chunks to avoid attention degradation on long inputs.
+            chunk_size = 20
+            all_capabilities = []
+            all_imports: Dict[str, list] = {}
+            all_architectures: list[str] = []
+            reviewer = self.pool.get_client("reviewer")
+
+            for i in range(0, len(lines), chunk_size):
+                chunk_text = "\n".join(lines[i:i + chunk_size])
+                prompt = _SCAN_PROJECT_PROMPT.format(
+                    project_name=project_name,
+                    project_description=description or "No description",
+                    dependencies=dependencies or "None",
+                    module_map=chunk_text,
+                )
                 try:
-                    source = Path(abs_path).read_text(errors="replace")
-                    tree = ast.parse(source)
-                except (SyntaxError, ValueError):
-                    continue
-
-                info = self._extract_ast_info(tree)
-                if not info["classes"] and not info["functions"] and not info["imports"]:
-                    continue
-                module_map.append((rel_path, info))
-
-        # Build set of all project-defined names for call graph filtering
-        project_names = set()
-        for _, info in module_map:
-            for cls in info["classes"]:
-                project_names.add(cls["name"])
-                for m in cls["methods"]:
-                    project_names.add(m["name"])
-            for func in info["functions"]:
-                project_names.add(func["name"])
-
-        _STDLIB_PREFIXES = ("os", "sys", "json", "logging", "typing",
-                            "dataclasses", "pathlib", "collections", "abc",
-                            "enum", "time", "datetime", "re", "hashlib",
-                            "math", "functools", "asyncio", "uuid",
-                            "sqlite3", "inspect", "textwrap", "contextlib",
-                            "copy", "io", "threading", "concurrent")
-
-        # Format module map — compact: one line per module
-        lines = []
-        for rel_path, info in module_map:
-            doc = info.get("docstring", "")
-            parts = [rel_path]
-            if doc:
-                parts.append(f'"{doc}"')
-            for cls in info["classes"]:
-                bases = f"({', '.join(cls['bases'])})" if cls["bases"] else ""
-                methods = ", ".join(m["name"] for m in cls["methods"])
-                parts.append(f"class {cls['name']}{bases} [{methods}]" if methods
-                             else f"class {cls['name']}{bases}")
-            for func in info["functions"]:
-                parts.append(f"{'async ' if func.get('is_async') else ''}def {func['name']}")
-            # External imports only (skip stdlib)
-            ext_imports = [i for i in info["imports"]
-                           if not i.startswith(_STDLIB_PREFIXES)]
-            if ext_imports:
-                parts.append(f"imports: {', '.join(ext_imports[:3])}")
-            # Intra-project calls (intersection of callee names with project definitions)
-            # Filter out generic names that don't convey architecture
-            _GENERIC = {"__init__", "handle", "run", "start", "stop", "close",
-                        "get", "set", "add", "remove", "update", "delete",
-                        "read", "write", "load", "save", "open", "parse",
-                        "format", "build", "create", "make", "init", "setup"}
-            project_calls = sorted(
-                (info.get("calls", set()) & project_names) - _GENERIC
-            )
-            if project_calls:
-                parts.append(f"calls: {', '.join(project_calls[:8])}")
-            lines.append(" | ".join(parts))
-
-        logger.info("AST scan: %d modules, %d chars for %s",
-                     len(module_map), sum(len(l) for l in lines), project_name)
-
-        # ---- Phase 2: Chunked LLM calls ----
-        # Split modules into chunks to avoid attention degradation on long inputs.
-        chunk_size = 20
-        all_capabilities = []
-        all_imports: Dict[str, list] = {}
-        all_architectures: list[str] = []
-        reviewer = self.pool.get_client("reviewer")
-
-        for i in range(0, len(lines), chunk_size):
-            chunk_text = "\n".join(lines[i:i + chunk_size])
-            prompt = _SCAN_PROJECT_PROMPT.format(
-                project_name=project_name,
-                project_description=description or "No description",
-                dependencies=dependencies or "None",
-                module_map=chunk_text,
-            )
-            try:
-                raw = await reviewer.generate(
-                    prompt=prompt,
-                    system="You extract capabilities from code structure. Output only JSON.",
-                    temperature=0.1,
-                    max_tokens=2000,
-                )
-                sj = raw.strip()
-                if sj.startswith("```"):
-                    sj = "\n".join(sj.split("\n")[1:])
-                if sj.endswith("```"):
-                    sj = "\n".join(sj.split("\n")[:-1])
-                data = json.loads(sj)
-                for cap in data.get("capabilities", []):
-                    if cap not in all_capabilities:
-                        all_capabilities.append(cap)
-                for dep, items in data.get("imports_from", {}).items():
-                    all_imports.setdefault(dep, []).extend(
-                        i for i in items if i not in all_imports.get(dep, [])
+                    raw = await reviewer.generate(
+                        prompt=prompt,
+                        system="You extract capabilities from code structure. Output only JSON.",
+                        temperature=0.1,
+                        max_tokens=2000,
                     )
-                arch = data.get("architecture", "")
-                if arch and arch not in all_architectures:
-                    all_architectures.append(arch)
-            except (json.JSONDecodeError, Exception) as e:
-                logger.warning("Scan chunk %d failed for %s: %s",
-                               i // chunk_size, project_name, e
-                )
-                continue
+                    sj = raw.strip()
+                    if sj.startswith("```"):
+                        sj = "\n".join(sj.split("\n")[1:])
+                    if sj.endswith("```"):
+                        sj = "\n".join(sj.split("\n")[:-1])
+                    data = json.loads(sj)
+                    for cap in data.get("capabilities", []):
+                        if cap not in all_capabilities:
+                            all_capabilities.append(cap)
+                    for dep, items in data.get("imports_from", {}).items():
+                        all_imports.setdefault(dep, []).extend(
+                            i for i in items if i not in all_imports.get(dep, [])
+                        )
+                    arch = data.get("architecture", "")
+                    if arch and arch not in all_architectures:
+                        all_architectures.append(arch)
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.warning("Scan chunk %d failed for %s: %s",
+                                   i // chunk_size, project_name, e
+                    )
+                    continue
 
-        content = json.dumps({
-            "capabilities": all_capabilities,
-            "imports_from": all_imports,
-            "architecture": all_architectures[0] if all_architectures else "",
-        })
-        return SynthesisResult(
-            query="scan",
-            synthesis_type="scan",
-            content=content,
-            paper_count=len(module_map),
-            success=True,
-        )
+            content = json.dumps({
+                "capabilities": all_capabilities,
+                "imports_from": all_imports,
+                "architecture": all_architectures[0] if all_architectures else "",
+            })
+            return SynthesisResult(
+                query="scan",
+                synthesis_type="scan",
+                content=content,
+                paper_count=len(module_map),
+                success=True,
+            )
+        finally:
+            tree_ctx.__exit__(None, None, None)
 
     @staticmethod
     def _extract_ast_info(tree: "ast.Module") -> dict:
