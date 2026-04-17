@@ -1,6 +1,6 @@
 # khonliang-researcher
 
-Automated research pipeline: RSS/search -> fetch -> distill -> concept graph -> synergize -> FR generation. Served over MCP for consumption by project Claudes (khonliang, developer, genealogy).
+Automated research pipeline: RSS/search -> fetch -> distill -> concept graph -> concept bundles and evidence briefs. Served over MCP for consumption by project Claudes (khonliang, developer, genealogy).
 
 ## Stack
 
@@ -22,15 +22,15 @@ All MCP tool responses must be token-efficient. External agents pay per token â€
 ## Architecture Boundary
 
 - **khonliang** = library. Agent roles, routing, consensus, stores, MCP transport, generic capabilities.
-- **researcher** = business logic. Paper discovery, distillation strategy, concept extraction, relevance scoring, FR generation heuristics, report generation.
+- **researcher** = business logic. Paper discovery, distillation strategy, concept extraction, relevance scoring, concept bundling, report generation.
+- **developer** = active FR lifecycle. Promotion, status, dependencies, milestones, specs, and work units live there.
 - New features go in researcher unless they are generic multi-agent primitives. When in doubt, it's researcher business logic.
 
 ## Capability Tracking
 
-Projects have `exists` / `planned` / `exploring` capability tags, auto-maintained via FR lifecycle:
-- `update_fr_status("completed")` -> records capability as `exists`
-- `update_fr_status("planned")` -> records as `planned`
-- `synergize()` reads these to avoid proposing features that already exist
+Projects have `exists` / `planned` / `exploring` capability tags. Researcher
+reads these for landscape and capability reports, while developer owns active
+FR lifecycle updates.
 
 ## Key Files
 

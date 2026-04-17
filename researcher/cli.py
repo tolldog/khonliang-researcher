@@ -13,7 +13,6 @@ Usage:
     khonliang-researcher ingest-github REPO_URL
     khonliang-researcher research-caps [PROJECT]
     khonliang-researcher graph tree|matrix|path|project
-    khonliang-researcher fr list|workflow|update|next|promote|overlaps|merge|deps
     khonliang-researcher project landscape|capabilities
     khonliang-researcher repo register|list
     khonliang-researcher serve
@@ -507,7 +506,6 @@ def synth_landscape(ctx):
 # Synergize and evaluate
 # ------------------------------------------------------------------
 
-@cli.command("synergize")
 @click.option("--min-score", default=0.5, help="Minimum concept score threshold")
 @click.option("--max-concepts", default=30, help="Max concepts to analyze")
 @click.pass_context
@@ -589,14 +587,15 @@ def evaluate_cmd(ctx, capability):
 # Feature requests
 # ------------------------------------------------------------------
 
-@cli.group()
 @click.pass_context
 def fr(ctx):
-    """Manage feature requests."""
-    pass
+    """Legacy local FR helpers.
+
+    Not registered as a CLI command. Developer owns active FR lifecycle.
+    """
+    click.echo("Researcher no longer owns active FR lifecycle. Use developer.")
 
 
-@fr.command("list")
 @click.option("--target", "-t", default="", help="Filter by target project")
 @click.option("--reviewed", is_flag=True, help="Only show reviewed FRs")
 @click.pass_context
@@ -636,7 +635,6 @@ def fr_list(ctx, target, reviewed):
         click.echo(f"          ID: {f['id']}  Concept: {f.get('concept', '?')}")
 
 
-@fr.command("workflow")
 def fr_workflow():
     """Show the FR workflow protocol for project Claudes."""
     click.echo("""FR Workflow: open → planned → in_progress → completed
@@ -659,7 +657,6 @@ Management:
   fr promote -t TARGET TITLE  Create a new FR""")
 
 
-@fr.command("next")
 @click.option("--target", "-t", default="", help="Filter by target project")
 @click.pass_context
 def fr_next(ctx, target):
@@ -754,7 +751,6 @@ def fr_next(ctx, target):
         click.echo(f"{len(blocked)} FR(s) blocked.")
 
 
-@fr.command("update")
 @click.argument("fr_id")
 @click.argument("status", type=click.Choice(["open", "planned", "in_progress", "completed"]))
 @click.option("--branch", default="", help="Git branch name (for in_progress)")
@@ -820,7 +816,6 @@ def fr_update(ctx, fr_id, status, branch, notes):
     )
 
 
-@fr.command("promote")
 @click.argument("title")
 @click.option("--target", "-t", required=True, help="Target project")
 @click.option("--description", "-d", default="", help="Full FR description")
@@ -871,7 +866,6 @@ def fr_promote(ctx, title, target, description, priority, concept, classificatio
     click.echo(f"Target: {target}  Priority: {priority}")
 
 
-@fr.command("deps")
 @click.argument("fr_id")
 @click.argument("depends_on")
 @click.pass_context
@@ -899,7 +893,6 @@ def fr_deps(ctx, fr_id, depends_on):
         click.echo(f"  {dep_id}: {dep.title if dep else '?'}")
 
 
-@fr.command("overlaps")
 @click.option("--target", "-t", default="", help="Filter by target project")
 @click.option("--threshold", default=0.75, help="Similarity threshold")
 @click.pass_context
@@ -954,7 +947,6 @@ def fr_overlaps(ctx, target, threshold):
     _run(_overlaps())
 
 
-@fr.command("merge")
 @click.argument("keep_id")
 @click.argument("merge_ids")
 @click.option("--title", default="", help="New merged title")
@@ -1017,7 +1009,6 @@ def fr_merge(ctx, keep_id, merge_ids, title, description):
     click.echo(f"Archived: {', '.join(ids_to_merge)}")
 
 
-@fr.command("review")
 @click.option("--target", "-t", default="", help="Filter by target project")
 @click.pass_context
 def fr_review(ctx, target):

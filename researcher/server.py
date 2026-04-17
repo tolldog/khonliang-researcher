@@ -10,7 +10,6 @@ Usage:
 
 import argparse
 import asyncio
-from collections import deque
 import json
 import logging
 import sys
@@ -56,7 +55,7 @@ def create_research_server(pipeline: ResearchPipeline):
 1. `find_papers(query)` — search arxiv + semantic scholar
 2. `fetch_paper(url)` — ingest a paper into the knowledge store
 3. `start_distillation()` — summarize + extract triples + score relevance
-4. `feature_requests(target="your_project")` — see what emerged
+4. `synergize_concepts()` — find concept bundles for developer to turn into FRs
 
 ## Discovery
 - `find_papers(query, engines="arxiv,semantic_scholar")` — search by keyword
@@ -96,15 +95,15 @@ and per-project applicability scores.
 - `synthesize_topic(topic)` — cross-paper analysis of a theme
 - `synthesize_project(project)` — applicability brief for a project
 - `synthesize_landscape()` — map major directions, trends, gaps
-- `project_landscape(project)` — per-project view with concepts, FRs, capabilities
+- `project_landscape(project)` — per-project view with concepts and capabilities
 
 ## Feature Requests
-- `synergize()` — classify concepts and auto-generate FRs
-- `feature_requests(target)` — list FRs for a project
-- `next_fr(target)` — highest priority unblocked FR
-- `review_feature_requests(target)` — deep-review with 32B model
-- `promote_fr(...)` — manually create a vetted FR
-- `fr_workflow()` — full lifecycle protocol (open → planned → completed)
+Researcher no longer owns active FR lifecycle. Use developer for
+`promote_fr`, `feature_requests`, `next_fr`, status updates, dependencies,
+milestones, and work units. Researcher keeps historical FR records only so
+paper/evidence references remain resolvable by ID.
+
+- `synergize_concepts()` — concept bundles for developer to evaluate
 - `project_capabilities(target)` — what exists vs what's planned
 
 ## Ideas Pipeline
@@ -559,10 +558,14 @@ Most tools accept detail="compact|brief|full":
         )
 
     # ------------------------------------------------------------------
-    # FR promotion
+    # Legacy FR helpers
     # ------------------------------------------------------------------
+    #
+    # These functions are intentionally not registered as MCP tools.
+    # Developer owns active FR lifecycle and skill registration; researcher
+    # keeps historical FR data only so papers/evidence can still reference
+    # stable FR ids.
 
-    @mcp.tool()
     def promote_fr(
         target: str,
         title: str,
@@ -631,7 +634,6 @@ Most tools accept detail="compact|brief|full":
 
         return f"FR promoted: {title}\nID: {fr_id}\nTarget: {target}\nPriority: {priority}\n\nProject Claudes can now pick this up via feature_requests(target='{target}')"
 
-    @mcp.tool()
     def fr_workflow() -> str:
         """Get the FR workflow protocol for project Claudes.
 
@@ -684,7 +686,6 @@ Each status update is recorded with timestamp and optional notes for audit trail
 Completing an FR automatically records the capability as "exists" for the target project.
 """
 
-    @mcp.tool()
     def update_fr_status(fr_id: str, status: str, branch: str = "", notes: str = "") -> str:
         """Update a feature request's lifecycle status.
 
@@ -775,7 +776,6 @@ Completing an FR automatically records the capability as "exists" for the target
             result += f"\nNotes: {notes}"
         return result
 
-    @mcp.tool()
     def set_fr_dependency(fr_id: str, depends_on: str) -> str:
         """Set dependencies between feature requests.
 
@@ -805,7 +805,6 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return f"Dependencies set for {entry.title}:\n" + "\n".join(dep_titles)
 
-    @mcp.tool()
     def next_fr(target: str = "", detail: str = "brief") -> str:
         """Next FR to work on (highest priority, deps met). detail: compact|brief|full."""
         from khonliang.knowledge.store import EntryStatus
@@ -923,7 +922,6 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return format_response(compact, brief, full, detail)
 
-    @mcp.tool()
     async def fr_overlaps(target: str = "", threshold: float = 0.75, detail: str = "brief") -> str:
         """Find overlapping FRs. detail: compact|brief|full."""
         frs = pipeline.get_feature_requests(target=target or None)
@@ -991,7 +989,6 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return format_response(compact, brief, full, detail)
 
-    @mcp.tool()
     def merge_frs(keep_id: str, merge_ids: str, merged_title: str = "", merged_description: str = "") -> str:
         """Merge overlapping FRs into one. Keeps one, archives the rest.
 
@@ -1069,7 +1066,6 @@ Completing an FR automatically records the capability as "exists" for the target
     # FR pipeline improvements
     # ------------------------------------------------------------------
 
-    @mcp.tool()
     async def auto_deduplicate_frs(
         target: str = "",
         threshold: float = 0.85,
@@ -1201,7 +1197,6 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return format_response(compact, brief, full, detail)
 
-    @mcp.tool()
     async def cluster_frs(
         target: str = "",
         min_cluster_size: int = 2,
@@ -1304,7 +1299,6 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return format_response(compact, brief, full, detail)
 
-    @mcp.tool()
     def update_fr(
         fr_id: str,
         title: str = "",
@@ -1686,7 +1680,6 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return format_response(compact, brief, full, detail)
 
-    @mcp.tool()
     async def synergize(min_score: float = 0.5, max_concepts: int = 10, detail: str = "brief") -> str:
         """[DEPRECATED] Classify concepts and generate FRs. detail: compact|brief|full.
 
@@ -1750,7 +1743,6 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return _DEPRECATION_NOTICE + format_response(compact, brief, full, detail)
 
-    @mcp.tool()
     async def synergize_compare(min_score: float = 0.5, max_concepts: int = 10) -> str:
         """Compare self-distillation candidates. Shows per-candidate concept/FR counts and
         diversity metrics (overlap ratios) across N synergize outputs.
@@ -1777,7 +1769,6 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return "\n".join(lines)
 
-    @mcp.tool()
     async def review_feature_requests(target: str = "", detail: str = "brief") -> str:
         """Review FRs with 32B model. detail='brief' or 'full'."""
         results = await pipeline.review_frs(target=target or None)
@@ -1847,7 +1838,6 @@ Completing an FR automatically records the capability as "exists" for the target
 
         return format_response(compact, brief, full, detail)
 
-    @mcp.tool()
     def feature_requests(target: str = "", detail: str = "brief") -> str:
         """List feature requests. detail='brief' (default) or 'full'."""
         frs = pipeline.get_feature_requests(target=target or None)
@@ -2152,7 +2142,7 @@ Completing an FR automatically records the capability as "exists" for the target
     @mcp.tool()
     async def project_landscape(project: str, detail: str = "brief") -> str:
         """Research landscape for a specific project. Shows relevant concepts,
-        paper counts, capability gaps, and open FRs. detail='brief' or 'full'."""
+        paper counts, and capabilities. detail='brief' or 'full'."""
         projects = pipeline.config.get("projects", {})
         if project not in projects:
             return f"Unknown project. Available: {', '.join(projects.keys())}"
@@ -2171,9 +2161,6 @@ Completing an FR automatically records the capability as "exists" for the target
         distilled = len(pipeline.knowledge.get_by_status(EntryStatus.DISTILLED, tier=Tier.IMPORTED))
         total = len(list(pipeline.knowledge.get_by_tier(Tier.IMPORTED)))
 
-        # Open FRs for this project
-        frs = pipeline.get_feature_requests(target=project)
-
         # Capabilities
         caps_exist = []
         caps_planned = []
@@ -2188,11 +2175,9 @@ Completing an FR automatically records the capability as "exists" for the target
                 caps_planned.append(entry.title)
 
         def brief():
-            lines = [f"{project} | concepts:{len(proj_concepts)} papers:{distilled}/{total} frs:{len(frs)} exists:{len(caps_exist)} planned:{len(caps_planned)}"]
+            lines = [f"{project} | concepts:{len(proj_concepts)} papers:{distilled}/{total} exists:{len(caps_exist)} planned:{len(caps_planned)}"]
             if top_concepts:
                 lines.append("top concepts: " + ", ".join(f"{c}({s:.0%})" for c, s in top_concepts[:8]))
-            if frs:
-                lines.append("open FRs: " + ", ".join(truncate(f.get("title", "?"), 40) for f in frs[:5]))
             return "\n".join(lines)
 
         def full():
@@ -2209,10 +2194,6 @@ Completing an FR automatically records the capability as "exists" for the target
                 lines.append(f"planned ({len(caps_planned)}):")
                 for c in caps_planned:
                     lines.append(f"  {c}")
-            if frs:
-                lines.append(f"open FRs ({len(frs)}):")
-                for f in frs:
-                    lines.append(f"  [{f.get('priority','?')}] {f.get('title','?')}")
             return "\n".join(lines)
 
         return brief_or_full(brief, full, detail=detail)
