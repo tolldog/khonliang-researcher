@@ -1105,24 +1105,25 @@ def graph_tree(ctx, concept, depth, branches):
 @click.pass_context
 def graph_path(ctx, start, end):
     """Find how two concepts connect through the knowledge graph."""
-    from khonliang_researcher import (
-        build_concept_graph,
-        find_paths,
-        format_entity_suggestions,
-        suggest_entities,
-    )
+    from khonliang_researcher import build_concept_graph, find_paths
+
+    try:
+        from khonliang_researcher import format_entity_suggestions, suggest_entities
+    except ImportError:
+        format_entity_suggestions = suggest_entities = None
 
     pipeline = _get_pipeline(ctx)
     g = build_concept_graph(pipeline.triples, knowledge=pipeline.knowledge)
     paths = find_paths(g, start, end)
     if not paths:
         click.echo(f"No path found from '{start}' to '{end}'.")
-        start_suggestions = format_entity_suggestions(suggest_entities(g, start))
-        end_suggestions = format_entity_suggestions(suggest_entities(g, end))
-        if start not in g and start_suggestions:
-            click.echo(f"Start {start_suggestions}")
-        if end not in g and end_suggestions:
-            click.echo(f"End {end_suggestions}")
+        if format_entity_suggestions and suggest_entities:
+            start_suggestions = format_entity_suggestions(suggest_entities(g, start))
+            end_suggestions = format_entity_suggestions(suggest_entities(g, end))
+            if start not in g and start_suggestions:
+                click.echo(f"Start {start_suggestions}")
+            if end not in g and end_suggestions:
+                click.echo(f"End {end_suggestions}")
         return
 
     click.echo(f"Found {len(paths)} path(s) from '{start}' to '{end}':\n")
