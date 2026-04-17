@@ -37,6 +37,89 @@ def _compact_field(value: Any, limit: int = 80) -> str:
     return truncate(text.strip(), limit)
 
 
+def _filter_taxonomy(taxonomy: dict[str, Any], audience: str = "") -> tuple[list[dict], list[dict]]:
+    groups = list(taxonomy.get("groups", []))
+    relationships = list(taxonomy.get("relationships", []))
+    audience = str(audience or "").strip()
+    if not audience:
+        return groups, relationships
+
+    selected_codes = {g["code"] for g in groups if g.get("audience") == audience}
+    parent_codes = {
+        rel["target"]
+        for rel in relationships
+        if rel.get("source") in selected_codes and rel.get("predicate") == "specializes"
+    }
+    selected_codes |= parent_codes
+    return (
+        [g for g in groups if g.get("code") in selected_codes],
+        [
+            rel for rel in relationships
+            if rel.get("source") in selected_codes and rel.get("target") in selected_codes
+        ],
+    )
+
+
+def _format_concept_taxonomy_limited(
+    taxonomy: dict[str, Any],
+    *,
+    audience: str = "",
+    detail: str = "brief",
+    limit: int = 50,
+) -> str:
+    groups, relationships = _filter_taxonomy(taxonomy, audience)
+    audience = str(audience or "").strip()
+    if not groups:
+        suffix = f" for audience '{audience}'" if audience else ""
+        return f"No taxonomy groups{suffix}. Distill some papers first."
+
+    groups = sorted(groups, key=lambda g: (g.get("audience", ""), g.get("code", "")))
+    relationships = sorted(relationships, key=lambda r: (r.get("source", ""), r.get("target", "")))
+    total_groups = len(groups)
+    max_groups = max(1, int(limit))
+    shown_groups = groups[:max_groups]
+    shown_group_codes = {g.get("code") for g in shown_groups}
+    relationships = [
+        rel
+        for rel in relationships
+        if rel.get("source") in shown_group_codes and rel.get("target") in shown_group_codes
+    ]
+
+    def compact():
+        return "\n".join(
+            f"{g['code']}|{_compact_field(g.get('audience'), 32)}|"
+            f"{_compact_field(g.get('label'), 60)}|entities={len(g.get('entities', []))}"
+            for g in shown_groups
+        )
+
+    def brief():
+        lines = [
+            f"Concept taxonomy: {total_groups} groups, showing {len(shown_groups)}, "
+            f"{len(relationships)} relationships"
+        ]
+        for group in shown_groups:
+            entities = ", ".join(group.get("entities", [])[:3])
+            if len(group.get("entities", [])) > 3:
+                entities += f", +{len(group['entities']) - 3} more"
+            lines.append(
+                f"{group['code']} [{group.get('audience', 'general')}] "
+                f"{group.get('label', '?')} ({len(group.get('entities', []))})"
+            )
+            if entities:
+                lines.append(f"  {entities}")
+        return "\n".join(lines)
+
+    def full():
+        lines = [brief()]
+        if relationships:
+            lines.append("\nRelationships:")
+            for rel in relationships[:80]:
+                lines.append(f"  {rel['source']} -[{rel['predicate']}]-> {rel['target']}")
+        return "\n".join(lines)
+
+    return format_response(compact, brief, full, detail)
+
+
 def create_research_server(pipeline: ResearchPipeline):
     """Create MCP server with khonliang base tools + custom research tools."""
     from researcher.synthesizer import Synthesizer
@@ -1560,6 +1643,34 @@ Completing an FR automatically records the capability as "exists" for the target
             )
             lines.append(f"  {i}. {chain}")
         return "\n".join(lines)
+
+    @mcp.tool()
+    def concept_taxonomy(
+        audience: str = "",
+        universal_concepts: str = "",
+        limit: int = 50,
+        detail: str = "brief",
+    ) -> str:
+        """Audience-scoped concept taxonomy. detail: compact|brief|full.
+
+        Groups existing graph nodes into deterministic taxonomy buckets with
+        stable codes, and links domain-specific concepts to universal parents
+        when ``universal_concepts`` names those parent patterns.
+        """
+        from khonliang_researcher import build_concept_graph, build_concept_taxonomy
+        from researcher.util import split_csv
+
+        graph = build_concept_graph(pipeline.triples, knowledge=pipeline.knowledge)
+        taxonomy = build_concept_taxonomy(
+            graph,
+            universal_concepts=split_csv(universal_concepts),
+        )
+        return _format_concept_taxonomy_limited(
+            taxonomy,
+            audience=audience,
+            detail=detail,
+            limit=limit,
+        )
 
     @mcp.tool()
     def concepts_for_project(project: str, min_score: float = 0.4, limit: int = 30, detail: str = "brief") -> str:
