@@ -1117,12 +1117,14 @@ def graph_path(ctx, start, end):
     paths = find_paths(g, start, end)
     if not paths:
         click.echo(f"No path found from '{start}' to '{end}'.")
-        start_suggestions = format_entity_suggestions(suggest_entities(g, start))
-        end_suggestions = format_entity_suggestions(suggest_entities(g, end))
-        if start not in g and start_suggestions:
-            click.echo(f"Start {start_suggestions}")
-        if end not in g and end_suggestions:
-            click.echo(f"End {end_suggestions}")
+        if start not in g:
+            start_suggestions = format_entity_suggestions(suggest_entities(g, start))
+            if start_suggestions:
+                click.echo(f"Start {start_suggestions}")
+        if end not in g:
+            end_suggestions = format_entity_suggestions(suggest_entities(g, end))
+            if end_suggestions:
+                click.echo(f"End {end_suggestions}")
         return
 
     click.echo(f"Found {len(paths)} path(s) from '{start}' to '{end}':\n")

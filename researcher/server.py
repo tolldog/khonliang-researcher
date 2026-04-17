@@ -1540,13 +1540,15 @@ Completing an FR automatically records the capability as "exists" for the target
         graph = build_concept_graph(pipeline.triples, knowledge=pipeline.knowledge)
         paths = find_paths(graph, start, end)
         if not paths:
-            start_suggestions = format_entity_suggestions(suggest_entities(graph, start))
-            end_suggestions = format_entity_suggestions(suggest_entities(graph, end))
             suggestion_lines = []
-            if start not in graph and start_suggestions:
-                suggestion_lines.append(f"Start {start_suggestions}")
-            if end not in graph and end_suggestions:
-                suggestion_lines.append(f"End {end_suggestions}")
+            if start not in graph:
+                start_suggestions = format_entity_suggestions(suggest_entities(graph, start))
+                if start_suggestions:
+                    suggestion_lines.append(f"Start {start_suggestions}")
+            if end not in graph:
+                end_suggestions = format_entity_suggestions(suggest_entities(graph, end))
+                if end_suggestions:
+                    suggestion_lines.append(f"End {end_suggestions}")
             suffix = "\n" + "\n".join(suggestion_lines) if suggestion_lines else ""
             return f"No path found from '{start}' to '{end}'." + suffix
 
