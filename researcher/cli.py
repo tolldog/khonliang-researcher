@@ -1172,6 +1172,77 @@ def graph_project(ctx, project, min_score, limit):
             click.echo(f"    Also: {other}")
 
 
+@graph.command("taxonomy")
+@click.option("--audience", default="", help="Filter by audience, e.g. developer-researcher")
+@click.option("--universal", default="", help="Comma-separated universal parent concepts")
+@click.option("--limit", default=50, help="Maximum groups to print")
+@click.pass_context
+def graph_taxonomy(ctx, audience, universal, limit):
+    """Show audience-scoped concept taxonomy groups."""
+    from khonliang_researcher import build_concept_graph, build_concept_taxonomy
+
+    pipeline = _get_pipeline(ctx)
+    graph_data = build_concept_graph(pipeline.triples, knowledge=pipeline.knowledge)
+    taxonomy = build_concept_taxonomy(
+        graph_data,
+        universal_concepts=_split_csv(universal),
+    )
+    click.echo(_format_taxonomy(taxonomy, audience=audience, limit=limit))
+
+
+def _split_csv(value):
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _format_taxonomy(taxonomy, *, audience="", limit=50):
+    groups = taxonomy.get("groups", [])
+    relationships = taxonomy.get("relationships", [])
+    audience = str(audience or "").strip()
+
+    if audience:
+        selected_codes = {g["code"] for g in groups if g.get("audience") == audience}
+        parent_codes = {
+            rel["target"]
+            for rel in relationships
+            if rel.get("source") in selected_codes and rel.get("predicate") == "specializes"
+        }
+        selected_codes |= parent_codes
+        groups = [g for g in groups if g["code"] in selected_codes]
+        relationships = [
+            rel for rel in relationships
+            if rel.get("source") in selected_codes and rel.get("target") in selected_codes
+        ]
+
+    if not groups:
+        suffix = f" for audience '{audience}'" if audience else ""
+        return f"No taxonomy groups{suffix}. Distill some papers first."
+
+    total_groups = len(groups)
+    groups = sorted(groups, key=lambda g: (g.get("audience", ""), g.get("code", "")))
+    groups = groups[:max(1, int(limit))]
+
+    lines = [f"Concept taxonomy ({total_groups} groups, showing {len(groups)})"]
+    current_audience = ""
+    for group in groups:
+        group_audience = group.get("audience", "general")
+        if group_audience != current_audience:
+            current_audience = group_audience
+            lines.append(f"\n{group_audience}:")
+        entities = ", ".join(group.get("entities", [])[:5])
+        if len(group.get("entities", [])) > 5:
+            entities += f", +{len(group['entities']) - 5} more"
+        lines.append(f"  {group['code']} {group['label']} ({len(group.get('entities', []))})")
+        if entities:
+            lines.append(f"    {entities}")
+
+    if relationships:
+        lines.append("\nRelationships:")
+        for rel in sorted(relationships, key=lambda r: (r.get("source", ""), r.get("target", "")))[:50]:
+            lines.append(f"  {rel['source']} -[{rel['predicate']}]-> {rel['target']}")
+
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------
 # Ideas
 # ------------------------------------------------------------------
