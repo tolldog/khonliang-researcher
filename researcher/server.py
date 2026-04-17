@@ -1530,12 +1530,27 @@ Completing an FR automatically records the capability as "exists" for the target
         Traces paths from start → end through intermediate concepts.
         Shows the chain of papers and relationships connecting them.
         """
-        from khonliang_researcher import build_concept_graph, find_paths
+        from khonliang_researcher import (
+            build_concept_graph,
+            find_paths,
+            format_entity_suggestions,
+            suggest_entities,
+        )
 
         graph = build_concept_graph(pipeline.triples, knowledge=pipeline.knowledge)
         paths = find_paths(graph, start, end)
         if not paths:
-            return f"No path found from '{start}' to '{end}'."
+            suggestion_lines = []
+            if start not in graph:
+                start_suggestions = format_entity_suggestions(suggest_entities(graph, start))
+                if start_suggestions:
+                    suggestion_lines.append(f"Start {start_suggestions}")
+            if end not in graph:
+                end_suggestions = format_entity_suggestions(suggest_entities(graph, end))
+                if end_suggestions:
+                    suggestion_lines.append(f"End {end_suggestions}")
+            suffix = "\n" + "\n".join(suggestion_lines) if suggestion_lines else ""
+            return f"No path found from '{start}' to '{end}'." + suffix
 
         lines = [f"Found {len(paths)} path(s) from '{start}' to '{end}':\n"]
         for i, path in enumerate(paths[:5], 1):
