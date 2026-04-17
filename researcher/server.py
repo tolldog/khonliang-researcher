@@ -988,6 +988,7 @@ Most tools accept detail="compact|brief|full":
 
         return format_response(compact, brief, full, detail)
 
+    @mcp.tool()
     async def synergize(min_score: float = 0.5, max_concepts: int = 10, detail: str = "brief") -> str:
         """[DEPRECATED] Classify concepts and return candidate FRs. detail: compact|brief|full.
 
@@ -1050,6 +1051,7 @@ Most tools accept detail="compact|brief|full":
 
         return _DEPRECATION_NOTICE + format_response(compact, brief, full, detail)
 
+    @mcp.tool()
     async def synergize_compare(min_score: float = 0.5, max_concepts: int = 10) -> str:
         """Compare self-distillation candidates. Shows per-candidate concept/FR counts and
         diversity metrics (overlap ratios) across N synergize outputs.
