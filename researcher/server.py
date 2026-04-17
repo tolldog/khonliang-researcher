@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import asyncio
+from collections import deque
 import json
 import logging
 import sys
