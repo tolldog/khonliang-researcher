@@ -5,7 +5,7 @@ description = "Research paper ingestion and distillation pipeline powered by kho
 requires-python = ">=3.11"
 dependencies = [
     "ollama-khonliang @ git+https://github.com/tolldog/ollama-khonliang.git@main",
-    "khonliang-researcher-lib @ git+https://github.com/tolldog/khonliang-researcher-lib.git@74ce1a794e45f6268128703ffd1e9f7ebb9e7e28",
+    "khonliang-researcher-lib @ git+https://github.com/tolldog/khonliang-researcher-lib.git@69bebbcb18290ffad560ff23092666f6c32d0b09",
     "aiohttp>=3.9",
     "beautifulsoup4>=4.12",
     "click>=8.0",

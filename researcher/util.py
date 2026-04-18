@@ -19,6 +19,31 @@ def split_csv(value: str) -> list[str]:
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
+def parse_branch_specs(value: str | list[str] | tuple[str, ...]) -> list[dict]:
+    """Parse investigation branch specs.
+
+    Specs use ``label:seed one,seed two``. Multiple specs may be provided as a
+    semicolon-separated string or as repeated CLI option values.
+    """
+    if isinstance(value, str):
+        raw_specs = [part.strip() for part in value.split(";") if part.strip()]
+    else:
+        raw_specs = []
+        for item in value:
+            raw_specs.extend(part.strip() for part in str(item).split(";") if part.strip())
+
+    specs = []
+    for raw in raw_specs:
+        label, sep, seed_text = raw.partition(":")
+        label = label.strip()
+        seeds = split_csv(seed_text) if sep else []
+        specs.append({
+            "label": label,
+            "seeds": seeds,
+        })
+    return specs
+
+
 def _github_repo(source: str) -> tuple[str, str] | None:
     """Return (owner/repo, clone_url) for supported GitHub URL forms."""
     value = str(source or "").strip().rstrip("/")

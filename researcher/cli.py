@@ -775,6 +775,40 @@ def _format_taxonomy(taxonomy, *, audience="", limit=50):
     return "\n".join(lines)
 
 
+@graph.command("investigate")
+@click.argument("seeds")
+@click.option("--label", default="", help="Workspace label")
+@click.option(
+    "--branch",
+    "branches",
+    multiple=True,
+    help="Branch spec as 'label:seed one,seed two'. May be repeated.",
+)
+@click.option("--depth", default=2, help="Max branch traversal depth")
+@click.option("--branches-per-node", default=4, help="Max outgoing edges per node")
+@click.option("--detail", default="brief", type=click.Choice(["compact", "brief", "full"]))
+@click.pass_context
+def graph_investigate(ctx, seeds, label, branches, depth, branches_per_node, detail):
+    """Create a temporary branchable evidence workspace for concept investigation."""
+    from khonliang_researcher import (
+        build_investigation_workspace,
+        format_investigation_workspace,
+    )
+    from researcher.util import parse_branch_specs
+
+    pipeline = _get_pipeline(ctx)
+    workspace = build_investigation_workspace(
+        pipeline.triples,
+        seeds=seeds,
+        label=label,
+        branch_specs=parse_branch_specs(branches),
+        knowledge=pipeline.knowledge,
+        max_depth=depth,
+        max_branches=branches_per_node,
+    )
+    click.echo(format_investigation_workspace(workspace, detail=detail))
+
+
 # ------------------------------------------------------------------
 # Ideas
 # ------------------------------------------------------------------
