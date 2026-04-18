@@ -827,19 +827,17 @@ class ResearchPipeline:
     ) -> Dict[str, Any]:
         """DEPRECATED — FR generation is moving out of researcher.
 
-        Classify concepts and generate targeted FRs across the ecosystem.
-        Returns parsed JSON with concept classifications and feature
-        requests, or raw content if JSON parsing fails.
+        Classify concepts and return candidate FR text across the ecosystem.
+        Returns parsed JSON with concept classifications and candidate feature
+        requests, or raw content if JSON parsing fails. It does not write FRs
+        into researcher's knowledge store.
 
         Researcher is the knowledge layer (ingest, distill, suggest).
         FR generation belongs to the action layer (developer). Consumers
         should migrate to:
 
         - ``synergize_concepts`` for the concept-bundling half (no FRs)
-        - developer's forthcoming FR-generation pipeline for the
-          bundle-to-FR half (tracked as fr_developer_4724d49d)
-
-        This method will be removed once developer's consumer lands.
+        - developer's FR-generation pipeline for accepted FR records
         """
         import warnings
         # FutureWarning rather than DeprecationWarning: DeprecationWarning is
@@ -849,7 +847,7 @@ class ResearchPipeline:
         warnings.warn(
             "ResearchPipeline.synergize() is deprecated. Use "
             "synergize_concepts() for concept bundles; FR generation "
-            "moves to developer (fr_developer_4724d49d).",
+            "moves to developer.",
             FutureWarning,
             stacklevel=2,
         )
@@ -882,94 +880,24 @@ class ResearchPipeline:
         except json.JSONDecodeError:
             return {"error": "LLM returned non-JSON", "raw": result.content}
 
-        # Gather existing capabilities for post-generation filtering
-        existing_caps = set()
-        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
-            tags = entry.tags or []
-            if "capability" in tags and (entry.metadata or {}).get("capability_status") in ("exists", "planned"):
-                existing_caps.add(entry.title.lower())
-
-        # Embed existing caps for fuzzy matching
-        cap_embeddings = {}
-        if existing_caps and self.relevance:
-            try:
-                for cap in existing_caps:
-                    emb = await self.relevance._embed(cap)
-                    if emb:
-                        cap_embeddings[cap] = emb
-            except Exception:
-                pass  # Fall back to substring matching only
-
-        # Store FRs as Tier 3 knowledge entries, filtering out already-built
-        fr_count = 0
-        skipped = 0  # capability matches
-        fr_existed = 0  # already in knowledge store
-        for item in classifications:
-            for fr in item.get("feature_requests", []):
-                fr_title_lower = fr.get("title", "").lower()
-
-                # Skip FRs that match existing capabilities (substring)
-                if any(cap in fr_title_lower or fr_title_lower in cap for cap in existing_caps):
-                    skipped += 1
-                    continue
-
-                # Skip FRs that match via embedding similarity
-                if cap_embeddings:
-                    try:
-                        from khonliang_researcher import cosine_similarity
-                        fr_emb = await self.relevance._embed(fr_title_lower)
-                        if fr_emb and any(
-                            cosine_similarity(fr_emb, ce) > 0.85
-                            for ce in cap_embeddings.values()
-                        ):
-                            skipped += 1
-                            continue
-                    except Exception:
-                        pass
-
-                import hashlib
-                # Hash target + title + concept for stable, collision-resistant IDs
-                fr_hash_input = f"{fr['target']}:{fr['title']}:{item.get('concept', '')}"
-                fr_id = f"fr_{fr['target']}_{hashlib.sha256(fr_hash_input.encode()).hexdigest()[:8]}"
-
-                # Don't overwrite existing FRs (preserves reviews, deps, status history)
-                existing = self.knowledge.get(fr_id)
-                if existing:
-                    fr_existed += 1
-                    continue
-
-                fr_entry = KnowledgeEntry(
-                    id=fr_id,
-                    tier=Tier.DERIVED,
-                    title=fr["title"],
-                    content=json.dumps(fr, indent=2),
-                    source="synergize",
-                    scope="research",
-                    tags=["fr", f"target:{fr['target']}", item.get("classification", "")],
-                    status=EntryStatus.DISTILLED,
-                    metadata={
-                        "concept": item.get("concept", ""),
-                        "classification": item.get("classification", ""),
-                        "target": fr["target"],
-                        "priority": fr.get("priority", "medium"),
-                        "backing_papers": fr.get("backing_papers", []),
-                        "synergies": [item["synergies"]] if isinstance(item.get("synergies"), str) else item.get("synergies", []),
-                    },
-                )
-                self.knowledge.add(fr_entry)
-                fr_count += 1
-
-        if skipped:
-            logger.info("Synergize: skipped %d FRs matching existing capabilities", skipped)
-        if fr_existed:
-            logger.info("Synergize: skipped %d FRs already in knowledge store", fr_existed)
+        # Researcher no longer writes FRs into its knowledge store. Keep this
+        # deprecated method read-only for old callers that still inspect the
+        # raw model output, while developer owns accepted FR IDs and lifecycle.
+        fr_count = sum(
+            len(item.get("feature_requests", []))
+            for item in classifications
+        )
 
         self.digest.record(
-            summary=f"Synergize: {len(classifications)} concepts classified, {fr_count} FRs generated",
+            summary=f"Synergize: {len(classifications)} concepts classified, {fr_count} candidate FRs returned",
             source="pipeline",
             audience="research",
             tags=["synergize"],
-            metadata={"concept_count": len(classifications), "fr_count": fr_count},
+            metadata={
+                "concept_count": len(classifications),
+                "candidate_fr_count": fr_count,
+                "fr_store_owner": "developer",
+            },
         )
 
         return {
@@ -1578,92 +1506,32 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
 
         return evaluation
 
-    async def review_frs(
-        self, target: Optional[str] = None
+    def get_historical_feature_requests(
+        self, target: Optional[str] = None,
+        include_archived: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Review stored FRs with the large reviewer model.
+        """Query legacy researcher FR records for historical display/migration.
 
-        Updates each FR entry with review verdict and metadata.
-        Returns list of {fr_id, verdict, reasoning, ...} dicts.
+        Active FR IDs, status, dependencies, milestones, and execution state
+        live in developer. This reader exists only to keep old researcher FR
+        IDs resolvable while the corpus still contains references to them.
+        By default it includes archived/completed records because historical
+        and migration callers need the full legacy ID set.
         """
-        from researcher.synthesizer import Synthesizer
-
-        synth = Synthesizer(self.knowledge, self.triples, self.pool)
-        projects = self.config.get("projects", {})
-        frs = self.get_feature_requests(target=target)
-
-        if not frs:
-            return []
-
-        results = []
-        for fr in frs:
-            fr_target = fr.get("target", "")
-            project_cfg = projects.get(fr_target, {})
-            if not project_cfg:
-                continue
-
-            logger.info("Reviewing FR: %s → %s", fr.get("title", "?"), fr_target)
-
-            review = await synth.review_fr(
-                fr_data=fr,
-                project_config=project_cfg,
-                project_name=fr_target,
-            )
-
-            # Update the FR entry with review results
-            entry = self.knowledge.get(fr["id"])
-            if entry:
-                entry.metadata["review"] = review
-                entry.metadata["review_verdict"] = review.get("verdict", "error")
-                # If revised, update the FR content
-                if review.get("verdict") == "revise":
-                    fr_content = json.loads(entry.content)
-                    if review.get("revised_title"):
-                        fr_content["original_title"] = fr_content.get("title", "")
-                        fr_content["title"] = review["revised_title"]
-                    if review.get("revised_description"):
-                        fr_content["original_description"] = fr_content.get("description", "")
-                        fr_content["description"] = review["revised_description"]
-                    if review.get("revised_priority"):
-                        fr_content["priority"] = review["revised_priority"]
-                    entry.content = json.dumps(fr_content, indent=2)
-                    entry.title = review.get("revised_title", entry.title)
-                self.knowledge.add(entry)
-
-            results.append({
-                "fr_id": fr["id"],
-                "title": fr.get("title", ""),
-                "target": fr_target,
-                **review,
-            })
-
-        accepted = sum(1 for r in results if r.get("verdict") == "accept")
-        revised = sum(1 for r in results if r.get("verdict") == "revise")
-        rejected = sum(1 for r in results if r.get("verdict") == "reject")
-
-        self.digest.record(
-            summary=f"FR review: {accepted} accepted, {revised} revised, {rejected} rejected",
-            source="pipeline",
-            audience="research",
-            tags=["review", "fr"],
-            metadata={"accepted": accepted, "revised": revised, "rejected": rejected},
-        )
-
-        return results
-
-    def get_feature_requests(
-        self, target: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Query stored feature requests, optionally filtered by target project."""
         frs = []
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             tags = entry.tags or []
             if "fr" not in tags:
                 continue
-            if "fr:archived" in tags or "fr:completed" in tags:
-                continue
             status = (entry.metadata or {}).get("fr_status", "open")
-            if status in ("completed", "archived"):
+            if (
+                not include_archived
+                and (
+                    "fr:archived" in tags
+                    or "fr:completed" in tags
+                    or status in ("completed", "archived")
+                )
+            ):
                 continue
             if target and f"target:{target}" not in tags:
                 continue

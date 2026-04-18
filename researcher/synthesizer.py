@@ -255,16 +255,16 @@ NEW CAPABILITY:
 APPLICATION: researcher
 DESCRIPTION: Automated research pipeline that discovers papers via RSS/search, fetches and
 distills them using local LLMs, extracts concept graphs and triples, scores relevance to
-configured projects, generates feature requests via synergize, and serves everything over MCP
-so project Claudes can consume research insights.
+configured projects, returns concept bundles, and serves everything over MCP so developer
+and project agents can consume research insights.
 
 CURRENT PIPELINE COMPONENTS:
 - Paper fetching (RSS, arxiv, web)
 - LLM distillation (summarize, extract triples, assess per-project)
 - Embedding-based relevance scoring
 - Concept graph with project score propagation
-- Synergize: concept classification and FR generation
-- FR lifecycle: promote, review, merge, dependencies, status tracking
+- Synergize concepts: concept classification and candidate bundles
+- Historical FR references: read-only records for old evidence links
 - Idea ingestion: parse informal text into researchable claims
 - Knowledge store, triple store, digest store (all SQLite-backed)
 
@@ -815,15 +815,14 @@ class Synthesizer:
         n_samples: int = 1,
         compare: bool = False,
     ) -> SynthesisResult:
-        """Classify research concepts and generate targeted FRs.
+        """Classify research concepts and return candidate FR text.
 
         Analyzes concept scores across projects to determine whether each
-        concept should become a library feature, app feature, or both.
-        Deduplicates similar concepts via embeddings and excludes concepts
-        that already have open FRs.
+        concept may map to library work, app work, or both. Developer owns
+        accepted FR records and lifecycle state.
 
         Returns SynthesisResult with JSON content containing classified
-        concepts and generated feature requests.
+        concepts and candidate feature request text.
         """
         from khonliang_researcher import build_project_scores
 
@@ -1040,20 +1039,6 @@ class Synthesizer:
                 "reasoning": f"Review model returned non-JSON: {content[:200]}",
                 "concerns": [],
             }
-
-    async def review_all_frs(
-        self,
-        projects: Dict[str, Dict[str, Any]],
-        target: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Review all stored FRs using the large model.
-
-        Returns list of {fr, review} dicts.
-        """
-        from researcher.pipeline import create_pipeline
-        # We need the pipeline's get_feature_requests �� but we're called from it
-        # So accept frs as parameter instead
-        raise NotImplementedError("Call pipeline.review_frs() instead")
 
     async def idea_brief(
         self, idea_text: str, claims: List[str], paper_summaries: List[Dict]
