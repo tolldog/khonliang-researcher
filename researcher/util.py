@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Iterator
+from typing import Iterator, TypedDict
 
 
 class RepoTreeError(RuntimeError):
@@ -19,7 +19,12 @@ def split_csv(value: str) -> list[str]:
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
-def parse_branch_specs(value: str | list[str] | tuple[str, ...]) -> list[dict]:
+class BranchSpec(TypedDict):
+    label: str
+    seeds: list[str]
+
+
+def parse_branch_specs(value: str | list[str] | tuple[str, ...]) -> list[BranchSpec]:
     """Parse investigation branch specs.
 
     Specs use ``label:seed one,seed two``. Multiple specs may be provided as a
@@ -36,7 +41,13 @@ def parse_branch_specs(value: str | list[str] | tuple[str, ...]) -> list[dict]:
     for raw in raw_specs:
         label, sep, seed_text = raw.partition(":")
         label = label.strip()
-        seeds = split_csv(seed_text) if sep else []
+        if not sep:
+            raise ValueError(f"Invalid branch spec {raw!r}: expected label:seed")
+        if not label:
+            raise ValueError(f"Invalid branch spec {raw!r}: label is required")
+        seeds = split_csv(seed_text)
+        if not seeds:
+            raise ValueError(f"Invalid branch spec {raw!r}: at least one seed is required")
         specs.append({
             "label": label,
             "seeds": seeds,
