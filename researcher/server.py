@@ -854,6 +854,38 @@ Most tools accept detail="compact|brief|full":
         )
 
     @mcp.tool()
+    def investigation_workspace(
+        seeds: str,
+        label: str = "",
+        branches: str = "",
+        depth: int = 2,
+        branches_per_node: int = 4,
+        detail: str = "brief",
+    ) -> str:
+        """Create a temporary branchable evidence workspace. detail: compact|brief|full.
+
+        Branch specs use ``label:seed one,seed two`` and may be separated by
+        semicolons. The workspace references corpus papers one-way so the
+        long-lived library graph is not polluted by exploratory labels.
+        """
+        from khonliang_researcher import (
+            build_investigation_workspace,
+            format_investigation_workspace,
+        )
+        from researcher.util import parse_branch_specs
+
+        workspace = build_investigation_workspace(
+            pipeline.triples,
+            seeds=seeds,
+            label=label,
+            branch_specs=parse_branch_specs(branches),
+            knowledge=pipeline.knowledge,
+            max_depth=depth,
+            max_branches=branches_per_node,
+        )
+        return format_investigation_workspace(workspace, detail=detail)
+
+    @mcp.tool()
     def concepts_for_project(project: str, min_score: float = 0.4, limit: int = 30, detail: str = "brief") -> str:
         """Concepts relevant to a project. detail: compact|brief|full."""
         from khonliang_researcher import build_project_scores
