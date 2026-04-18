@@ -1507,23 +1507,31 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         return evaluation
 
     def get_historical_feature_requests(
-        self, target: Optional[str] = None
+        self, target: Optional[str] = None,
+        include_archived: bool = True,
     ) -> List[Dict[str, Any]]:
         """Query legacy researcher FR records for historical display/migration.
 
         Active FR IDs, status, dependencies, milestones, and execution state
         live in developer. This reader exists only to keep old researcher FR
         IDs resolvable while the corpus still contains references to them.
+        By default it includes archived/completed records because historical
+        and migration callers need the full legacy ID set.
         """
         frs = []
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             tags = entry.tags or []
             if "fr" not in tags:
                 continue
-            if "fr:archived" in tags or "fr:completed" in tags:
-                continue
             status = (entry.metadata or {}).get("fr_status", "open")
-            if status in ("completed", "archived"):
+            if (
+                not include_archived
+                and (
+                    "fr:archived" in tags
+                    or "fr:completed" in tags
+                    or status in ("completed", "archived")
+                )
+            ):
                 continue
             if target and f"target:{target}" not in tags:
                 continue
