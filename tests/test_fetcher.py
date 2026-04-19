@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from researcher import fetcher
 from researcher.fetcher import ContentFormat
 
@@ -41,6 +43,19 @@ def test_non_linkedin_source_does_not_resolve_tracking_link_without_page_key():
         fetcher._extract_linkedin_external_url(
             html,
             source_url="https://example.org/page-with-lnkd.in-text",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("href", ["javascript:alert(1)", "/relative/path", "https://"])
+def test_linkedin_external_url_rejects_invalid_hrefs(href):
+    html = LINKEDIN_INTERSTITIAL.replace("https://arxiv.org/pdf/2511.19699", href)
+
+    assert (
+        fetcher._extract_linkedin_external_url(
+            html,
+            source_url="https://lnkd.in/guZ5SMq3",
         )
         is None
     )
