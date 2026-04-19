@@ -70,9 +70,11 @@ def extract_arxiv_id(url_or_id: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def _extract_linkedin_external_url(html: str) -> Optional[str]:
+def _extract_linkedin_external_url(html: str, source_url: str = "") -> Optional[str]:
     """Extract the real target from LinkedIn's shortlink interstitial page."""
     soup = BeautifulSoup(html, "html.parser")
+    source_host = urlparse(source_url).netloc.lower()
+    is_linkedin_source = source_host in {"lnkd.in", "linkedin.com", "www.linkedin.com"}
 
     page_key = soup.find("meta", attrs={"name": "pageKey"})
     is_redirect = (
@@ -89,9 +91,22 @@ def _extract_linkedin_external_url(html: str) -> Optional[str]:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
 
-    if is_redirect or "lnkd.in" in html[:2000]:
+    if is_redirect or is_linkedin_source:
         return target
     return None
+
+
+def _record_shortlink_resolution(metadata: dict, source_url: str) -> None:
+    """Record the first caller URL and any intermediate shortlink hops."""
+    existing_chain = metadata.get("resolved_chain")
+    if isinstance(existing_chain, list):
+        chain = [str(item) for item in existing_chain]
+    else:
+        existing_from = metadata.get("resolved_from")
+        chain = [str(existing_from)] if existing_from else []
+    metadata["resolved_from"] = source_url
+    metadata["resolved_chain"] = [source_url, *chain]
+    metadata["shortlink_resolver"] = "linkedin_external_interstitial"
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +274,7 @@ async def fetch_url(
                 text_content = await resp.text()
 
     if fmt == ContentFormat.HTML and _shortlink_depth < _MAX_SHORTLINK_REDIRECTS:
-        target_url = _extract_linkedin_external_url(text_content)
+        target_url = _extract_linkedin_external_url(text_content, source_url=url)
         if target_url and target_url != url:
             logger.info("Resolved LinkedIn shortlink %s -> %s", url, target_url)
             result = await fetch_url(
@@ -267,11 +282,7 @@ async def fetch_url(
                 timeout=timeout,
                 _shortlink_depth=_shortlink_depth + 1,
             )
-            result.metadata.setdefault("resolved_from", url)
-            result.metadata.setdefault(
-                "shortlink_resolver",
-                "linkedin_external_interstitial",
-            )
+            _record_shortlink_resolution(result.metadata, url)
             return result
 
     title, content = _convert(raw, text_content, fmt)
