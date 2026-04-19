@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -59,11 +60,53 @@ _HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
+_LINKEDIN_REDIRECT_PAGE_KEY = "d_shortlink_frontend_external_link_redirect_interstitial"
+_MAX_SHORTLINK_REDIRECTS = 3
+
 
 def extract_arxiv_id(url_or_id: str) -> Optional[str]:
     """Pull an arxiv ID from a URL or bare ID string."""
     m = _ARXIV_ID_RE.search(url_or_id)
     return m.group(0) if m else None
+
+
+def _extract_linkedin_external_url(html: str, source_url: str = "") -> Optional[str]:
+    """Extract the real target from LinkedIn's shortlink interstitial page."""
+    soup = BeautifulSoup(html, "html.parser")
+    source_host = urlparse(source_url).netloc.lower()
+    is_linkedin_source = source_host in {"lnkd.in", "linkedin.com", "www.linkedin.com"}
+
+    page_key = soup.find("meta", attrs={"name": "pageKey"})
+    is_redirect = (
+        page_key is not None
+        and page_key.get("content") == _LINKEDIN_REDIRECT_PAGE_KEY
+    )
+
+    link = soup.find("a", attrs={"data-tracking-control-name": "external_url_click"})
+    if not link or not link.get("href"):
+        return None
+
+    target = str(link["href"]).strip()
+    parsed = urlparse(target)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    if is_redirect or is_linkedin_source:
+        return target
+    return None
+
+
+def _record_shortlink_resolution(metadata: dict, source_url: str) -> None:
+    """Record the first caller URL and any intermediate shortlink hops."""
+    existing_chain = metadata.get("resolved_chain")
+    if isinstance(existing_chain, list):
+        chain = [str(item) for item in existing_chain]
+    else:
+        existing_from = metadata.get("resolved_from")
+        chain = [str(existing_from)] if existing_from else []
+    metadata["resolved_from"] = source_url
+    metadata["resolved_chain"] = [source_url, *chain]
+    metadata["shortlink_resolver"] = "linkedin_external_interstitial"
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +250,12 @@ def _convert(raw: bytes, text: str, fmt: ContentFormat) -> tuple[str, str]:
 # Public fetch functions
 # ---------------------------------------------------------------------------
 
-async def fetch_url(url: str, timeout: int = 60) -> FetchResult:
+async def fetch_url(
+    url: str,
+    timeout: int = 60,
+    *,
+    _shortlink_depth: int = 0,
+) -> FetchResult:
     """Fetch any URL, auto-detect format, return clean text.
 
     Handles HTML, PDF, Markdown, and plain text automatically.
@@ -224,6 +272,18 @@ async def fetch_url(url: str, timeout: int = 60) -> FetchResult:
             else:
                 raw = b""
                 text_content = await resp.text()
+
+    if fmt == ContentFormat.HTML and _shortlink_depth < _MAX_SHORTLINK_REDIRECTS:
+        target_url = _extract_linkedin_external_url(text_content, source_url=url)
+        if target_url and target_url != url:
+            logger.info("Resolved LinkedIn shortlink %s -> %s", url, target_url)
+            result = await fetch_url(
+                target_url,
+                timeout=timeout,
+                _shortlink_depth=_shortlink_depth + 1,
+            )
+            _record_shortlink_resolution(result.metadata, url)
+            return result
 
     title, content = _convert(raw, text_content, fmt)
 
