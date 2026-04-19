@@ -232,6 +232,17 @@ class ResearchPipeline:
             result = await fetch_arxiv(url)
         else:
             result = await fetch_url(url)
+            resolved_url = result.url
+            resolved_arxiv_id = extract_arxiv_id(resolved_url)
+            if resolved_arxiv_id:
+                canonical_url = f"https://arxiv.org/abs/{resolved_arxiv_id}"
+            else:
+                canonical_url = resolved_url
+
+            if canonical_url in self._url_index:
+                logger.info("Paper already ingested after resolving %s: %s", url, canonical_url)
+                self._url_index[url] = self._url_index[canonical_url]
+                return self._url_index[canonical_url]
 
         if not result.content.strip():
             logger.warning("Empty content from %s", url)
@@ -244,15 +255,16 @@ class ResearchPipeline:
         entry = KnowledgeEntry(
             id=entry_id,
             tier=Tier.IMPORTED,
-            title=result.title or url,
+            title=result.title or result.url,
             content=result.content,
-            source=url,
+            source=canonical_url,
             scope="research",
             tags=["paper"],
             status=EntryStatus.INGESTED,
             metadata={
                 "url": canonical_url,
                 "original_url": url if url != canonical_url else "",
+                "fetched_url": result.url if result.url != canonical_url else "",
                 "fetched_at": result.fetched_at,
                 **result.metadata,
             },
