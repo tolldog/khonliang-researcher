@@ -179,6 +179,8 @@ and per-project applicability scores.
 - `synthesize_project(project)` — applicability brief for a project
 - `synthesize_landscape()` — map major directions, trends, gaps
 - `project_landscape(project)` — per-project view with concepts and capabilities
+- `brief_on(topic, in_context_of)` — single-shot topic-in-context brief
+  (multi-query recall; reuses stored distills, no new LLM synth call)
 
 ## Feature Requests
 Researcher no longer owns active FR lifecycle. Use developer for
@@ -1252,6 +1254,177 @@ Most tools accept detail="compact|brief|full":
             return f"# Research Landscape ({count} papers)\n\n{content}"
 
         return format_response(compact, brief, full, detail)
+
+    @mcp.tool()
+    def brief_on(
+        topic: str,
+        in_context_of: str = "",
+        project: str = "",
+        detail: str = "brief",
+        top_k: int = 5,
+    ) -> str:
+        """Topic-in-context brief over the corpus.
+
+        Single-shot alternative to synthesize_topic that (a) accepts an
+        ``in_context_of`` scoping phrase and (b) expands recall via
+        multi-query retrieval (topic / topic+context / context) and then
+        bundles per-paper summaries under the detail-level budget.
+
+        Does not spin up a new distillation pipeline — it reuses whatever
+        summary ``distill_paper`` already produced for each selected
+        entry, falling back to the entry's own content head if no
+        summary is stored.
+
+        Returns JSON:
+          {brief, source_ids, retrieval_diagnostics: {queries_run,
+           total_hits, top_k_chosen, per_query_hits}}
+
+        detail: compact (TL;DR + bare id list), brief (TL;DR + one-line
+        per source, target <=2000 chars), full (per-source paragraph).
+        """
+        topic = (topic or "").strip()
+        ctx = (in_context_of or "").strip()
+        if not topic:
+            return json.dumps({
+                "brief": "brief_on requires a non-empty topic.",
+                "source_ids": [],
+                "retrieval_diagnostics": {
+                    "queries_run": [],
+                    "total_hits": 0,
+                    "top_k_chosen": 0,
+                },
+            })
+
+        # 1. Multi-query expansion. Union + dedup by entry id; track which
+        #    queries surfaced each entry so we can boost entries that
+        #    appear in BOTH topic and context queries (per FR ranking
+        #    guidance).
+        queries: list[str] = [topic]
+        if ctx:
+            queries.append(f"{topic} {ctx}")
+            queries.append(ctx)
+
+        hits_per_query: dict[str, list[str]] = {}
+        entries_by_id: dict[str, Any] = {}
+        rank_reciprocal_sum: dict[str, float] = {}
+        query_hit_counts: dict[str, int] = {}
+
+        threshold = pipeline.relevance.threshold if project else 0.0
+        for q in queries:
+            results = pipeline.search(q, limit=10)
+            if project:
+                results = [
+                    e for e in results
+                    if (e.metadata or {}).get("relevance_scores", {})
+                    .get(project, 0) >= threshold
+                ]
+            hits_per_query[q] = [e.id for e in results]
+            for rank, entry in enumerate(results):
+                entries_by_id.setdefault(entry.id, entry)
+                rank_reciprocal_sum[entry.id] = (
+                    rank_reciprocal_sum.get(entry.id, 0.0) + 1.0 / (rank + 1)
+                )
+                query_hit_counts[entry.id] = query_hit_counts.get(entry.id, 0) + 1
+
+        total_hits = len(entries_by_id)
+
+        if not entries_by_id:
+            return json.dumps({
+                "brief": (
+                    f"No corpus matches for topic='{topic}'"
+                    + (f" in_context_of='{ctx}'" if ctx else "")
+                    + "."
+                ),
+                "source_ids": [],
+                "retrieval_diagnostics": {
+                    "queries_run": queries,
+                    "total_hits": 0,
+                    "top_k_chosen": 0,
+                    "per_query_hits": {q: len(ids) for q, ids in hits_per_query.items()},
+                },
+            })
+
+        # 2. Rank: (query_hit_count desc, reciprocal sum desc). Entries
+        #    hit by both topic and context get strict preference.
+        def _score(eid: str) -> tuple[int, float]:
+            return (query_hit_counts[eid], rank_reciprocal_sum[eid])
+
+        ranked_ids = sorted(entries_by_id.keys(), key=_score, reverse=True)
+        top_k = max(1, int(top_k))
+        chosen_ids = ranked_ids[:top_k]
+
+        # 3. For each chosen entry, load its already-distilled summary if
+        #    one exists — reusing distill_paper's output keeps the
+        #    "10x-outlier survives unchanged" distill invariant intact.
+        #    Fall back to the entry's own content head when no summary
+        #    has been produced yet.
+        per_source: list[dict[str, Any]] = []
+        for eid in chosen_ids:
+            entry = entries_by_id[eid]
+            key_claim = ""
+            summary_entry = pipeline.knowledge.get(f"{eid}_summary")
+            if summary_entry is not None:
+                try:
+                    summary_data = json.loads(summary_entry.content)
+                except (json.JSONDecodeError, TypeError):
+                    summary_data = None
+                if isinstance(summary_data, dict):
+                    findings = summary_data.get("key_findings") or []
+                    if findings and isinstance(findings[0], str):
+                        key_claim = findings[0]
+                    if not key_claim:
+                        key_claim = summary_data.get("abstract", "") or ""
+            if not key_claim:
+                key_claim = (entry.content or "").strip().split("\n", 1)[0]
+            per_source.append({
+                "id": eid,
+                "title": entry.title,
+                "key_claim": truncate(key_claim, 220),
+            })
+
+        # 4. Bundle under the detail budget. No new LLM synth call —
+        #    brief_on is intentionally a cheap retrieval+reuse primitive,
+        #    distinct from synthesize_topic which does run a synth LLM.
+        header = f"{topic}"
+        if ctx:
+            header += f" (context: {ctx})"
+        header += f" - {len(chosen_ids)} of {total_hits} matching entries"
+
+        def compact() -> str:
+            ids = ",".join(chosen_ids)
+            return f"topic={_compact_field(topic, 60)}|context={_compact_field(ctx, 60)}|ids={ids}"
+
+        def brief() -> str:
+            lines = [header]
+            for s in per_source:
+                line = f"[{s['id']}] {truncate(s['title'], 80)} - {s['key_claim']}"
+                lines.append(truncate(line, 300))
+            out = "\n".join(lines)
+            if len(out) > 2000:
+                out = out[:1997] + "..."
+            return out
+
+        def full() -> str:
+            lines = [f"# {header}\n"]
+            for s in per_source:
+                lines.append(f"## [{s['id']}] {s['title']}")
+                if s["key_claim"]:
+                    lines.append(s["key_claim"])
+                lines.append("")
+            return "\n".join(lines)
+
+        brief_text = format_response(compact, brief, full, detail)
+
+        return json.dumps({
+            "brief": brief_text,
+            "source_ids": chosen_ids,
+            "retrieval_diagnostics": {
+                "queries_run": queries,
+                "total_hits": total_hits,
+                "top_k_chosen": len(chosen_ids),
+                "per_query_hits": {q: len(ids) for q, ids in hits_per_query.items()},
+            },
+        })
 
     @mcp.tool()
     def project_capabilities(target: str = "") -> str:
