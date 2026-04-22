@@ -1292,6 +1292,7 @@ Most tools accept detail="compact|brief|full":
                     "queries_run": [],
                     "total_hits": 0,
                     "top_k_chosen": 0,
+                    "per_query_hits": {},
                 },
             })
 
@@ -1309,9 +1310,14 @@ Most tools accept detail="compact|brief|full":
         rank_reciprocal_sum: dict[str, float] = {}
         query_hit_counts: dict[str, int] = {}
 
+        # Per-query fetch limit must be at least top_k so the final union
+        # can plausibly fill the caller's requested size even when many
+        # hits are shared across queries (and therefore deduped away).
+        per_query_limit = max(10, int(top_k))
+
         threshold = pipeline.relevance.threshold if project else 0.0
         for q in queries:
-            results = pipeline.search(q, limit=10)
+            results = pipeline.search(q, limit=per_query_limit)
             if project:
                 results = [
                     e for e in results
@@ -1376,9 +1382,13 @@ Most tools accept detail="compact|brief|full":
                         key_claim = summary_data.get("abstract", "") or ""
             if not key_claim:
                 key_claim = (entry.content or "").strip().split("\n", 1)[0]
+            # Store the full claim; renderers truncate for compact/brief and
+            # emit the full text for detail='full'. Truncating at store time
+            # would silently cap full() output at 220 chars.
             per_source.append({
                 "id": eid,
                 "title": entry.title,
+                "key_claim_full": key_claim,
                 "key_claim": truncate(key_claim, 220),
             })
 
@@ -1408,8 +1418,8 @@ Most tools accept detail="compact|brief|full":
             lines = [f"# {header}\n"]
             for s in per_source:
                 lines.append(f"## [{s['id']}] {s['title']}")
-                if s["key_claim"]:
-                    lines.append(s["key_claim"])
+                if s["key_claim_full"]:
+                    lines.append(s["key_claim_full"])
                 lines.append("")
             return "\n".join(lines)
 

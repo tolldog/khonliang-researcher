@@ -22,11 +22,37 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Callable, List
 
 import pytest
 
 from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+
+# ---------------------------------------------------------------------------
+# FastMCP private-API isolation
+# ---------------------------------------------------------------------------
+#
+# FastMCP does not currently expose a public API to retrieve a registered
+# tool's underlying Python function. We reach into ``_tool_manager._tools``
+# here; this is the ONLY place that happens so a FastMCP upgrade that
+# changes the registry shape fails in one, obvious spot.
+#
+# If/when FastMCP exposes a public accessor (e.g. ``mcp.get_tool(name)``),
+# replace this helper's body and the rest of the suite is unaffected.
+def _get_registered_tool_fn(mcp: Any, name: str) -> Callable | None:
+    for attr in ("_tool_manager", "tool_manager"):
+        mgr = getattr(mcp, attr, None)
+        if mgr is None:
+            continue
+        tools = getattr(mgr, "_tools", None) or getattr(mgr, "tools", None)
+        if not tools:
+            continue
+        entry = tools.get(name) if isinstance(tools, dict) else None
+        if entry is None:
+            continue
+        return getattr(entry, "fn", None) or getattr(entry, "func", None) or entry
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -95,112 +121,67 @@ def _summary(parent_id: str, key_finding: str) -> KnowledgeEntry:
     )
 
 
-def _build_server_with_fake_pipeline(pipeline) -> Any:
-    """Spin up a research server wrapping the fake pipeline.
+class _DummyWorker:
+    def __init__(self, *a, **kw):
+        pass
 
-    The server normally requires a real pipeline (knowledge + triples +
-    pool). We only exercise brief_on, which touches pipeline.search,
-    pipeline.knowledge.get, and pipeline.relevance — fake those and
-    stub out the pieces the tool constructor otherwise needs.
+    stats = {"running": False, "pending": 0, "processed": 0, "failed": 0}
+
+    def count_pending(self):
+        return 0
+
+
+class _DummySynth:
+    def __init__(self, *a, **kw):
+        pass
+
+
+class _Stub:
+    def __getattr__(self, _name):
+        return _Stub()
+
+    def __call__(self, *a, **kw):
+        return _Stub()
+
+
+@pytest.fixture
+def call_brief_on(monkeypatch):
+    """Return a callable that invokes the ``brief_on`` MCP tool.
+
+    Uses pytest's ``monkeypatch`` so any attribute swaps on
+    ``researcher.worker`` / ``researcher.synthesizer`` are automatically
+    reverted at test teardown. No global state leaks between tests.
     """
-    from researcher import server as server_mod
-
-    # The full create_research_server wires a Synthesizer and DistillWorker
-    # onto the pipeline; those aren't on our fake. Rather than stub the
-    # whole thing, invoke the tool directly by poking at the registered
-    # MCP tool table via a thin wrapper server build.
-    #
-    # Easiest path: construct an MCP with just our tool by reusing the
-    # decorator pattern from the real server. We avoid the DistillWorker
-    # and Synthesizer constructors entirely.
-    raise NotImplementedError  # placeholder — unused; see direct-call tests below
-
-
-def _call_brief_on(pipeline, **kwargs) -> dict:
-    """Invoke the tool body directly without a full MCP server.
-
-    We import ``create_research_server`` side-effect-free and then fish
-    the registered tool out. If that's too invasive, we can instead
-    inline-call the same code path; here the tool body is a closure over
-    ``pipeline`` so we build a minimal replica.
-    """
-    # Strategy: rather than reconstruct the full server (which needs a
-    # Synthesizer / Worker / ModelPool), call the closure body directly
-    # by importing the module and constructing the tool ourselves with
-    # the same logic. To avoid code drift, we instead invoke the real
-    # function via FastMCP's tool registry after a minimal server build
-    # that skips worker/synth setup.
-    from researcher.server import create_research_server
-
-    # Minimal pipeline needs: .knowledge, .triples, .relevance, .pool,
-    # .search(), .config, plus enough for Synthesizer + DistillWorker
-    # constructors to not crash. We stub those.
-    class _Stub:
-        def __getattr__(self, _name):
-            return _Stub()
-
-        def __call__(self, *a, **kw):
-            return _Stub()
-
-    pipeline.triples = _Stub()
-    pipeline.pool = _Stub()
-    pipeline.config = {"projects": {}}
-    pipeline.digest = _Stub()
-
-    # DistillWorker(pipeline) and Synthesizer(knowledge, triples, pool)
-    # may try to do real work; patch them out.
-    import researcher.server as srv_mod
     import researcher.worker as worker_mod
     import researcher.synthesizer as synth_mod
+    from researcher.server import create_research_server
 
-    class _DummyWorker:
-        def __init__(self, *a, **kw):
-            pass
+    # create_research_server instantiates a DistillWorker and a
+    # Synthesizer. Neither is exercised by brief_on, so substitute
+    # no-op stand-ins; monkeypatch reverts after each test.
+    monkeypatch.setattr(worker_mod, "DistillWorker", _DummyWorker)
+    monkeypatch.setattr(synth_mod, "Synthesizer", _DummySynth)
 
-        stats = {"running": False, "pending": 0, "processed": 0, "failed": 0}
+    def _invoke(pipeline, **kwargs) -> dict:
+        # Minimal pipeline shim: brief_on only touches .knowledge,
+        # .relevance, and .search(). The surrounding server wiring
+        # wants a few more attributes — stub them.
+        pipeline.triples = _Stub()
+        pipeline.pool = _Stub()
+        pipeline.config = {"projects": {}}
+        pipeline.digest = _Stub()
 
-        def count_pending(self):
-            return 0
-
-    class _DummySynth:
-        def __init__(self, *a, **kw):
-            pass
-
-    original_worker = srv_mod.DistillWorker if hasattr(srv_mod, "DistillWorker") else None
-    # create_research_server imports DistillWorker / Synthesizer inside the
-    # function body, so we patch the source modules.
-    worker_mod.DistillWorker = _DummyWorker  # type: ignore[attr-defined]
-    synth_mod.Synthesizer = _DummySynth  # type: ignore[attr-defined]
-
-    try:
         mcp = create_research_server(pipeline)
-    finally:
-        if original_worker is not None:
-            srv_mod.DistillWorker = original_worker  # type: ignore[attr-defined]
+        tool_fn = _get_registered_tool_fn(mcp, "brief_on")
+        assert tool_fn is not None, "brief_on tool not found on MCP server"
 
-    # FastMCP stores tools in a private registry. Find brief_on and call.
-    tool_fn = None
-    # Modern FastMCP exposes tools via ``_tool_manager._tools`` or similar.
-    for attr in ("_tool_manager", "tool_manager"):
-        mgr = getattr(mcp, attr, None)
-        if mgr is None:
-            continue
-        tools = getattr(mgr, "_tools", None) or getattr(mgr, "tools", None)
-        if not tools:
-            continue
-        entry = tools.get("brief_on") if isinstance(tools, dict) else None
-        if entry is None:
-            continue
-        tool_fn = getattr(entry, "fn", None) or getattr(entry, "func", None) or entry
-        break
+        result = tool_fn(**kwargs)
+        return json.loads(result)
 
-    assert tool_fn is not None, "brief_on tool not found on MCP server"
-
-    result = tool_fn(**kwargs)
-    return json.loads(result)
+    return _invoke
 
 
-def test_brief_on_runs_three_queries_when_context_supplied():
+def test_brief_on_runs_three_queries_when_context_supplied(call_brief_on):
     """Multi-query expansion: topic / topic+context / context all fire."""
     e1 = _entry("aaa", "topic-only hit")
     e2 = _entry("bbb", "both hit")
@@ -212,7 +193,7 @@ def test_brief_on_runs_three_queries_when_context_supplied():
         "reviewer agent": [e2, e3],
     })
 
-    out = _call_brief_on(
+    out = call_brief_on(
         pipeline,
         topic="ollama code review",
         in_context_of="reviewer agent",
@@ -236,14 +217,14 @@ def test_brief_on_runs_three_queries_when_context_supplied():
     assert set(out["source_ids"]) == {"aaa", "bbb", "ccc"}
 
 
-def test_brief_on_single_query_when_no_context():
+def test_brief_on_single_query_when_no_context(call_brief_on):
     pipeline = _FakePipeline({"ollama code review": [_entry("aaa", "x")]})
-    out = _call_brief_on(pipeline, topic="ollama code review")
+    out = call_brief_on(pipeline, topic="ollama code review")
     assert [c[0] for c in pipeline.calls] == ["ollama code review"]
     assert out["retrieval_diagnostics"]["queries_run"] == ["ollama code review"]
 
 
-def test_brief_on_reuses_stored_distill_summary_no_redistill():
+def test_brief_on_reuses_stored_distill_summary_no_redistill(call_brief_on):
     """When a <id>_summary entry exists, brief_on reads its key_findings
     rather than re-running the distiller. This is the FR's 'reuse the
     existing distill_paper primitive' invariant."""
@@ -255,53 +236,96 @@ def test_brief_on_reuses_stored_distill_summary_no_redistill():
         summaries={"xyz_summary": summary},
     )
 
-    out = _call_brief_on(pipeline, topic="query", detail="brief")
+    out = call_brief_on(pipeline, topic="query", detail="brief")
     # The sentinel finding from the stored summary must appear in the brief.
     assert "KEY_FINDING_SENTINEL" in out["brief"]
     assert out["source_ids"] == ["xyz"]
 
 
-def test_brief_on_falls_back_to_content_when_no_summary():
+def test_brief_on_falls_back_to_content_when_no_summary(call_brief_on):
     e = _entry("nodistill", "Raw Paper", content="First line is the claim.\nrest...")
     pipeline = _FakePipeline({"q": [e]})
 
-    out = _call_brief_on(pipeline, topic="q", detail="brief")
+    out = call_brief_on(pipeline, topic="q", detail="brief")
     assert "First line is the claim." in out["brief"]
 
 
-def test_brief_on_brief_detail_under_2000_chars():
+def test_brief_on_brief_detail_under_2000_chars(call_brief_on):
     """Acceptance: detail='brief' output fits in <=2000 chars."""
     entries = [_entry(f"id{i:02d}", f"Title {i} " * 20) for i in range(10)]
     pipeline = _FakePipeline({"topic": entries[:10], "topic ctx": entries[5:], "ctx": entries})
 
-    out = _call_brief_on(
+    out = call_brief_on(
         pipeline, topic="topic", in_context_of="ctx", detail="brief", top_k=10,
     )
     assert len(out["brief"]) <= 2000
 
 
-def test_brief_on_empty_topic_rejected():
+def test_brief_on_empty_topic_rejected(call_brief_on):
     pipeline = _FakePipeline({})
-    out = _call_brief_on(pipeline, topic="")
+    out = call_brief_on(pipeline, topic="")
     assert out["source_ids"] == []
     assert "non-empty topic" in out["brief"]
+    # Contract: per_query_hits is always present, even on early-return.
+    diag = out["retrieval_diagnostics"]
+    assert diag["per_query_hits"] == {}
 
 
-def test_brief_on_no_hits_returns_empty_diagnostics():
+def test_brief_on_no_hits_returns_empty_diagnostics(call_brief_on):
     pipeline = _FakePipeline({"nothing": []})
-    out = _call_brief_on(pipeline, topic="nothing")
+    out = call_brief_on(pipeline, topic="nothing")
     assert out["source_ids"] == []
     assert out["retrieval_diagnostics"]["total_hits"] == 0
     # queries_run is still populated so callers can tune.
     assert out["retrieval_diagnostics"]["queries_run"] == ["nothing"]
 
 
-def test_brief_on_return_shape():
+def test_brief_on_return_shape(call_brief_on):
     pipeline = _FakePipeline({"t": [_entry("id1", "T")]})
-    out = _call_brief_on(pipeline, topic="t")
+    out = call_brief_on(pipeline, topic="t")
     assert set(out.keys()) == {"brief", "source_ids", "retrieval_diagnostics"}
     diag = out["retrieval_diagnostics"]
-    assert set(diag.keys()) >= {"queries_run", "total_hits", "top_k_chosen"}
+    assert set(diag.keys()) >= {"queries_run", "total_hits", "top_k_chosen", "per_query_hits"}
+
+
+def test_brief_on_per_query_limit_respects_top_k(call_brief_on):
+    """top_k > 10 must propagate to pipeline.search so enough candidates
+    are pulled per query to fill the caller's requested top_k."""
+    entries = [_entry(f"id{i:02d}", f"Title {i}") for i in range(25)]
+    pipeline = _FakePipeline({"topic": entries})
+
+    out = call_brief_on(pipeline, topic="topic", detail="brief", top_k=20)
+    # Every recorded search must have been issued with limit >= 20.
+    assert all(limit >= 20 for _q, limit in pipeline.calls), pipeline.calls
+    # And the top_k_chosen honours the caller's request.
+    assert out["retrieval_diagnostics"]["top_k_chosen"] == 20
+
+
+def test_brief_on_full_detail_emits_untruncated_key_claim(call_brief_on):
+    """detail='full' must not truncate the key_claim at 220 chars."""
+    long_claim = "SENTINEL_FULL " + ("x" * 400)  # well past 220
+    e = _entry("longclaim", "Long-claim paper")
+    summary = KnowledgeEntry(
+        id="longclaim_summary",
+        tier=Tier.DERIVED,
+        title="Summary: longclaim",
+        content=json.dumps({
+            "title": "paper longclaim",
+            "abstract": "abstract text",
+            "key_findings": [long_claim],
+        }),
+        scope="research",
+        source="longclaim",
+        status=EntryStatus.DISTILLED,
+        tags=["summary"],
+        metadata={"parent_id": "longclaim"},
+    )
+    pipeline = _FakePipeline({"topic": [e]}, summaries={"longclaim_summary": summary})
+
+    out = call_brief_on(pipeline, topic="topic", detail="full")
+    assert long_claim in out["brief"], (
+        "full() formatter should emit the untruncated key_claim"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +350,7 @@ def _find_real_db() -> Path | None:
     _find_real_db() is None,
     reason="real researcher knowledge store not present; skipping corpus smoke test",
 )
-def test_brief_on_real_corpus_smoke():
+def test_brief_on_real_corpus_smoke(call_brief_on):
     """FR acceptance: brief_on(topic='local Ollama code review models',
     in_context_of='khonliang reviewer agent') must surface >=3 of the
     known-corpus entries (CodeGPT Ollama guide, Local AI Master 2026,
@@ -348,7 +372,7 @@ def test_brief_on_real_corpus_smoke():
         def search(self, query: str, limit: int = 10):
             return store.search(query, scope="research", limit=limit)
 
-    out = _call_brief_on(
+    out = call_brief_on(
         _ThinPipeline(store),
         topic="local Ollama code review models",
         in_context_of="khonliang reviewer agent",
