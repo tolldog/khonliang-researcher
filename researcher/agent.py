@@ -76,8 +76,14 @@ def main():
     """CLI entry point for the researcher agent."""
     import argparse
 
+    from khonliang_bus import add_version_flag
+
     # Check for install/uninstall commands before full agent init
-    parser = argparse.ArgumentParser(description="khonliang-researcher bus agent")
+    parser = argparse.ArgumentParser(
+        prog="researcher.agent",
+        description="khonliang-researcher bus agent",
+    )
+    add_version_flag(parser)
     parser.add_argument("command", nargs="?", choices=["install", "uninstall"],
                         help="install or uninstall from the bus")
     parser.add_argument("--id", default="researcher-primary")
