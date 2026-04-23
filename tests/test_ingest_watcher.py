@@ -100,3 +100,32 @@ async def test_ingest_watcher_registry_start_list_stop(tmp_path):
     stopped = await registry.stop(watcher_id)
     assert stopped is True
     assert registry.list_watchers() == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_watcher_retries_publish_after_failure(tmp_path):
+    events: list[tuple[str, dict]] = []
+    attempts = {"count": 0}
+
+    async def publish(topic: str, payload: dict) -> None:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("boom")
+        events.append((topic, payload))
+
+    snapshot = [{"entry_id": "a", "url": "https://example.com/a", "status": "distilled", "summary_preview": "done"}]
+
+    watcher = IngestWatcher(
+        config=IngestWatcherConfig("iw_test", 5, 1.0),
+        store=IngestWatcherStore(str(tmp_path / "watcher.db")),
+        publish=publish,
+        snapshot_fn=lambda: snapshot,
+        now_fn=lambda: 123.0,
+    )
+
+    emitted_first = await watcher.poll_once()
+    emitted_second = await watcher.poll_once()
+
+    assert emitted_first == 0
+    assert emitted_second == 1
+    assert [topic for topic, _ in events] == [TOPIC_URL_DISTILLED]

@@ -118,6 +118,24 @@ class IngestWatcherStore:
                 (watcher_id,),
             )
 
+    def was_emitted(
+        self,
+        watcher_id: str,
+        entry_id: str,
+        transition_kind: str,
+        dedupe_id: str,
+    ) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM ingest_watcher_dedupe
+                WHERE watcher_id = ? AND entry_id = ? AND transition_kind = ? AND dedupe_id = ?
+                LIMIT 1
+                """,
+                (watcher_id, entry_id, transition_kind, dedupe_id),
+            ).fetchone()
+        return row is not None
+
     def mark_emitted(
         self,
         watcher_id: str,
@@ -125,9 +143,9 @@ class IngestWatcherStore:
         transition_kind: str,
         dedupe_id: str,
         at: float,
-    ) -> bool:
+    ) -> None:
         with self._conn() as conn:
-            cur = conn.execute(
+            conn.execute(
                 """
                 INSERT OR IGNORE INTO ingest_watcher_dedupe
                     (watcher_id, entry_id, transition_kind, dedupe_id, emitted_at)
@@ -135,7 +153,6 @@ class IngestWatcherStore:
                 """,
                 (watcher_id, entry_id, transition_kind, dedupe_id, float(at)),
             )
-            return cur.rowcount > 0
 
 
 @dataclass
@@ -281,14 +298,12 @@ class IngestWatcher:
         dedupe_id: str,
         payload: dict[str, Any],
     ) -> bool:
-        is_new = self.store.mark_emitted(
+        if self.store.was_emitted(
             watcher_id=self.config.watcher_id,
             entry_id=entry_id,
             transition_kind=transition_kind,
             dedupe_id=dedupe_id,
-            at=self._now(),
-        )
-        if not is_new:
+        ):
             return False
         try:
             await self._publish(topic, payload)
@@ -299,6 +314,14 @@ class IngestWatcher:
                 topic,
                 e,
             )
+            return False
+        self.store.mark_emitted(
+            watcher_id=self.config.watcher_id,
+            entry_id=entry_id,
+            transition_kind=transition_kind,
+            dedupe_id=dedupe_id,
+            at=self._now(),
+        )
         return True
 
     async def _emit_poll_error(self, reason: str) -> None:

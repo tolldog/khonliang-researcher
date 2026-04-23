@@ -179,7 +179,8 @@ class LibrarianAgent(BaseAgent):
 
     async def _handle_bus_event(self, event: dict[str, Any]) -> None:
         topic = str(event.get("topic", "")).strip()
-        payload = event.get("payload") or {}
+        raw_payload = event.get("payload")
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
         if topic == "ingest.url_distilled":
             entry_id = str(payload.get("entry_id", "")).strip()
             if entry_id:

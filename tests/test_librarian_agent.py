@@ -301,3 +301,29 @@ def test_artifact_id_accepts_top_level_and_nested_shapes(tmp_path):
     assert agent._artifact_id({"id": "art_top"}) == "art_top"
     assert agent._artifact_id({"artifact": {"id": "art_nested"}}) == "art_nested"
     assert agent._artifact_id({}) == ""
+
+
+@pytest.mark.asyncio
+async def test_handle_bus_event_ignores_non_dict_payload(tmp_path, monkeypatch):
+    agent = LibrarianAgent(
+        agent_id="librarian-test",
+        bus_url="http://localhost:8788",
+        config_path=_make_config(tmp_path),
+    )
+
+    called = {"classify": 0, "rebuild": 0}
+
+    async def fake_classify(args):
+        called["classify"] += 1
+        return {"status": "classified"}
+
+    async def fake_rebuild(args):
+        called["rebuild"] += 1
+        return {"snapshot_id": "libsnap_1"}
+
+    monkeypatch.setattr(agent, "handle_classify_paper", fake_classify)
+    monkeypatch.setattr(agent, "handle_rebuild_neighborhoods", fake_rebuild)
+
+    await agent._handle_bus_event({"topic": "ingest.url_distilled", "payload": "bad"})
+
+    assert called == {"classify": 0, "rebuild": 0}
