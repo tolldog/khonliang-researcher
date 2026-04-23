@@ -228,9 +228,13 @@ class LibrarianAgent(BaseAgent):
         snapshot = self.store.latest_snapshot(audience)
         if snapshot:
             return snapshot.content
-        result = await self.handle_rebuild_neighborhoods({"audience": audience, "reason": reason})
-        if "snapshot" in result:
-            return result["snapshot"]
+        # rebuild persists the snapshot; re-read from the store rather than
+        # relying on the handler response (which is intentionally compact and
+        # no longer carries the full taxonomy payload).
+        await self.handle_rebuild_neighborhoods({"audience": audience, "reason": reason})
+        refreshed = self.store.latest_snapshot(audience)
+        if refreshed:
+            return refreshed.content
         return {}
 
     @handler("library_health")
@@ -242,6 +246,21 @@ class LibrarianAgent(BaseAgent):
 
     @handler("rebuild_neighborhoods")
     async def handle_rebuild_neighborhoods(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild taxonomy/neighborhood artifacts and persist a snapshot.
+
+        The response is intentionally bounded: it returns a compact summary
+        (snapshot_id, audience, paper_count, classification_count,
+        ambiguous_count, created_at, artifact_id, delta_artifact_id) rather
+        than the full taxonomy. This matches the token-economy goal — the
+        common ``ingest.queue_drained`` automation path would otherwise emit
+        oversized bus responses and risk timeouts.
+
+        Callers that need the full taxonomy should read it via
+        ``self.store.latest_snapshot(audience).content`` (local API) or a
+        future ``get_taxonomy_snapshot`` bus skill. The compute-store-distill
+        pattern (``fr_khonliang_8441aff3``) is the long-term home for that
+        retrieval surface.
+        """
         audience = str(args.get("audience", "")).strip()
         reason = str(args.get("reason", "")).strip()
         graph = self._graph()
@@ -253,9 +272,11 @@ class LibrarianAgent(BaseAgent):
         # sortable and dependency-free.
         snapshot_id = f"libsnap_{time.time_ns()}"
 
+        paper_entries = self._paper_entries()
+        paper_count = len(paper_entries)
         classified = 0
         ambiguous = 0
-        for entry in self._paper_entries():
+        for entry in paper_entries:
             result = classify_paper_from_triples(entry.id, triples, taxonomy, audience=audience)
             if result["status"] == "classified":
                 self.store.upsert_classification(
@@ -299,7 +320,7 @@ class LibrarianAgent(BaseAgent):
             ambiguous_count=ambiguous,
         )
 
-        self.store.store_snapshot(
+        stored = self.store.store_snapshot(
             NeighborhoodSnapshot(
                 snapshot_id=snapshot_id,
                 audience=audience,
@@ -308,6 +329,7 @@ class LibrarianAgent(BaseAgent):
                 content=taxonomy,
             )
         )
+        created_at = float(stored.rebuilt_at) if stored is not None else time.time()
 
         await self.publish(
             "library.rebuilt",
@@ -316,7 +338,7 @@ class LibrarianAgent(BaseAgent):
                 "artifact_id": artifact_id,
                 "delta_artifact_id": delta_artifact_id,
                 "reason": reason,
-                "rebuilt_at": time.time(),
+                "rebuilt_at": created_at,
                 "changes_summary": {
                     "groups": len(taxonomy.get("groups", [])),
                     "relationships": len(taxonomy.get("relationships", [])),
@@ -327,11 +349,13 @@ class LibrarianAgent(BaseAgent):
         )
         return {
             "snapshot_id": snapshot_id,
+            "audience": audience,
             "artifact_id": artifact_id,
             "delta_artifact_id": delta_artifact_id,
-            "classified_count": classified,
+            "paper_count": paper_count,
+            "classification_count": classified,
             "ambiguous_count": ambiguous,
-            "snapshot": taxonomy,
+            "created_at": created_at,
         }
 
     @handler("taxonomy_report")

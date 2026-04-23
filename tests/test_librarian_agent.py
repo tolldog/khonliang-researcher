@@ -101,6 +101,85 @@ async def test_rebuild_neighborhoods_persists_snapshot_and_classification(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_handle_rebuild_neighborhoods_response_is_bounded(tmp_path, monkeypatch):
+    """The handler response must NOT include the full taxonomy payload.
+
+    Returning the entire snapshot inline defeats the FR's stated goal of
+    bounding heavy librarian outputs by default, and risks oversized bus
+    responses / timeouts on the common ``ingest.queue_drained`` automation
+    path. Callers that need the taxonomy read it from the store via
+    ``latest_snapshot`` or a future ``get_taxonomy_snapshot`` bus skill.
+    """
+    agent = LibrarianAgent(
+        agent_id="librarian-test",
+        bus_url="http://localhost:8788",
+        config_path=_make_config(tmp_path),
+    )
+
+    # Seed several papers + triples so the taxonomy payload is non-trivial
+    # — any leak of the full snapshot would produce a much larger response.
+    for idx in range(5):
+        agent.pipeline.knowledge.add(
+            KnowledgeEntry(
+                id=f"paper{idx}",
+                tier=Tier.IMPORTED,
+                title=f"Paper {idx}",
+                content="body",
+                source=f"paper{idx}",
+                scope="research",
+                tags=["paper"],
+                status=EntryStatus.DISTILLED,
+                metadata={"url": f"https://example.com/paper{idx}"},
+            )
+        )
+        agent.pipeline.triples.add(
+            subject=f"Concept {idx}",
+            predicate="relates_to",
+            obj=f"Concept {idx + 1}",
+            confidence=0.9,
+            source=f"paper:paper{idx}",
+        )
+
+    async def fake_post(url, json):
+        return SimpleNamespace(json=lambda: {"artifact": {"id": "art_bounded"}})
+
+    async def fake_publish(topic, payload):
+        return None
+
+    monkeypatch.setattr(agent._http, "post", fake_post)
+    monkeypatch.setattr(agent, "publish", fake_publish)
+
+    result = await agent.handle_rebuild_neighborhoods(
+        {"audience": "", "reason": "test-bounded"}
+    )
+
+    # Bounded compact summary only — no full taxonomy leak.
+    assert "snapshot" not in result
+    assert "taxonomy" not in result
+    assert "groups" not in result
+    assert "relationships" not in result
+
+    # Expected compact fields are present.
+    for key in (
+        "snapshot_id",
+        "audience",
+        "artifact_id",
+        "delta_artifact_id",
+        "paper_count",
+        "classification_count",
+        "ambiguous_count",
+        "created_at",
+    ):
+        assert key in result, f"compact summary missing key {key!r}"
+
+    assert result["paper_count"] == 5
+    # Callers retrieve the full taxonomy from the store, not the response.
+    stored = agent.store.latest_snapshot()
+    assert stored is not None
+    assert stored.content  # taxonomy lives here, not in the handler reply
+
+
+@pytest.mark.asyncio
 async def test_taxonomy_report_caps_brief_output(tmp_path, monkeypatch):
     agent = LibrarianAgent(
         agent_id="librarian-test",

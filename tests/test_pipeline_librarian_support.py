@@ -68,7 +68,14 @@ def test_list_evidence_sources_filters_owned_locally(tmp_path):
     assert [row["project"] for row in external] == ["external"]
 
 
-def test_list_evidence_sources_self_heals_stale_owned_locally_metadata(tmp_path):
+def test_list_evidence_sources_preserves_explicit_owned_locally_false(tmp_path):
+    """Regression: an explicit ``owned_locally=False`` for a local checkout
+    must persist through ``list_evidence_sources``. Previously the listing
+    logic OR-ed the stored flag with a path-existence check, which silently
+    flipped the value back to ``True`` for any existing path — making the
+    explicit API/CLI override impossible to persist. Callers that want the
+    legacy inference can combine ``owned_locally or path_exists`` themselves.
+    """
     pipeline = create_pipeline(_make_config(tmp_path))
     repo_path = tmp_path / "ollama-khonliang"
     repo_path.mkdir()
@@ -81,7 +88,12 @@ def test_list_evidence_sources_self_heals_stale_owned_locally_metadata(tmp_path)
     rows = pipeline.list_evidence_sources()
 
     assert rows[0]["project"] == "khonliang"
-    assert rows[0]["owned_locally"] is True
+    # Stored value is honoured verbatim — explicit False is not clobbered
+    # even though the path exists on disk.
+    assert rows[0]["owned_locally"] is False
+    # path_exists is exposed separately so callers can combine them if they
+    # want the union (``owned_locally or path_exists``).
+    assert rows[0]["path_exists"] is True
 
 
 @pytest.mark.asyncio

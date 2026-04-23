@@ -1677,15 +1677,24 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         return entry_id
 
     def list_evidence_sources(self, owned_locally: Optional[bool] = None) -> list[dict[str, Any]]:
-        """Return registered evidence sources."""
+        """Return registered evidence sources.
+
+        ``owned_locally`` in each row is the value persisted at registration
+        time (``register_evidence_source`` infers a default from the path when
+        the caller passes ``None``, but an explicit ``False`` is honoured).
+        ``path_exists`` is a derived boolean callers can combine with the
+        stored flag via ``owned_locally or path_exists`` when they want the
+        legacy OR-inference behaviour.
+        """
         rows: list[dict[str, Any]] = []
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             if "repo" not in (entry.tags or []):
                 continue
             meta = entry.metadata or {}
             repo_path = str(meta.get("repo_path", "?"))
-            is_owned = bool(meta.get("owned_locally", False)) or self._infer_owned_locally(repo_path)
-            if owned_locally is not None and is_owned != owned_locally:
+            stored_owned = bool(meta.get("owned_locally", False))
+            path_exists = self._infer_owned_locally(repo_path)
+            if owned_locally is not None and stored_owned != owned_locally:
                 continue
             rows.append(
                 {
@@ -1693,7 +1702,8 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                     "repo_path": repo_path,
                     "scope": meta.get("scope", "?"),
                     "depends_on": list(meta.get("depends_on", [])),
-                    "owned_locally": is_owned,
+                    "owned_locally": stored_owned,
+                    "path_exists": path_exists,
                     "upstream_url": meta.get("upstream_url", ""),
                     "license": meta.get("license", ""),
                 }
@@ -1713,6 +1723,7 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                     "scope": cfg.get("scope", "?"),
                     "depends_on": list(cfg.get("depends_on", [])),
                     "owned_locally": inferred_owned,
+                    "path_exists": inferred_owned,
                     "upstream_url": cfg.get("upstream_url", ""),
                     "license": cfg.get("license", ""),
                 }
