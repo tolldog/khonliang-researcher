@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
 from researcher.pipeline import create_pipeline
 
 
@@ -86,7 +88,7 @@ def test_list_evidence_sources_self_heals_stale_owned_locally_metadata(tmp_path)
 async def test_consume_research_request_searches_and_records(monkeypatch, tmp_path):
     pipeline = create_pipeline(_make_config(tmp_path))
 
-    async def fake_search(query: str, max_results: int = 8):
+    async def fake_search(query: str, engines=None, max_results: int = 8, **kwargs):
         assert "code review" in query
         return [
             SimpleNamespace(
@@ -114,3 +116,103 @@ async def test_consume_research_request_searches_and_records(monkeypatch, tmp_pa
     assert result["audience"] == "developer-researcher"
     assert len(result["papers"]) == 2
     assert result["papers"][0]["title"] == "Paper A"
+
+
+@pytest.mark.asyncio
+async def test_consume_research_request_threads_suggested_sources(monkeypatch, tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+
+    captured: dict = {}
+
+    async def fake_search(query, engines=None, max_results=20, **kwargs):
+        captured["query"] = query
+        captured["engines"] = engines
+        captured["max_results"] = max_results
+        return []
+
+    monkeypatch.setattr("researcher.pipeline.search_papers", fake_search)
+
+    await pipeline.consume_research_request(
+        topic="code review",
+        suggested_sources=["arxiv", "semantic_scholar"],
+        max_results=5,
+    )
+
+    assert captured["engines"] == ["arxiv", "semantic_scholar"]
+    assert captured["max_results"] == 5
+
+
+@pytest.mark.asyncio
+async def test_consume_research_request_omits_engines_when_no_sources(monkeypatch, tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+
+    captured: dict = {}
+
+    async def fake_search(query, engines=None, max_results=20, **kwargs):
+        captured["engines"] = engines
+        return []
+
+    monkeypatch.setattr("researcher.pipeline.search_papers", fake_search)
+
+    # Missing param → engines defaults to None (search all engines)
+    await pipeline.consume_research_request(topic="t1")
+    assert captured["engines"] is None
+
+    # Empty list → same (still None, not [] — avoids search_papers returning empty)
+    await pipeline.consume_research_request(topic="t2", suggested_sources=[])
+    assert captured["engines"] is None
+
+    # List of empty/whitespace strings → also None
+    await pipeline.consume_research_request(topic="t3", suggested_sources=["", "  "])
+    assert captured["engines"] is None
+
+
+def test_get_ingest_snapshot_excludes_non_url_entries(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+
+    # URL-backed paper — included
+    pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="paper-ok",
+            tier=Tier.IMPORTED,
+            title="Paper with URL",
+            content="body",
+            source="https://example.com/a",
+            scope="research",
+            tags=["paper"],
+            status=EntryStatus.INGESTED,
+            metadata={"url": "https://example.com/a"},
+        )
+    )
+    # Idea — excluded (no url, tag idea)
+    pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="idea-xx",
+            tier=Tier.IMPORTED,
+            title="An idea",
+            content="raw",
+            source="idea",
+            scope="research",
+            tags=["idea"],
+            status=EntryStatus.INGESTED,
+            metadata={"claims": []},
+        )
+    )
+    # Paper-tagged but no URL — excluded (bad data guard)
+    pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="paper-nourl",
+            tier=Tier.IMPORTED,
+            title="Broken paper",
+            content="body",
+            source="?",
+            scope="research",
+            tags=["paper"],
+            status=EntryStatus.INGESTED,
+            metadata={},
+        )
+    )
+
+    rows = pipeline.get_ingest_snapshot()
+    assert [row["entry_id"] for row in rows] == ["paper-ok"]
+    assert rows[0]["url"] == "https://example.com/a"

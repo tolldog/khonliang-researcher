@@ -48,6 +48,21 @@ class DistillResult:
     success: bool = False
 
 
+def is_paper_entry(entry: KnowledgeEntry) -> bool:
+    """Return True iff ``entry`` is a URL-backed paper (not an idea or other non-paper import).
+
+    Papers are ingested via :meth:`ResearchPipeline.ingest_paper` with ``tags=["paper"]``
+    and a non-empty ``metadata["url"]``. Ideas (``tags=["idea"]``) and other Tier.IMPORTED
+    entries have no URL and should be excluded from ingest-watcher snapshots and
+    librarian classification loops.
+    """
+    if "paper" not in (entry.tags or []):
+        return False
+    meta = entry.metadata or {}
+    url = str(meta.get("url", "") or "").strip()
+    return bool(url)
+
+
 def update_capability_status(
     knowledge: KnowledgeStore,
     target: str,
@@ -1726,6 +1741,12 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
             EntryStatus.SKIPPED,
         ):
             for entry in self.knowledge.get_by_status(status, tier=Tier.IMPORTED):
+                if not is_paper_entry(entry):
+                    # Skip ideas and other non-URL imports — the ingest watcher
+                    # only publishes url_* transitions, and non-paper entries
+                    # would otherwise emit events with empty URLs and keep the
+                    # queue artificially non-drained.
+                    continue
                 meta = entry.metadata or {}
                 rows.append(
                     {
@@ -1764,7 +1785,11 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         if branch.strip():
             query_parts.append(f"branch {branch.strip()}")
         query = " ".join(part for part in query_parts if part).strip()
-        results = await search_papers(query, max_results=max_results)
+        # Thread suggested_sources through to search_papers so callers who supply
+        # engine hints (e.g. ["arxiv", "semantic_scholar"]) actually constrain
+        # the search. Unknown engine names are silently dropped by search_papers.
+        engines = [s for s in (suggested_sources or []) if str(s).strip()] or None
+        results = await search_papers(query, engines=engines, max_results=max_results)
         papers = [
             {
                 "title": item.title,

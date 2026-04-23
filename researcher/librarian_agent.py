@@ -28,7 +28,7 @@ from khonliang_researcher import (
     suggest_entities,
 )
 
-from researcher.pipeline import create_pipeline
+from researcher.pipeline import create_pipeline, is_paper_entry
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +133,14 @@ class LibrarianAgent(BaseAgent):
         return ""
 
     def _paper_entries(self):
-        return list(self.pipeline.knowledge.get_by_tier(Tier.IMPORTED))
+        # Filter to real URL-backed papers so library_health counts and
+        # rebuild_neighborhoods classification don't pollute with ideas
+        # or other non-paper Tier.IMPORTED entries.
+        return [
+            entry
+            for entry in self.pipeline.knowledge.get_by_tier(Tier.IMPORTED)
+            if is_paper_entry(entry)
+        ]
 
     async def _create_classification_delta_artifact(
         self,
@@ -180,6 +187,12 @@ class LibrarianAgent(BaseAgent):
     async def _handle_bus_event(self, event: dict[str, Any]) -> None:
         topic = str(event.get("topic", "")).strip()
         raw_payload = event.get("payload")
+        if raw_payload is not None and not isinstance(raw_payload, dict):
+            logger.warning(
+                "librarian ingest-event watcher got non-dict payload for topic %s (type=%s); treating as empty",
+                topic,
+                type(raw_payload).__name__,
+            )
         payload = raw_payload if isinstance(raw_payload, dict) else {}
         if topic == "ingest.url_distilled":
             entry_id = str(payload.get("entry_id", "")).strip()

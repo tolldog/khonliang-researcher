@@ -327,3 +327,88 @@ async def test_handle_bus_event_ignores_non_dict_payload(tmp_path, monkeypatch):
     await agent._handle_bus_event({"topic": "ingest.url_distilled", "payload": "bad"})
 
     assert called == {"classify": 0, "rebuild": 0}
+
+
+@pytest.mark.asyncio
+async def test_handle_bus_event_tolerates_non_dict_payload_and_warns(tmp_path, monkeypatch, caplog):
+    agent = LibrarianAgent(
+        agent_id="librarian-test",
+        bus_url="http://localhost:8788",
+        config_path=_make_config(tmp_path),
+    )
+
+    async def fake_classify(args):
+        return {"status": "classified"}
+
+    async def fake_rebuild(args):
+        return {"snapshot_id": "libsnap_1"}
+
+    monkeypatch.setattr(agent, "handle_classify_paper", fake_classify)
+    monkeypatch.setattr(agent, "handle_rebuild_neighborhoods", fake_rebuild)
+
+    caplog.set_level("WARNING", logger="researcher.librarian_agent")
+
+    # list payload — not a dict, must not raise, must log a warning
+    await agent._handle_bus_event({"topic": "ingest.url_distilled", "payload": [1, 2]})
+    # int payload — same
+    await agent._handle_bus_event({"topic": "ingest.queue_drained", "payload": 42})
+    # missing payload key entirely — also fine, but NO warning (raw_payload is None)
+    await agent._handle_bus_event({"topic": "ingest.url_distilled"})
+
+    warnings = [rec for rec in caplog.records if rec.levelname == "WARNING"]
+    assert len(warnings) == 2
+    assert all("non-dict payload" in rec.getMessage() for rec in warnings)
+
+
+def test_paper_entries_excludes_ideas_and_url_less_entries(tmp_path):
+    agent = LibrarianAgent(
+        agent_id="librarian-test",
+        bus_url="http://localhost:8788",
+        config_path=_make_config(tmp_path),
+    )
+
+    # Real paper: tag=paper and has url
+    agent.pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="paper-ok",
+            tier=Tier.IMPORTED,
+            title="Real paper",
+            content="body",
+            source="https://example.com/a",
+            scope="research",
+            tags=["paper"],
+            status=EntryStatus.DISTILLED,
+            metadata={"url": "https://example.com/a"},
+        )
+    )
+    # Idea: tag=idea, no url
+    agent.pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="idea-xx",
+            tier=Tier.IMPORTED,
+            title="An idea",
+            content="raw idea text",
+            source="idea",
+            scope="research",
+            tags=["idea"],
+            status=EntryStatus.INGESTED,
+            metadata={"claims": []},
+        )
+    )
+    # Edge: tag=paper but no url — still excluded (guards bad data)
+    agent.pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="paper-nourl",
+            tier=Tier.IMPORTED,
+            title="Malformed paper",
+            content="body",
+            source="?",
+            scope="research",
+            tags=["paper"],
+            status=EntryStatus.INGESTED,
+            metadata={},
+        )
+    )
+
+    ids = {entry.id for entry in agent._paper_entries()}
+    assert ids == {"paper-ok"}
