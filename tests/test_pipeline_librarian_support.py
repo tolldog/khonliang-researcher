@@ -179,6 +179,185 @@ async def test_consume_research_request_omits_engines_when_no_sources(monkeypatc
     assert captured["engines"] is None
 
 
+@pytest.mark.asyncio
+async def test_consume_research_request_continues_batch_on_per_paper_failure(
+    monkeypatch, tmp_path
+):
+    """Per-paper error isolation: a transient failure on one paper in a
+    batch must not abort the rest. Failed papers land in ``failed`` with the
+    captured exception; successful ones keep flowing through ``ingested``.
+    The digest-backed research-request record reflects the mixed outcome
+    via ``status=partial`` (some succeeded, some failed).
+    """
+    pipeline = create_pipeline(_make_config(tmp_path))
+
+    async def fake_search(query, engines=None, max_results=8, **kwargs):
+        return [
+            SimpleNamespace(title="Paper 1", url="https://example.com/p1", source="arxiv"),
+            SimpleNamespace(title="Paper 2", url="https://example.com/p2", source="arxiv"),
+            SimpleNamespace(title="Paper 3", url="https://example.com/p3", source="arxiv"),
+        ]
+
+    monkeypatch.setattr("researcher.pipeline.search_papers", fake_search)
+
+    ingest_calls: list[str] = []
+
+    async def fake_ingest(url: str):
+        ingest_calls.append(url)
+        if url == "https://example.com/p2":
+            raise RuntimeError("transient fetch boom")
+        return f"entry-{url.rsplit('/', 1)[-1]}"
+
+    monkeypatch.setattr(pipeline, "ingest_paper", fake_ingest)
+
+    result = await pipeline.consume_research_request(
+        topic="batch isolation",
+        auto_fetch=True,
+    )
+
+    # All three URLs were attempted (batch did not abort on #2's failure).
+    assert ingest_calls == [
+        "https://example.com/p1",
+        "https://example.com/p2",
+        "https://example.com/p3",
+    ]
+
+    # Papers #1 and #3 landed.
+    assert result["ingested"] == ["entry-p1", "entry-p3"]
+    # Back-compat alias still populated.
+    assert result["ingested_entry_ids"] == ["entry-p1", "entry-p3"]
+
+    # Paper #2 is captured with the exception details.
+    assert len(result["failed"]) == 1
+    failure = result["failed"][0]
+    assert failure["url"] == "https://example.com/p2"
+    assert failure["error_type"] == "RuntimeError"
+    assert "transient fetch boom" in failure["error"]
+
+    # Summary reflects the requested/ingested/failed counts.
+    assert result["summary"]["requested"] == 3
+    assert result["summary"]["ingested"] == 2
+    assert result["summary"]["failed"] == 1
+
+    # Mixed outcome → status is "partial".
+    assert result["status"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_consume_research_request_cancelled_error_propagates(
+    monkeypatch, tmp_path
+):
+    """``asyncio.CancelledError`` from ingest_paper must propagate out of
+    the batch loop. The broad Exception catch that isolates per-paper
+    failures must not swallow cancellation — otherwise task cancellation
+    semantics break silently.
+    """
+    pipeline = create_pipeline(_make_config(tmp_path))
+
+    async def fake_search(query, engines=None, max_results=8, **kwargs):
+        return [
+            SimpleNamespace(title="Paper 1", url="https://example.com/p1", source="arxiv"),
+        ]
+
+    monkeypatch.setattr("researcher.pipeline.search_papers", fake_search)
+
+    import asyncio as _asyncio
+
+    async def fake_ingest(url: str):
+        raise _asyncio.CancelledError()
+
+    monkeypatch.setattr(pipeline, "ingest_paper", fake_ingest)
+
+    with pytest.raises(_asyncio.CancelledError):
+        await pipeline.consume_research_request(
+            topic="cancel propagation",
+            auto_fetch=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_consume_research_request_all_failed_status(monkeypatch, tmp_path):
+    """When every attempted paper fails, status is ``failed`` (not partial)."""
+    pipeline = create_pipeline(_make_config(tmp_path))
+
+    async def fake_search(query, engines=None, max_results=8, **kwargs):
+        return [
+            SimpleNamespace(title="P1", url="https://example.com/p1", source="arxiv"),
+            SimpleNamespace(title="P2", url="https://example.com/p2", source="arxiv"),
+        ]
+
+    monkeypatch.setattr("researcher.pipeline.search_papers", fake_search)
+
+    async def fake_ingest(url: str):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline, "ingest_paper", fake_ingest)
+
+    result = await pipeline.consume_research_request(
+        topic="all fail",
+        auto_fetch=True,
+    )
+
+    assert result["ingested"] == []
+    assert len(result["failed"]) == 2
+    assert result["status"] == "failed"
+    assert result["summary"] == {
+        "requested": 2,
+        "ingested": 0,
+        "failed": 2,
+        "distilled": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_consume_research_request_all_succeeded_status(monkeypatch, tmp_path):
+    """When every paper lands, status is ``completed``."""
+    pipeline = create_pipeline(_make_config(tmp_path))
+
+    async def fake_search(query, engines=None, max_results=8, **kwargs):
+        return [
+            SimpleNamespace(title="P1", url="https://example.com/p1", source="arxiv"),
+            SimpleNamespace(title="P2", url="https://example.com/p2", source="arxiv"),
+        ]
+
+    monkeypatch.setattr("researcher.pipeline.search_papers", fake_search)
+
+    async def fake_ingest(url: str):
+        return f"entry-{url.rsplit('/', 1)[-1]}"
+
+    monkeypatch.setattr(pipeline, "ingest_paper", fake_ingest)
+
+    result = await pipeline.consume_research_request(
+        topic="all good",
+        auto_fetch=True,
+    )
+
+    assert result["ingested"] == ["entry-p1", "entry-p2"]
+    assert result["failed"] == []
+    assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_consume_research_request_skipped_status_without_auto_fetch(
+    monkeypatch, tmp_path
+):
+    """Search-only requests (auto_fetch=False) report ``status=skipped`` —
+    no ingest work was attempted, so completed/partial/failed don't apply.
+    """
+    pipeline = create_pipeline(_make_config(tmp_path))
+
+    async def fake_search(query, engines=None, max_results=8, **kwargs):
+        return [SimpleNamespace(title="P1", url="https://example.com/p1", source="arxiv")]
+
+    monkeypatch.setattr("researcher.pipeline.search_papers", fake_search)
+
+    result = await pipeline.consume_research_request(topic="search only")
+
+    assert result["status"] == "skipped"
+    assert result["ingested"] == []
+    assert result["failed"] == []
+
+
 def test_get_ingest_snapshot_excludes_non_url_entries(tmp_path):
     pipeline = create_pipeline(_make_config(tmp_path))
 

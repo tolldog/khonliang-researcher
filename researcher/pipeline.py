@@ -1811,23 +1811,103 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         ]
 
         ingested: list[str] = []
+        failed: list[dict[str, str]] = []
         distilled = 0
         if auto_fetch:
+            # Per-paper error isolation: a transient fetch error on one paper
+            # in a 20-paper batch must not abort the whole request. Collect
+            # failures into ``failed`` and keep going so callers see both the
+            # successes and the per-paper errors.
             for paper in papers:
-                entry_id = await self.ingest_paper(paper["url"])
-                if not entry_id:
-                    continue
-                ingested.append(entry_id)
-                if auto_distill:
-                    result = await self.distill(entry_id)
-                    if result.success:
-                        distilled += 1
+                url = paper["url"]
+                try:
+                    entry_id = await self.ingest_paper(url)
+                    if not entry_id:
+                        failed.append(
+                            {
+                                "url": url,
+                                "error_type": "ingest_returned_none",
+                                "error": "ingest_paper returned no entry id",
+                            }
+                        )
+                        continue
+                    ingested.append(entry_id)
+                    if auto_distill:
+                        try:
+                            result = await self.distill(entry_id)
+                            if result.success:
+                                distilled += 1
+                            else:
+                                failed.append(
+                                    {
+                                        "url": url,
+                                        "entry_id": entry_id,
+                                        "error_type": "distill_unsuccessful",
+                                        "error": "distill returned success=False",
+                                    }
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.exception(
+                                "consume_research_request: distill failed for %s (%s)",
+                                entry_id,
+                                url,
+                            )
+                            failed.append(
+                                {
+                                    "url": url,
+                                    "entry_id": entry_id,
+                                    "error_type": type(exc).__name__,
+                                    "error": str(exc),
+                                }
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        "consume_research_request: ingest_paper failed for %s",
+                        url,
+                    )
+                    failed.append(
+                        {
+                            "url": url,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    )
+
+        # Status reflects the mixed outcome:
+        #   - ``completed`` when every requested paper landed
+        #   - ``partial`` when some succeeded and some failed
+        #   - ``failed`` when zero succeeded (and at least one was attempted)
+        #   - ``skipped`` when auto_fetch is false (search-only; no ingest work)
+        requested = len(papers)
+        if not auto_fetch:
+            status = "skipped"
+        elif not failed and requested:
+            status = "completed"
+        elif ingested and failed:
+            status = "partial"
+        elif not ingested and failed:
+            status = "failed"
+        else:
+            # auto_fetch=True but no papers to attempt — treat as completed
+            # (the request ran to completion with zero work items).
+            status = "completed"
+
+        summary_counts = {
+            "requested": requested,
+            "ingested": len(ingested),
+            "failed": len(failed),
+            "distilled": distilled,
+        }
 
         self.digest.record(
             summary=f"Consumed research request: {topic}",
             source="pipeline",
             audience="research",
-            tags=["research-request", f"priority:{priority or 'medium'}"],
+            tags=["research-request", f"priority:{priority or 'medium'}", f"status:{status}"],
             metadata={
                 "topic": topic,
                 "audience": audience,
@@ -1839,7 +1919,10 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                 "auto_fetch": auto_fetch,
                 "auto_distill": auto_distill,
                 "ingested": ingested,
+                "failed": failed,
                 "distilled": distilled,
+                "status": status,
+                "summary": summary_counts,
             },
         )
 
@@ -1852,7 +1935,11 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
             "rationale": rationale,
             "papers": papers,
             "ingested_entry_ids": ingested,
+            "ingested": ingested,
+            "failed": failed,
             "distilled_count": distilled,
+            "status": status,
+            "summary": summary_counts,
         }
 
 
