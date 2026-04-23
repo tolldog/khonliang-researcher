@@ -24,9 +24,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+from types import MethodType
 
-from khonliang_bus import BaseAgent
+from khonliang_bus import BaseAgent, Skill
+from khonliang_bus.connector import BusConnector
+
+from researcher.ingest_watcher import IngestWatcherRegistry, IngestWatcherStore
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +74,134 @@ def create_researcher_agent(
         len(agent.register_skills()),
     )
 
+    _extend_with_native_handlers(agent, pipeline)
+
     return agent
+
+
+def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
+    """Attach native bus handlers on top of the MCP bridge."""
+    original_register_skills = agent.register_skills
+
+    def register_skills(self):
+        skills = list(original_register_skills())
+        names = {skill.name for skill in skills}
+        extras = [
+            Skill(
+                "watch_ingest_queue",
+                "Start a long-running ingest watcher publishing ingest.* bus events.",
+                {"interval_s": {"type": "integer", "default": 5}},
+            ),
+            Skill(
+                "list_ingest_watchers",
+                "List active ingest watchers.",
+                {},
+            ),
+            Skill(
+                "stop_ingest_watcher",
+                "Stop an ingest watcher.",
+                {"watcher_id": {"type": "string", "required": True}},
+            ),
+        ]
+        for skill in extras:
+            if skill.name not in names:
+                skills.append(skill)
+        return skills
+
+    async def _get_ingest_registry(self) -> IngestWatcherRegistry:
+        registry = getattr(self, "_ingest_watcher_registry", None)
+        if registry is None:
+            store = IngestWatcherStore(str(pipeline.config.get("db_path", "data/researcher.db")))
+            registry = IngestWatcherRegistry(
+                store=store,
+                publish=self.publish,
+                snapshot_fn=pipeline.get_ingest_snapshot,
+            )
+            self._ingest_watcher_registry = registry
+        return registry
+
+    async def handle_watch_ingest_queue(self, args):
+        interval_s = int(args.get("interval_s", 5))
+        if interval_s <= 0:
+            return {"error": "interval_s must be positive"}
+        registry = await _get_ingest_registry(self)
+        watcher_id = await registry.start(interval_s=interval_s)
+        return {"watcher_id": watcher_id, "interval_s": interval_s}
+
+    async def handle_list_ingest_watchers(self, args):
+        registry = await _get_ingest_registry(self)
+        return {"watchers": registry.list_watchers()}
+
+    async def handle_stop_ingest_watcher(self, args):
+        watcher_id = str(args.get("watcher_id", "")).strip()
+        if not watcher_id:
+            return {"error": "watcher_id is required"}
+        registry = await _get_ingest_registry(self)
+        stopped = await registry.stop(watcher_id)
+        return {"watcher_id": watcher_id, "stopped": stopped}
+
+    async def start(self):
+        skills = self._all_skills()
+        collabs = self.register_collaborations()
+        self._connector = BusConnector(
+            bus_url=self.bus_url,
+            agent_id=self.agent_id,
+            on_request=self._dispatch_request,
+        )
+        try:
+            await self._connector.connect_and_register(
+                agent_type=self.agent_type,
+                version=self.version,
+                pid=os.getpid(),
+                skills=[s.to_dict() for s in skills],
+                collaborations=[
+                    {
+                        "name": c.name,
+                        "description": c.description,
+                        "requires": c.requires,
+                        "steps": c.steps,
+                    }
+                    for c in collabs
+                ],
+            )
+        except Exception:
+            await self._http.aclose()
+            raise
+
+        registry = await _get_ingest_registry(self)
+        await registry.rehydrate()
+
+        logger.info(
+            "Agent %s started (%d skills, WebSocket)",
+            self.agent_id,
+            len(skills),
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+        except NotImplementedError:
+            pass
+        try:
+            await self._connector.run()
+        finally:
+            await registry.shutdown()
+            await self._http.aclose()
+
+    async def shutdown(self):
+        registry = getattr(self, "_ingest_watcher_registry", None)
+        if registry is not None:
+            await registry.shutdown()
+        await BaseAgent.shutdown(self)
+
+    import signal
+
+    agent.register_skills = MethodType(register_skills, agent)
+    agent._handlers["watch_ingest_queue"] = MethodType(handle_watch_ingest_queue, agent)
+    agent._handlers["list_ingest_watchers"] = MethodType(handle_list_ingest_watchers, agent)
+    agent._handlers["stop_ingest_watcher"] = MethodType(handle_stop_ingest_watcher, agent)
+    agent.start = MethodType(start, agent)
+    agent.shutdown = MethodType(shutdown, agent)
 
 
 def main():

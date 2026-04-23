@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,7 @@ from researcher.queue import PaperFetcher, ListParser
 from researcher.idea import IdeaParserRole
 from khonliang_researcher import RelevanceScorer
 from researcher.roles import SummarizerRole, ExtractorRole, AssessorRole
+from researcher.search_engines import search_papers
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,21 @@ class DistillResult:
     triples: List[Dict[str, Any]] = field(default_factory=list)
     assessments: Dict[str, Any] = field(default_factory=dict)
     success: bool = False
+
+
+def is_paper_entry(entry: KnowledgeEntry) -> bool:
+    """Return True iff ``entry`` is a URL-backed paper (not an idea or other non-paper import).
+
+    Papers are ingested via :meth:`ResearchPipeline.ingest_paper` with ``tags=["paper"]``
+    and a non-empty ``metadata["url"]``. Ideas (``tags=["idea"]``) and other Tier.IMPORTED
+    entries have no URL and should be excluded from ingest-watcher snapshots and
+    librarian classification loops.
+    """
+    if "paper" not in (entry.tags or []):
+        return False
+    meta = entry.metadata or {}
+    url = str(meta.get("url", "") or "").strip()
+    return bool(url)
 
 
 def update_capability_status(
@@ -1604,6 +1621,355 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         if triple_context:
             parts.append(f"## Known Relationships\n{triple_context}")
         return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Evidence-source catalog
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _infer_owned_locally(repo_path: str) -> bool:
+        if not repo_path:
+            return False
+        if "://" in repo_path:
+            return False
+        normalized = os.path.abspath(repo_path)
+        return os.path.isabs(normalized) and os.path.exists(normalized)
+
+    def register_evidence_source(
+        self,
+        project: str,
+        repo_path: str,
+        *,
+        description: str = "",
+        depends_on: list[str] | None = None,
+        scope: str = "",
+        owned_locally: Optional[bool] = None,
+        upstream_url: str = "",
+        license_name: str = "",
+    ) -> str:
+        """Register or update an evidence source entry."""
+        entry_id = f"repo_{project}"
+        deps = list(depends_on or [])
+        config_project = self.config.get("projects", {}).get(project, {})
+        if owned_locally is None:
+            owned_locally = self._infer_owned_locally(repo_path)
+
+        entry = KnowledgeEntry(
+            id=entry_id,
+            tier=Tier.DERIVED,
+            title=f"Repo: {project}",
+            content=description or config_project.get("description", ""),
+            source="registry",
+            scope="registry",
+            tags=["repo", "evidence-source", f"repo:{project}"],
+            status=EntryStatus.DISTILLED,
+            metadata={
+                "project": project,
+                "repo_path": repo_path,
+                "scope": scope or config_project.get("scope", ""),
+                "depends_on": deps or config_project.get("depends_on", []),
+                "owned_locally": bool(owned_locally),
+                "upstream_url": upstream_url,
+                "license": license_name,
+            },
+        )
+        self.knowledge.add(entry)
+        return entry_id
+
+    def list_evidence_sources(self, owned_locally: Optional[bool] = None) -> list[dict[str, Any]]:
+        """Return registered evidence sources.
+
+        Resolution of the ``owned_locally`` field is three-way:
+
+        - The metadata key is **absent** (legacy rows registered before the
+          explicit flag existed) → auto-infer from path existence. This
+          preserves back-compat for repos already in the knowledge store.
+        - The metadata value is explicitly ``True`` or ``False`` → that
+          value is authoritative, even if path existence disagrees. This
+          preserves R5's explicit-override intent (an operator can mark a
+          locally-cloned mirror as ``owned_locally=False`` and have that
+          stick through subsequent listings).
+
+        ``path_exists`` is always derived independently so callers can
+        combine them via ``owned_locally or path_exists`` when they want the
+        legacy OR-inference behaviour. ``owned_locally_explicit`` surfaces
+        whether the stored value was explicitly set vs auto-inferred.
+        """
+        rows: list[dict[str, Any]] = []
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "repo" not in (entry.tags or []):
+                continue
+            meta = entry.metadata or {}
+            repo_path = str(meta.get("repo_path", "?"))
+            path_exists = self._infer_owned_locally(repo_path)
+            raw = meta.get("owned_locally")  # None iff key absent or explicitly None
+            if raw is None:
+                # Legacy row — no explicit flag was ever stored. Fall back to
+                # path-existence inference so pre-R5 data still behaves.
+                resolved_owned = path_exists
+                owned_explicit = False
+            else:
+                # Explicit True/False — honour it verbatim (R5 intent).
+                resolved_owned = bool(raw)
+                owned_explicit = True
+            if owned_locally is not None and resolved_owned != owned_locally:
+                continue
+            rows.append(
+                {
+                    "project": meta.get("project", "?"),
+                    "repo_path": repo_path,
+                    "scope": meta.get("scope", "?"),
+                    "depends_on": list(meta.get("depends_on", [])),
+                    "owned_locally": resolved_owned,
+                    "owned_locally_explicit": owned_explicit,
+                    "path_exists": path_exists,
+                    "upstream_url": meta.get("upstream_url", ""),
+                    "license": meta.get("license", ""),
+                }
+            )
+        if rows:
+            return rows
+
+        for name, cfg in self.config.get("projects", {}).items():
+            repo = cfg.get("repo", "not set")
+            inferred_owned = self._infer_owned_locally(str(repo))
+            if owned_locally is not None and inferred_owned != owned_locally:
+                continue
+            rows.append(
+                {
+                    "project": name,
+                    "repo_path": repo,
+                    "scope": cfg.get("scope", "?"),
+                    "depends_on": list(cfg.get("depends_on", [])),
+                    "owned_locally": inferred_owned,
+                    # Config-sourced rows never carried an explicit flag; their
+                    # ownership is always path-inferred.
+                    "owned_locally_explicit": False,
+                    "path_exists": inferred_owned,
+                    "upstream_url": cfg.get("upstream_url", ""),
+                    "license": cfg.get("license", ""),
+                }
+            )
+        return rows
+
+    # ------------------------------------------------------------------
+    # Ingest watcher support
+    # ------------------------------------------------------------------
+
+    def get_ingest_snapshot(self) -> list[dict[str, Any]]:
+        """Return a stable snapshot of ingest/distill state per entry."""
+        def _preview(entry_id: str) -> str:
+            summary_entry = self.knowledge.get(f"{entry_id}_summary")
+            if not summary_entry or not summary_entry.content:
+                return ""
+            text = summary_entry.content.strip().replace("\n", " ")
+            return text[:200]
+
+        rows: list[dict[str, Any]] = []
+        for status in (
+            EntryStatus.INGESTED,
+            EntryStatus.PROCESSING,
+            EntryStatus.DISTILLED,
+            EntryStatus.FAILED,
+            EntryStatus.SKIPPED,
+        ):
+            for entry in self.knowledge.get_by_status(status, tier=Tier.IMPORTED):
+                if not is_paper_entry(entry):
+                    # Skip ideas and other non-URL imports — the ingest watcher
+                    # only publishes url_* transitions, and non-paper entries
+                    # would otherwise emit events with empty URLs and keep the
+                    # queue artificially non-drained.
+                    continue
+                meta = entry.metadata or {}
+                rows.append(
+                    {
+                        "entry_id": entry.id,
+                        "url": meta.get("url", ""),
+                        "title": entry.title,
+                        "status": entry.status,
+                        "summary_preview": _preview(entry.id) if entry.status == EntryStatus.DISTILLED else "",
+                        "error_message": meta.get("error_message", ""),
+                    }
+                )
+        rows.sort(key=lambda row: row["entry_id"])
+        return rows
+
+    # ------------------------------------------------------------------
+    # Research-request consumer
+    # ------------------------------------------------------------------
+
+    async def consume_research_request(
+        self,
+        *,
+        topic: str,
+        audience: str = "",
+        branch: str = "",
+        priority: str = "medium",
+        rationale: str = "",
+        suggested_sources: list[str] | None = None,
+        max_results: int = 8,
+        auto_fetch: bool = False,
+        auto_distill: bool = False,
+    ) -> dict[str, Any]:
+        """Translate a structured research request into searches/fetches."""
+        query_parts = [topic.strip()]
+        if audience.strip():
+            query_parts.append(f"audience {audience.strip()}")
+        if branch.strip():
+            query_parts.append(f"branch {branch.strip()}")
+        query = " ".join(part for part in query_parts if part).strip()
+        # Thread suggested_sources through to search_papers so callers who supply
+        # engine hints (e.g. ["arxiv", "semantic_scholar"]) actually constrain
+        # the search. Unknown engine names are silently dropped by search_papers.
+        # Append the *stripped* value — passing " arxiv " through as-is would
+        # miss engine registry lookups that key on the bare name.
+        engines = [
+            stripped
+            for s in (suggested_sources or [])
+            for stripped in [str(s).strip()]
+            if stripped
+        ] or None
+        results = await search_papers(query, engines=engines, max_results=max_results)
+        papers = [
+            {
+                "title": item.title,
+                "url": item.url,
+                "source": item.source,
+            }
+            for item in results
+        ]
+
+        ingested: list[str] = []
+        failed: list[dict[str, str]] = []
+        distilled = 0
+        if auto_fetch:
+            # Per-paper error isolation: a transient fetch error on one paper
+            # in a 20-paper batch must not abort the whole request. Collect
+            # failures into ``failed`` and keep going so callers see both the
+            # successes and the per-paper errors.
+            for paper in papers:
+                url = paper["url"]
+                try:
+                    entry_id = await self.ingest_paper(url)
+                    if not entry_id:
+                        failed.append(
+                            {
+                                "url": url,
+                                "error_type": "ingest_returned_none",
+                                "error": "ingest_paper returned no entry id",
+                            }
+                        )
+                        continue
+                    ingested.append(entry_id)
+                    if auto_distill:
+                        try:
+                            result = await self.distill(entry_id)
+                            if result.success:
+                                distilled += 1
+                            else:
+                                failed.append(
+                                    {
+                                        "url": url,
+                                        "entry_id": entry_id,
+                                        "error_type": "distill_unsuccessful",
+                                        "error": "distill returned success=False",
+                                    }
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.exception(
+                                "consume_research_request: distill failed for %s (%s)",
+                                entry_id,
+                                url,
+                            )
+                            failed.append(
+                                {
+                                    "url": url,
+                                    "entry_id": entry_id,
+                                    "error_type": type(exc).__name__,
+                                    "error": str(exc),
+                                }
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        "consume_research_request: ingest_paper failed for %s",
+                        url,
+                    )
+                    failed.append(
+                        {
+                            "url": url,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    )
+
+        # Status reflects the mixed outcome:
+        #   - ``completed`` when every requested paper landed
+        #   - ``partial`` when some succeeded and some failed
+        #   - ``failed`` when zero succeeded (and at least one was attempted)
+        #   - ``skipped`` when auto_fetch is false (search-only; no ingest work)
+        requested = len(papers)
+        if not auto_fetch:
+            status = "skipped"
+        elif not failed and requested:
+            status = "completed"
+        elif ingested and failed:
+            status = "partial"
+        elif not ingested and failed:
+            status = "failed"
+        else:
+            # auto_fetch=True but no papers to attempt — treat as completed
+            # (the request ran to completion with zero work items).
+            status = "completed"
+
+        summary_counts = {
+            "requested": requested,
+            "ingested": len(ingested),
+            "failed": len(failed),
+            "distilled": distilled,
+        }
+
+        self.digest.record(
+            summary=f"Consumed research request: {topic}",
+            source="pipeline",
+            audience="research",
+            tags=["research-request", f"priority:{priority or 'medium'}", f"status:{status}"],
+            metadata={
+                "topic": topic,
+                "audience": audience,
+                "branch": branch,
+                "rationale": rationale,
+                "suggested_sources": list(suggested_sources or []),
+                "query": query,
+                "results": len(papers),
+                "auto_fetch": auto_fetch,
+                "auto_distill": auto_distill,
+                "ingested": ingested,
+                "failed": failed,
+                "distilled": distilled,
+                "status": status,
+                "summary": summary_counts,
+            },
+        )
+
+        return {
+            "query": query,
+            "topic": topic,
+            "audience": audience,
+            "branch": branch,
+            "priority": priority,
+            "rationale": rationale,
+            "papers": papers,
+            "ingested_entry_ids": ingested,
+            "ingested": ingested,
+            "failed": failed,
+            "distilled_count": distilled,
+            "status": status,
+            "summary": summary_counts,
+        }
 
 
 def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
