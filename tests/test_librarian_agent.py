@@ -412,3 +412,144 @@ def test_paper_entries_excludes_ideas_and_url_less_entries(tmp_path):
 
     ids = {entry.id for entry in agent._paper_entries()}
     assert ids == {"paper-ok"}
+
+
+@pytest.mark.asyncio
+async def test_rebuild_neighborhoods_concurrent_within_same_second_produces_distinct_ids(
+    tmp_path, monkeypatch
+):
+    """Two rebuilds firing within the same wall-clock second (e.g. a manual
+    trigger racing an ``ingest.queue_drained`` event) must produce distinct
+    snapshot_ids. Second-resolution ``int(time.time())`` would collide and one
+    snapshot would overwrite the other; nanosecond resolution prevents this.
+    """
+    agent = LibrarianAgent(
+        agent_id="librarian-test",
+        bus_url="http://localhost:8788",
+        config_path=_make_config(tmp_path),
+    )
+
+    async def fake_post(url, json):
+        return SimpleNamespace(json=lambda: {"artifact": {"id": "art_x"}})
+
+    async def fake_publish(topic, payload):
+        return None
+
+    monkeypatch.setattr(agent._http, "post", fake_post)
+    monkeypatch.setattr(agent, "publish", fake_publish)
+
+    # Pin int(time.time()) to a fixed second so a naive `libsnap_{int(...)}`
+    # implementation would produce identical ids across the two rebuilds.
+    # time_ns() is NOT pinned, so nanosecond-based ids stay distinct.
+    import time as _time
+
+    monkeypatch.setattr(_time, "time", lambda: 1_700_000_000.0)
+
+    first = await agent.handle_rebuild_neighborhoods({"audience": "", "reason": "manual"})
+    second = await agent.handle_rebuild_neighborhoods(
+        {"audience": "", "reason": "event:ingest.queue_drained"}
+    )
+
+    assert first["snapshot_id"] != second["snapshot_id"], (
+        "snapshot_id collision: two rebuilds in the same second produced the same id "
+        f"({first['snapshot_id']}). Use time.time_ns() for nanosecond resolution."
+    )
+    # Both must be persisted — neither silently overwritten by the other.
+    import sqlite3
+
+    conn = sqlite3.connect(str(tmp_path / "researcher.db"))
+    try:
+        rows = conn.execute(
+            "SELECT snapshot_id FROM librarian_neighborhood_snapshots"
+        ).fetchall()
+    finally:
+        conn.close()
+    snapshot_ids = {row[0] for row in rows}
+    assert first["snapshot_id"] in snapshot_ids
+    assert second["snapshot_id"] in snapshot_ids
+
+
+@pytest.mark.asyncio
+async def test_classify_paper_caches_latest_snapshot_lookup(tmp_path, monkeypatch):
+    """handle_classify_paper must call store.latest_snapshot at most once per
+    classified path. Calling it twice in a single expression risks the two
+    reads disagreeing if a concurrent rebuild lands between them.
+    """
+    agent = LibrarianAgent(
+        agent_id="librarian-test",
+        bus_url="http://localhost:8788",
+        config_path=_make_config(tmp_path),
+    )
+
+    agent.pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="paper-lookup",
+            tier=Tier.IMPORTED,
+            title="Cache test paper",
+            content="paper",
+            source="paper-lookup",
+            scope="research",
+            tags=["paper"],
+            status=EntryStatus.DISTILLED,
+            metadata={"url": "https://example.com/paper-lookup"},
+        )
+    )
+    agent.pipeline.triples.add(
+        subject="Cache Test Paper",
+        predicate="specializes",
+        obj="Cache Behavior",
+        confidence=0.9,
+        source="paper:paper-lookup",
+    )
+    agent.pipeline.triples.add(
+        subject="Cache Test Paper",
+        predicate="applies_to",
+        obj="Classification Lookup",
+        confidence=0.8,
+        source="paper:paper-lookup",
+    )
+
+    async def fake_ensure_snapshot(audience: str = "", reason: str = "bootstrap"):
+        # Minimal taxonomy shape the classifier will accept; actual classification
+        # behaviour isn't the contract under test — cache count is.
+        return {"groups": [], "relationships": []}
+
+    async def fake_publish(topic, payload):
+        return None
+
+    monkeypatch.setattr(agent, "_ensure_snapshot", fake_ensure_snapshot)
+    monkeypatch.setattr(agent, "publish", fake_publish)
+
+    # Force the classifier to report "classified" so the source_snapshot_id
+    # lookup is exercised (that's the code path with the double-read bug).
+    def fake_classify(paper_id, triples, taxonomy, audience=""):
+        return {
+            "status": "classified",
+            "paper_id": paper_id,
+            "classification_code": "TEST.001",
+            "audience_tags": [audience] if audience else [],
+            "confidence": 0.9,
+            "rationale": "forced for test",
+        }
+
+    monkeypatch.setattr(librarian_agent, "classify_paper_from_triples", fake_classify)
+
+    # Spy on latest_snapshot.
+    real_latest = agent.store.latest_snapshot
+    calls = {"count": 0}
+
+    def counting_latest(audience: str = ""):
+        calls["count"] += 1
+        return real_latest(audience)
+
+    monkeypatch.setattr(agent.store, "latest_snapshot", counting_latest)
+
+    result = await agent.handle_classify_paper(
+        {"paper_id": "paper-lookup", "audience": ""}
+    )
+
+    assert result["status"] == "classified"
+    assert calls["count"] == 1, (
+        f"latest_snapshot should be called exactly once per classify path; "
+        f"called {calls['count']} times. Cache the result in a local variable."
+    )

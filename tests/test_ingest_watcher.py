@@ -103,6 +103,39 @@ async def test_ingest_watcher_registry_start_list_stop(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stop_returns_true_when_only_persisted_state_existed(tmp_path):
+    """Registry.stop() must report True when it cleaned up persisted state even
+    if no live watcher was running in this process. Returning False there would
+    look like a no-op failure to callers despite the delete actually happening.
+    """
+
+    async def publish(topic: str, payload: dict) -> None:
+        return None
+
+    store = IngestWatcherStore(str(tmp_path / "watcher.db"))
+
+    # Simulate a prior-process watcher: a persisted row with no live task.
+    store.register_watcher("iw_orphan", 5, 100.0)
+
+    registry = IngestWatcherRegistry(
+        store=store,
+        publish=publish,
+        snapshot_fn=lambda: [],
+    )
+
+    # Sanity: nothing live, but registry row is present.
+    assert any(row["watcher_id"] == "iw_orphan" for row in store.list_watchers())
+
+    stopped = await registry.stop("iw_orphan")
+    assert stopped is True, "stop() must return True when persisted state was cleaned"
+    assert not any(row["watcher_id"] == "iw_orphan" for row in store.list_watchers())
+
+    # Second call: nothing live AND nothing persisted -> genuinely nothing to stop.
+    stopped_again = await registry.stop("iw_orphan")
+    assert stopped_again is False
+
+
+@pytest.mark.asyncio
 async def test_ingest_watcher_retries_publish_after_failure(tmp_path):
     events: list[tuple[str, dict]] = []
     attempts = {"count": 0}

@@ -107,16 +107,23 @@ class IngestWatcherStore:
             for row in rows
         ]
 
-    def remove_watcher(self, watcher_id: str) -> None:
+    def remove_watcher(self, watcher_id: str) -> bool:
+        """Delete persisted state for ``watcher_id``.
+
+        Returns True if a registry row existed and was deleted, False if no
+        such watcher was registered (in which case nothing was removed).
+        """
         with self._conn() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "DELETE FROM ingest_watcher_registry WHERE watcher_id = ?",
                 (watcher_id,),
             )
+            removed = cursor.rowcount > 0
             conn.execute(
                 "DELETE FROM ingest_watcher_dedupe WHERE watcher_id = ?",
                 (watcher_id,),
             )
+        return removed
 
     def was_emitted(
         self,
@@ -411,11 +418,17 @@ class IngestWatcherRegistry:
             self._watchers[config.watcher_id] = _LiveWatcher(watcher, stop_event, task)
 
     async def stop(self, watcher_id: str) -> bool:
+        """Stop a watcher and clear its persisted state.
+
+        Returns True when cleanup actually happened — either a live watcher was
+        stopped in this process, or a persisted registry row existed and was
+        deleted. Returns False only when neither existed (nothing to stop).
+        """
         async with self._lock:
             live = self._watchers.pop(watcher_id, None)
         if live is None:
-            self.store.remove_watcher(watcher_id)
-            return False
+            removed = self.store.remove_watcher(watcher_id)
+            return removed
         live.stop_event.set()
         try:
             await asyncio.wait_for(live.task, timeout=5.0)

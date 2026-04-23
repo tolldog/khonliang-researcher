@@ -247,7 +247,11 @@ class LibrarianAgent(BaseAgent):
         graph = self._graph()
         taxonomy = build_concept_taxonomy(graph)
         triples = self.pipeline.triples.get(min_confidence=0.5, limit=5000)
-        snapshot_id = f"libsnap_{int(time.time())}"
+        # Nanosecond resolution prevents collisions when a manual rebuild and
+        # an event-driven rebuild (e.g. ingest.queue_drained) fire within the
+        # same wall-clock second. snapshot_id is TEXT; integer nanoseconds stay
+        # sortable and dependency-free.
+        snapshot_id = f"libsnap_{time.time_ns()}"
 
         classified = 0
         ambiguous = 0
@@ -408,6 +412,9 @@ class LibrarianAgent(BaseAgent):
         triples = self.pipeline.triples.get(min_confidence=0.5, limit=5000)
         result = classify_paper_from_triples(paper_id, triples, taxonomy, audience=audience)
         if result["status"] == "classified":
+            # Cache the latest-snapshot lookup once so a concurrent rebuild
+            # mid-classification can't make the two reads disagree.
+            latest = self.store.latest_snapshot(audience)
             record = self.store.upsert_classification(
                 PaperClassification(
                     paper_id=result["paper_id"],
@@ -415,7 +422,7 @@ class LibrarianAgent(BaseAgent):
                     audience_tags=result["audience_tags"],
                     confidence=result["confidence"],
                     rationale=result["rationale"],
-                    source_snapshot_id=self.store.latest_snapshot(audience).snapshot_id if self.store.latest_snapshot(audience) else "",
+                    source_snapshot_id=latest.snapshot_id if latest else "",
                 )
             )
             await self.publish(
