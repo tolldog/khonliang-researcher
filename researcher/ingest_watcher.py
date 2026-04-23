@@ -206,7 +206,7 @@ class IngestWatcher:
         emitted = 0
         active_count = 0
         for row in snapshot:
-            transition = _transition_for_status(str(row.get("status", "")))
+            transition = _transition_for_status(_status_value(row.get("status", "")))
             if not transition:
                 continue
             if transition in {"url_queued", "url_distilling"}:
@@ -451,12 +451,51 @@ class IngestWatcherRegistry:
         return rows
 
     async def shutdown(self) -> None:
-        ids = list(self._watchers.keys())
-        for watcher_id in ids:
+        """Cancel live watcher tasks WITHOUT deleting persisted rows.
+
+        Process-lifecycle cleanup. Rows remain in the registry so the next
+        process start can ``rehydrate()`` and resume. Use ``stop(watcher_id)``
+        for user-initiated unregister (which deletes persisted state).
+        """
+        async with self._lock:
+            ids = list(self._watchers.keys())
+            live_watchers = [self._watchers.pop(wid) for wid in ids]
+        for watcher_id, live in zip(ids, live_watchers):
+            live.stop_event.set()
             try:
-                await self.stop(watcher_id)
+                await asyncio.wait_for(live.task, timeout=5.0)
+            except asyncio.TimeoutError:
+                live.task.cancel()
+                try:
+                    await live.task
+                except (asyncio.CancelledError, Exception):
+                    pass
             except Exception as e:
-                logger.warning("ingest watcher shutdown: stop %s failed: %s", watcher_id, e)
+                logger.warning(
+                    "ingest watcher shutdown: cancel %s failed: %s",
+                    watcher_id,
+                    e,
+                )
+
+
+def _status_value(status: Any) -> str:
+    """Extract the raw string value from a status input.
+
+    Handles three shapes:
+    - plain ``str`` / ``str``-subclass (e.g. current ``EntryStatus`` which is
+      ``class EntryStatus(str)`` — the class attribute IS the string).
+    - ``Enum`` / ``IntEnum`` / ``StrEnum`` where ``str(member)`` returns
+      the qualified ``"ClassName.MEMBER"`` form; ``.value`` is the raw value.
+    - anything else — fall back to ``str()``.
+
+    Defensive against a future refactor that promotes ``EntryStatus`` to a
+    proper ``Enum`` — without this the mapping lookup would silently fail
+    and no ingest events would be emitted.
+    """
+    value = getattr(status, "value", None)
+    if value is not None:
+        return str(value)
+    return str(status)
 
 
 def _transition_for_status(status: str) -> Optional[str]:

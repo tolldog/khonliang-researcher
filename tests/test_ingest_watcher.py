@@ -136,6 +136,109 @@ async def test_stop_returns_true_when_only_persisted_state_existed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_poll_once_maps_entry_status_enum_to_transition(tmp_path):
+    """Regression: when snapshot rows carry ``EntryStatus`` members rather than
+    raw strings (e.g. from ``ResearchPipeline.get_ingest_snapshot()``), the
+    transition mapping must still resolve.
+
+    Simulates the hot-path shape by using a proper ``str.Enum`` whose
+    ``str(member)`` returns the qualified ``'ClassName.MEMBER'`` form.
+    Without the ``_status_value`` unwrap, ``_transition_for_status`` would
+    receive ``'FakeStatus.DISTILLED'`` and silently return None — meaning
+    ingest events would never fire on the real pipeline.
+    """
+    import enum
+
+    class FakeStatus(str, enum.Enum):
+        INGESTED = "ingested"
+        PROCESSING = "processing"
+        DISTILLED = "distilled"
+        FAILED = "failed"
+
+    # Sanity: confirm str(member) produces the qualified form that would
+    # break the mapping lookup without the defensive extractor.
+    assert str(FakeStatus.DISTILLED) != "distilled"
+
+    events: list[tuple[str, dict]] = []
+
+    async def publish(topic: str, payload: dict) -> None:
+        events.append((topic, payload))
+
+    snapshot = [
+        {"entry_id": "a", "url": "https://example.com/a", "status": FakeStatus.INGESTED, "summary_preview": ""},
+        {"entry_id": "b", "url": "https://example.com/b", "status": FakeStatus.PROCESSING, "summary_preview": ""},
+        {"entry_id": "c", "url": "https://example.com/c", "status": FakeStatus.DISTILLED, "summary_preview": "done"},
+        {"entry_id": "d", "url": "https://example.com/d", "status": FakeStatus.FAILED, "summary_preview": "", "error_message": "x"},
+    ]
+
+    watcher = IngestWatcher(
+        config=IngestWatcherConfig("iw_enum", 5, 1.0),
+        store=IngestWatcherStore(str(tmp_path / "watcher.db")),
+        publish=publish,
+        snapshot_fn=lambda: snapshot,
+        now_fn=lambda: 123.0,
+    )
+
+    emitted = await watcher.poll_once()
+
+    assert emitted == 4
+    assert [topic for topic, _ in events] == [
+        TOPIC_URL_QUEUED,
+        TOPIC_URL_DISTILLING,
+        TOPIC_URL_DISTILLED,
+        TOPIC_URL_FAILED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_persisted_rows_for_rehydrate(tmp_path):
+    """Process-lifecycle shutdown must NOT wipe the registry.
+
+    ``shutdown()`` cancels in-memory tasks for graceful exit; persisted
+    registry rows stay intact so the next process start can ``rehydrate()``.
+    Only user-initiated ``stop(watcher_id)`` deletes persisted state.
+    """
+    db_path = str(tmp_path / "watcher.db")
+
+    async def publish(topic: str, payload: dict) -> None:
+        return None
+
+    # Process A: start a watcher, then shut down gracefully.
+    store_a = IngestWatcherStore(db_path)
+    registry_a = IngestWatcherRegistry(
+        store=store_a,
+        publish=publish,
+        snapshot_fn=lambda: [],
+    )
+    watcher_id = await registry_a.start(interval_s=5)
+    assert any(row["watcher_id"] == watcher_id for row in store_a.list_watchers())
+
+    await registry_a.shutdown()
+
+    # Persisted row survives the shutdown.
+    rows_after_shutdown = store_a.list_watchers()
+    assert any(row["watcher_id"] == watcher_id for row in rows_after_shutdown), (
+        "shutdown() must preserve persisted rows for rehydrate on next process start"
+    )
+
+    # Process B: fresh registry over the same DB; rehydrate brings the watcher back.
+    store_b = IngestWatcherStore(db_path)
+    registry_b = IngestWatcherRegistry(
+        store=store_b,
+        publish=publish,
+        snapshot_fn=lambda: [],
+    )
+    restored = await registry_b.rehydrate()
+    assert watcher_id in restored
+
+    live = registry_b.list_watchers()
+    assert any(row["watcher_id"] == watcher_id for row in live)
+
+    # Clean up process B so the test doesn't leak a task.
+    await registry_b.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_ingest_watcher_retries_publish_after_failure(tmp_path):
     events: list[tuple[str, dict]] = []
     attempts = {"count": 0}
