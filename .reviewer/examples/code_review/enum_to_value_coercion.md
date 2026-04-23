@@ -5,32 +5,40 @@ severity: concern
 
 # Use `.value`, never `str(member)`, to coerce an Enum to a lookup key
 
-**Invariant**: converting an Enum member to a lookup/storage key: use `.value`, never `str(member)`. The shapes differ:
-
-- `enum.StrEnum` (Python 3.11+) or `class X(str, Enum)`: `str(member)` returns the raw value on 3.11+ — but historically returned `"ClassName.MEMBER"`, and mixing Python versions / enum shapes produces silent mismatches.
-- `enum.Enum` (no `str` mixin): `str(member)` returns `"ClassName.MEMBER"` — never the value.
-
-Always prefer explicit `.value`. When input may already be a plain `str`, use a helper that falls back cleanly.
+**Invariant**: the string form of an enum member is implementation-dependent across enum shapes (`Enum`, `IntEnum`, `StrEnum`, `class X(str)` subclasses) and Python versions. Always use `.value` explicitly — or a helper that falls back to `str()` for plain-string inputs — when producing a lookup or storage key. Never `str(member)`.
 
 **Bad pattern**:
 ```python
 class EntryStatus(StrEnum):
     IMPORTED = "imported"
 
-key = str(EntryStatus.IMPORTED)  # version / shape dependent
+key = str(EntryStatus.IMPORTED)  # shape- and version-dependent
 registry[key] = entry            # downstream lookup misses with "imported"
 ```
 
-**Good pattern** (mirrors `researcher.ingest_watcher._status_value`):
+**Good pattern** (copied verbatim from `researcher.ingest_watcher._status_value`):
 ```python
 def _status_value(status: Any) -> str:
+    """Extract the raw string value from a status input.
+
+    Handles three shapes:
+    - plain ``str`` / ``str``-subclass (e.g. current ``EntryStatus`` which is
+      ``class EntryStatus(str)`` — the class attribute IS the string).
+    - ``Enum`` / ``IntEnum`` / ``StrEnum`` where ``str(member)`` returns
+      the qualified ``"ClassName.MEMBER"`` form; ``.value`` is the raw value.
+    - anything else — fall back to ``str()``.
+
+    Defensive against a future refactor that promotes ``EntryStatus`` to a
+    proper ``Enum`` — without this the mapping lookup would silently fail
+    and no ingest events would be emitted.
+    """
     value = getattr(status, "value", None)
     if value is not None:
         return str(value)
-    return str(status)   # plain str / str-subclass path
+    return str(status)
 
 key = _status_value(EntryStatus.IMPORTED)  # always "imported"
 registry[key] = entry
 ```
 
-**Rationale**: `.value` is the only shape-stable and version-stable coercion. The `getattr(..., "value", None)` helper also tolerates plain-string inputs, which is what this repo actually sees because `EntryStatus` is `class EntryStatus(str)` today — a future promotion to `StrEnum` must not silently break the mapping lookup. Sourced from PR #29 findings.
+**Rationale**: `.value` (or `getattr(x, 'value', x)`) is the only coercion stable across enum shapes AND plain strings. The helper tolerates a future promotion from `class EntryStatus(str)` to a proper `Enum` without silently breaking mapping lookups. Sourced from PR #29 findings.

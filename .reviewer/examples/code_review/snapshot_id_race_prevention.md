@@ -13,14 +13,14 @@ def handle(self, event):
     snap = self.taxonomy.latest_snapshot()       # read 1
     result = compute(snap.content, event)
     # ... rebuild may land here ...
-    self._save(result, snapshot_id=self.taxonomy.latest_snapshot().id)  # read 2
+    self._save(result, snapshot_id=self.taxonomy.latest_snapshot().snapshot_id)  # read 2
 ```
 
 **Good pattern**:
 ```python
 def _ensure_snapshot(self):
     snap = self.taxonomy.latest_snapshot()
-    return snap.content, snap.id
+    return snap.content, snap.snapshot_id
 
 def handle(self, event):
     content, snapshot_id = self._ensure_snapshot()
@@ -28,4 +28,4 @@ def handle(self, event):
     self._save(result, snapshot_id=snapshot_id)
 ```
 
-**Rationale**: "the snapshot I computed against" and "the snapshot id I stored" must be the same value by construction, not by luck. Sourced from PR #29.
+**Rationale**: "the snapshot I computed against" and "the snapshot id I stored" must be the same value by construction, not by luck. The attribute on snapshot records in this repo is `.snapshot_id` (not `.id`) — see `researcher/librarian_agent.py::_ensure_snapshot` for the canonical pattern. Sourced from PR #29.
