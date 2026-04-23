@@ -1679,12 +1679,21 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
     def list_evidence_sources(self, owned_locally: Optional[bool] = None) -> list[dict[str, Any]]:
         """Return registered evidence sources.
 
-        ``owned_locally`` in each row is the value persisted at registration
-        time (``register_evidence_source`` infers a default from the path when
-        the caller passes ``None``, but an explicit ``False`` is honoured).
-        ``path_exists`` is a derived boolean callers can combine with the
-        stored flag via ``owned_locally or path_exists`` when they want the
-        legacy OR-inference behaviour.
+        Resolution of the ``owned_locally`` field is three-way:
+
+        - The metadata key is **absent** (legacy rows registered before the
+          explicit flag existed) → auto-infer from path existence. This
+          preserves back-compat for repos already in the knowledge store.
+        - The metadata value is explicitly ``True`` or ``False`` → that
+          value is authoritative, even if path existence disagrees. This
+          preserves R5's explicit-override intent (an operator can mark a
+          locally-cloned mirror as ``owned_locally=False`` and have that
+          stick through subsequent listings).
+
+        ``path_exists`` is always derived independently so callers can
+        combine them via ``owned_locally or path_exists`` when they want the
+        legacy OR-inference behaviour. ``owned_locally_explicit`` surfaces
+        whether the stored value was explicitly set vs auto-inferred.
         """
         rows: list[dict[str, Any]] = []
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
@@ -1692,9 +1701,18 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                 continue
             meta = entry.metadata or {}
             repo_path = str(meta.get("repo_path", "?"))
-            stored_owned = bool(meta.get("owned_locally", False))
             path_exists = self._infer_owned_locally(repo_path)
-            if owned_locally is not None and stored_owned != owned_locally:
+            raw = meta.get("owned_locally")  # None iff key absent or explicitly None
+            if raw is None:
+                # Legacy row — no explicit flag was ever stored. Fall back to
+                # path-existence inference so pre-R5 data still behaves.
+                resolved_owned = path_exists
+                owned_explicit = False
+            else:
+                # Explicit True/False — honour it verbatim (R5 intent).
+                resolved_owned = bool(raw)
+                owned_explicit = True
+            if owned_locally is not None and resolved_owned != owned_locally:
                 continue
             rows.append(
                 {
@@ -1702,7 +1720,8 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                     "repo_path": repo_path,
                     "scope": meta.get("scope", "?"),
                     "depends_on": list(meta.get("depends_on", [])),
-                    "owned_locally": stored_owned,
+                    "owned_locally": resolved_owned,
+                    "owned_locally_explicit": owned_explicit,
                     "path_exists": path_exists,
                     "upstream_url": meta.get("upstream_url", ""),
                     "license": meta.get("license", ""),
@@ -1723,6 +1742,9 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                     "scope": cfg.get("scope", "?"),
                     "depends_on": list(cfg.get("depends_on", [])),
                     "owned_locally": inferred_owned,
+                    # Config-sourced rows never carried an explicit flag; their
+                    # ownership is always path-inferred.
+                    "owned_locally_explicit": False,
                     "path_exists": inferred_owned,
                     "upstream_url": cfg.get("upstream_url", ""),
                     "license": cfg.get("license", ""),
@@ -1799,7 +1821,14 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         # Thread suggested_sources through to search_papers so callers who supply
         # engine hints (e.g. ["arxiv", "semantic_scholar"]) actually constrain
         # the search. Unknown engine names are silently dropped by search_papers.
-        engines = [s for s in (suggested_sources or []) if str(s).strip()] or None
+        # Append the *stripped* value — passing " arxiv " through as-is would
+        # miss engine registry lookups that key on the bare name.
+        engines = [
+            stripped
+            for s in (suggested_sources or [])
+            for stripped in [str(s).strip()]
+            if stripped
+        ] or None
         results = await search_papers(query, engines=engines, max_results=max_results)
         papers = [
             {

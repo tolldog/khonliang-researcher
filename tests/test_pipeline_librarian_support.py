@@ -180,6 +180,102 @@ async def test_consume_research_request_omits_engines_when_no_sources(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_consume_research_request_strips_engine_whitespace(monkeypatch, tmp_path):
+    """R7 regression: engine names with surrounding whitespace must be
+    *stripped* before hitting ``search_papers``. Previously the filter
+    check used ``.strip()`` but appended the unstripped original, so a
+    caller passing ``[" arxiv ", "semantic_scholar"]`` produced an engines
+    list with a whitespace-wrapped first entry that ``search_papers``
+    silently ignored (engine lookup keys on the bare name).
+    """
+    pipeline = create_pipeline(_make_config(tmp_path))
+
+    captured: dict = {}
+
+    async def fake_search(query, engines=None, max_results=8, **kwargs):
+        captured["engines"] = engines
+        return []
+
+    monkeypatch.setattr("researcher.pipeline.search_papers", fake_search)
+
+    await pipeline.consume_research_request(
+        topic="whitespace",
+        suggested_sources=[" arxiv ", "semantic_scholar", "\tcore\n"],
+    )
+
+    # Each engine is stripped verbatim — no surrounding whitespace survives.
+    assert captured["engines"] == ["arxiv", "semantic_scholar", "core"]
+
+
+def test_list_evidence_sources_legacy_data_without_owned_locally_key_auto_infers_from_path(
+    tmp_path,
+):
+    """R7 regression: rows registered before the ``owned_locally`` metadata
+    flag existed (or by a path where the key was simply never set) must
+    *auto-infer* from path existence rather than collapsing to False.
+
+    This exercises the pre-R5 legacy-data case: a repo entry whose
+    metadata dict lacks the key entirely. After R5's fix switched to
+    ``bool(meta.get('owned_locally', False))``, those rows silently
+    flipped to ``owned_locally=False`` even when the path existed on
+    disk. The three-way resolution (absent → infer; explicit → honour)
+    restores legacy compatibility without losing R5's intent.
+    """
+    pipeline = create_pipeline(_make_config(tmp_path))
+    repo_path = tmp_path / "legacy-repo"
+    repo_path.mkdir()
+
+    # Simulate legacy data: add the entry directly with metadata that has
+    # NO owned_locally key at all. This mimics what an older
+    # register_repo() implementation would have persisted.
+    pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="repo_legacy",
+            tier=Tier.DERIVED,
+            title="Repo: legacy",
+            content="Legacy pre-R5 entry",
+            source="registry",
+            scope="registry",
+            tags=["repo", "evidence-source", "repo:legacy"],
+            status=EntryStatus.DISTILLED,
+            metadata={
+                "project": "legacy",
+                "repo_path": str(repo_path),
+                "scope": "",
+                "depends_on": [],
+                # Note: NO "owned_locally" key — pre-R5 data shape.
+                "upstream_url": "",
+                "license": "",
+            },
+        )
+    )
+
+    rows = pipeline.list_evidence_sources()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["project"] == "legacy"
+    # Legacy row: key absent → auto-infer from path. Path exists → True.
+    assert row["owned_locally"] is True
+    assert row["path_exists"] is True
+    # Flag surfaces that the stored metadata had NO explicit value.
+    assert row["owned_locally_explicit"] is False
+
+    # And: once a caller registers the same project explicitly with False,
+    # that authoritative value must win on the next listing (R5 intent).
+    pipeline.register_evidence_source(
+        "legacy",
+        str(repo_path),
+        owned_locally=False,
+    )
+    rows_after = pipeline.list_evidence_sources()
+    assert len(rows_after) == 1
+    updated = rows_after[0]
+    assert updated["owned_locally"] is False
+    assert updated["owned_locally_explicit"] is True
+    assert updated["path_exists"] is True
+
+
+@pytest.mark.asyncio
 async def test_consume_research_request_continues_batch_on_per_paper_failure(
     monkeypatch, tmp_path
 ):
