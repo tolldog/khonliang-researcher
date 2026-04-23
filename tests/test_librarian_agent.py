@@ -94,7 +94,9 @@ async def test_rebuild_neighborhoods_persists_snapshot_and_classification(tmp_pa
 
     assert result["artifact_id"] == "art_123"
     assert agent.store.latest_snapshot() is not None
-    assert agent.store.get_classification("paper1") is not None
+    classification = agent.store.get_classification("paper1")
+    assert classification is not None
+    assert classification.source_snapshot_id == result["snapshot_id"]
     assert [topic for topic, _ in published] == ["library.rebuilt"]
 
 
@@ -130,6 +132,36 @@ async def test_taxonomy_report_caps_brief_output(tmp_path, monkeypatch):
     assert result["summary"]["relationship_count"] == 6
     assert result["summary"]["groups_truncated"] is True
     assert result["summary"]["relationships_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_suggest_missing_nodes_normalizes_group_labels(tmp_path, monkeypatch):
+    agent = LibrarianAgent(
+        agent_id="librarian-test",
+        bus_url="http://localhost:8788",
+        config_path=_make_config(tmp_path),
+    )
+
+    async def fake_ensure_snapshot(audience: str = "", reason: str = "bootstrap"):
+        return {
+            "groups": [
+                {
+                    "code": "DEV.001",
+                    "label": "Claude CLI Optimization",
+                    "audience": "developer-researcher",
+                }
+            ],
+            "relationships": [],
+        }
+
+    monkeypatch.setattr(agent, "_ensure_snapshot", fake_ensure_snapshot)
+    monkeypatch.setattr(librarian_agent, "suggest_entities", lambda graph, query: [])
+
+    result = await agent.handle_suggest_missing_nodes(
+        {"query": "claude cli optimization", "audience": "developer-researcher"}
+    )
+
+    assert [group["code"] for group in result["group_candidates"]] == ["DEV.001"]
 
 
 @pytest.mark.asyncio

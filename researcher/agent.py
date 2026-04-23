@@ -26,7 +26,6 @@ import asyncio
 import logging
 import os
 import sys
-import time
 from types import MethodType
 
 from khonliang_bus import BaseAgent, Skill
@@ -186,6 +185,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         try:
             await self._connector.run()
         finally:
+            await registry.shutdown()
             await self._http.aclose()
 
     async def shutdown(self):

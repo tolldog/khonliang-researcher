@@ -233,6 +233,7 @@ class LibrarianAgent(BaseAgent):
         graph = self._graph()
         taxonomy = build_concept_taxonomy(graph)
         triples = self.pipeline.triples.get(min_confidence=0.5, limit=5000)
+        snapshot_id = f"libsnap_{int(time.time())}"
 
         classified = 0
         ambiguous = 0
@@ -246,7 +247,7 @@ class LibrarianAgent(BaseAgent):
                         audience_tags=result["audience_tags"],
                         confidence=result["confidence"],
                         rationale=result["rationale"],
-                        source_snapshot_id="",
+                        source_snapshot_id=snapshot_id,
                     )
                 )
                 classified += 1
@@ -260,7 +261,6 @@ class LibrarianAgent(BaseAgent):
                 )
                 ambiguous += 1
 
-        snapshot_id = f"libsnap_{int(time.time())}"
         snapshot_payload = {
             "taxonomy": taxonomy,
             "classified_count": classified,
@@ -376,7 +376,8 @@ class LibrarianAgent(BaseAgent):
         normalized = query.lower().replace("-", " ").replace("_", " ")
         group_candidates = [
             group for group in groups
-            if normalized in group.get("label", "") or group.get("label", "") in normalized
+            if normalized in group.get("label", "").lower().replace("-", " ").replace("_", " ")
+            or group.get("label", "").lower().replace("-", " ").replace("_", " ") in normalized
         ][:5]
         return {
             "query": query,
