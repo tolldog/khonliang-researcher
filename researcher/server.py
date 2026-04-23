@@ -451,6 +451,48 @@ Most tools accept detail="compact|brief|full":
         return "\n".join(lines)
 
     @mcp.tool()
+    async def consume_research_request(
+        topic: str,
+        audience: str = "",
+        branch: str = "",
+        priority: str = "medium",
+        rationale: str = "",
+        suggested_sources: str = "",
+        max_results: int = 8,
+        auto_fetch: bool = False,
+        auto_distill: bool = False,
+    ) -> str:
+        """Translate a structured research request into searches/fetches."""
+        result = await pipeline.consume_research_request(
+            topic=topic,
+            audience=audience,
+            branch=branch,
+            priority=priority,
+            rationale=rationale,
+            suggested_sources=[s.strip() for s in suggested_sources.split(",") if s.strip()],
+            max_results=max_results,
+            auto_fetch=auto_fetch,
+            auto_distill=auto_distill,
+        )
+        papers = result.get("papers", [])
+        if not papers:
+            return f"No papers found for: {result['query']}"
+
+        lines = [
+            f"Research request: {topic}",
+            f"Query: {result['query']}",
+            f"Results: {len(papers)}",
+        ]
+        for idx, paper in enumerate(papers, 1):
+            lines.append(f"{idx}. {paper['title']} [{paper['source']}]")
+            lines.append(f"   {paper['url']}")
+        if result.get("ingested_entry_ids"):
+            lines.append(f"Ingested: {', '.join(result['ingested_entry_ids'])}")
+        if result.get("distilled_count"):
+            lines.append(f"Distilled: {result['distilled_count']}")
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def browse_feeds(query: str = "", feeds: str = "", relevant_only: bool = False) -> str:
         """Browse RSS feeds. query filters by keyword. relevant_only=true
         pre-filters by embedding relevance to configured projects.
@@ -1533,55 +1575,87 @@ Most tools accept detail="compact|brief|full":
         return "\n".join(lines)
 
     @mcp.tool()
-    def register_repo(project: str, repo_path: str, description: str = "", depends_on: str = "", scope: str = "") -> str:
+    def register_repo(
+        project: str,
+        repo_path: str,
+        description: str = "",
+        depends_on: str = "",
+        scope: str = "",
+        owned_locally: bool | None = None,
+        upstream_url: str = "",
+        license_name: str = "",
+    ) -> str:
         """Register or update a project repo in the DB.
 
         Stores repo location, description, scope, and dependencies
         so scan_codebase and synergize can find it.
         """
-        from khonliang.knowledge.store import KnowledgeEntry
-
-        entry_id = f"repo_{project}"
         deps = [d.strip() for d in depends_on.split(",") if d.strip()]
-
-        entry = KnowledgeEntry(
-            id=entry_id,
-            tier=Tier.DERIVED,
-            title=f"Repo: {project}",
-            content=description or pipeline.config.get("projects", {}).get(project, {}).get("description", ""),
-            source="registry",
-            scope="registry",
-            tags=["repo", f"repo:{project}"],
-            status=EntryStatus.DISTILLED,
-            metadata={
-                "project": project,
-                "repo_path": repo_path,
-                "scope": scope or pipeline.config.get("projects", {}).get(project, {}).get("scope", ""),
-                "depends_on": deps or pipeline.config.get("projects", {}).get(project, {}).get("depends_on", []),
-            },
+        pipeline.register_evidence_source(
+            project,
+            repo_path,
+            description=description,
+            depends_on=deps,
+            scope=scope,
+            owned_locally=owned_locally,
+            upstream_url=upstream_url,
+            license_name=license_name,
         )
-        pipeline.knowledge.add(entry)
-        return f"Registered {project} at {repo_path}"
+        owned_text = (
+            "owned_locally=auto"
+            if owned_locally is None
+            else f"owned_locally={bool(owned_locally)}"
+        )
+        return f"Registered {project} at {repo_path} ({owned_text})"
 
     @mcp.tool()
-    def list_repos() -> str:
+    def list_repos(owned_locally: str = "") -> str:
         """List all registered project repos."""
+        filter_value = None
+        if owned_locally.strip():
+            normalized = owned_locally.strip().lower()
+            if normalized in {"true", "1", "yes", "owned"}:
+                filter_value = True
+            elif normalized in {"false", "0", "no", "external"}:
+                filter_value = False
         repos = []
-        for entry in pipeline.knowledge.get_by_tier(Tier.DERIVED):
-            if "repo" not in (entry.tags or []):
-                continue
-            meta = entry.metadata or {}
-            deps = ", ".join(meta.get("depends_on", [])) or "none"
-            repos.append(f"{meta.get('project','?')} | {meta.get('repo_path','?')} | scope:{meta.get('scope','?')} | deps:{deps}")
-
-        if not repos:
-            # Fall back to config
-            for name, cfg in pipeline.config.get("projects", {}).items():
-                repo = cfg.get("repo", "not set")
-                deps = ", ".join(cfg.get("depends_on", [])) or "none"
-                repos.append(f"{name} | {repo} | scope:{cfg.get('scope','?')} | deps:{deps}")
+        for item in pipeline.list_evidence_sources(filter_value):
+            deps = ", ".join(item.get("depends_on", [])) or "none"
+            repos.append(
+                f"{item.get('project','?')} | {item.get('repo_path','?')} | "
+                f"scope:{item.get('scope','?')} | deps:{deps} | "
+                f"owned_locally:{item.get('owned_locally', False)}"
+            )
 
         return "\n".join(repos) if repos else "No repos registered."
+
+    @mcp.tool()
+    def register_evidence_source(
+        project: str,
+        repo_path: str,
+        description: str = "",
+        depends_on: str = "",
+        scope: str = "",
+        owned_locally: bool | None = None,
+        upstream_url: str = "",
+        license_name: str = "",
+    ) -> str:
+        """Alias for register_repo with evidence-source terminology."""
+        return register_repo(
+            project=project,
+            repo_path=repo_path,
+            description=description,
+            depends_on=depends_on,
+            scope=scope,
+            owned_locally=owned_locally,
+            upstream_url=upstream_url,
+            license_name=license_name,
+        )
+
+    @mcp.tool()
+    def list_evidence_sources(owned_locally: str = "") -> str:
+        """Alias for list_repos with evidence-source terminology."""
+        return list_repos(owned_locally=owned_locally)
 
     # ------------------------------------------------------------------
     # RR-8: Per-Project Landscape Reports

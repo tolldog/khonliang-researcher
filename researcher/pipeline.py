@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,7 @@ from researcher.queue import PaperFetcher, ListParser
 from researcher.idea import IdeaParserRole
 from khonliang_researcher import RelevanceScorer
 from researcher.roles import SummarizerRole, ExtractorRole, AssessorRole
+from researcher.search_engines import search_papers
 
 logger = logging.getLogger(__name__)
 
@@ -1604,6 +1606,218 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         if triple_context:
             parts.append(f"## Known Relationships\n{triple_context}")
         return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Evidence-source catalog
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _infer_owned_locally(repo_path: str) -> bool:
+        if not repo_path:
+            return False
+        if "://" in repo_path:
+            return False
+        normalized = os.path.abspath(repo_path)
+        return os.path.isabs(normalized) and os.path.exists(normalized)
+
+    def register_evidence_source(
+        self,
+        project: str,
+        repo_path: str,
+        *,
+        description: str = "",
+        depends_on: list[str] | None = None,
+        scope: str = "",
+        owned_locally: Optional[bool] = None,
+        upstream_url: str = "",
+        license_name: str = "",
+    ) -> str:
+        """Register or update an evidence source entry."""
+        entry_id = f"repo_{project}"
+        deps = list(depends_on or [])
+        config_project = self.config.get("projects", {}).get(project, {})
+        if owned_locally is None:
+            owned_locally = self._infer_owned_locally(repo_path)
+
+        entry = KnowledgeEntry(
+            id=entry_id,
+            tier=Tier.DERIVED,
+            title=f"Repo: {project}",
+            content=description or config_project.get("description", ""),
+            source="registry",
+            scope="registry",
+            tags=["repo", "evidence-source", f"repo:{project}"],
+            status=EntryStatus.DISTILLED,
+            metadata={
+                "project": project,
+                "repo_path": repo_path,
+                "scope": scope or config_project.get("scope", ""),
+                "depends_on": deps or config_project.get("depends_on", []),
+                "owned_locally": bool(owned_locally),
+                "upstream_url": upstream_url,
+                "license": license_name,
+            },
+        )
+        self.knowledge.add(entry)
+        return entry_id
+
+    def list_evidence_sources(self, owned_locally: Optional[bool] = None) -> list[dict[str, Any]]:
+        """Return registered evidence sources."""
+        rows: list[dict[str, Any]] = []
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "repo" not in (entry.tags or []):
+                continue
+            meta = entry.metadata or {}
+            repo_path = str(meta.get("repo_path", "?"))
+            is_owned = bool(meta.get("owned_locally", False)) or self._infer_owned_locally(repo_path)
+            if owned_locally is not None and is_owned != owned_locally:
+                continue
+            rows.append(
+                {
+                    "project": meta.get("project", "?"),
+                    "repo_path": repo_path,
+                    "scope": meta.get("scope", "?"),
+                    "depends_on": list(meta.get("depends_on", [])),
+                    "owned_locally": is_owned,
+                    "upstream_url": meta.get("upstream_url", ""),
+                    "license": meta.get("license", ""),
+                }
+            )
+        if rows:
+            return rows
+
+        for name, cfg in self.config.get("projects", {}).items():
+            repo = cfg.get("repo", "not set")
+            inferred_owned = self._infer_owned_locally(str(repo))
+            if owned_locally is not None and inferred_owned != owned_locally:
+                continue
+            rows.append(
+                {
+                    "project": name,
+                    "repo_path": repo,
+                    "scope": cfg.get("scope", "?"),
+                    "depends_on": list(cfg.get("depends_on", [])),
+                    "owned_locally": inferred_owned,
+                    "upstream_url": cfg.get("upstream_url", ""),
+                    "license": cfg.get("license", ""),
+                }
+            )
+        return rows
+
+    # ------------------------------------------------------------------
+    # Ingest watcher support
+    # ------------------------------------------------------------------
+
+    def get_ingest_snapshot(self) -> list[dict[str, Any]]:
+        """Return a stable snapshot of ingest/distill state per entry."""
+        def _preview(entry_id: str) -> str:
+            summary_entry = self.knowledge.get(f"{entry_id}_summary")
+            if not summary_entry or not summary_entry.content:
+                return ""
+            text = summary_entry.content.strip().replace("\n", " ")
+            return text[:200]
+
+        rows: list[dict[str, Any]] = []
+        for status in (
+            EntryStatus.INGESTED,
+            EntryStatus.PROCESSING,
+            EntryStatus.DISTILLED,
+            EntryStatus.FAILED,
+            EntryStatus.SKIPPED,
+        ):
+            for entry in self.knowledge.get_by_status(status, tier=Tier.IMPORTED):
+                meta = entry.metadata or {}
+                rows.append(
+                    {
+                        "entry_id": entry.id,
+                        "url": meta.get("url", ""),
+                        "title": entry.title,
+                        "status": entry.status,
+                        "summary_preview": _preview(entry.id) if entry.status == EntryStatus.DISTILLED else "",
+                        "error_message": meta.get("error_message", ""),
+                    }
+                )
+        rows.sort(key=lambda row: row["entry_id"])
+        return rows
+
+    # ------------------------------------------------------------------
+    # Research-request consumer
+    # ------------------------------------------------------------------
+
+    async def consume_research_request(
+        self,
+        *,
+        topic: str,
+        audience: str = "",
+        branch: str = "",
+        priority: str = "medium",
+        rationale: str = "",
+        suggested_sources: list[str] | None = None,
+        max_results: int = 8,
+        auto_fetch: bool = False,
+        auto_distill: bool = False,
+    ) -> dict[str, Any]:
+        """Translate a structured research request into searches/fetches."""
+        query_parts = [topic.strip()]
+        if audience.strip():
+            query_parts.append(f"audience {audience.strip()}")
+        if branch.strip():
+            query_parts.append(f"branch {branch.strip()}")
+        query = " ".join(part for part in query_parts if part).strip()
+        results = await search_papers(query, max_results=max_results)
+        papers = [
+            {
+                "title": item.title,
+                "url": item.url,
+                "source": item.source,
+            }
+            for item in results
+        ]
+
+        ingested: list[str] = []
+        distilled = 0
+        if auto_fetch:
+            for paper in papers:
+                entry_id = await self.ingest_paper(paper["url"])
+                if not entry_id:
+                    continue
+                ingested.append(entry_id)
+                if auto_distill:
+                    result = await self.distill(entry_id)
+                    if result.success:
+                        distilled += 1
+
+        self.digest.record(
+            summary=f"Consumed research request: {topic}",
+            source="pipeline",
+            audience="research",
+            tags=["research-request", f"priority:{priority or 'medium'}"],
+            metadata={
+                "topic": topic,
+                "audience": audience,
+                "branch": branch,
+                "rationale": rationale,
+                "suggested_sources": list(suggested_sources or []),
+                "query": query,
+                "results": len(papers),
+                "auto_fetch": auto_fetch,
+                "auto_distill": auto_distill,
+                "ingested": ingested,
+                "distilled": distilled,
+            },
+        )
+
+        return {
+            "query": query,
+            "topic": topic,
+            "audience": audience,
+            "branch": branch,
+            "priority": priority,
+            "rationale": rationale,
+            "papers": papers,
+            "ingested_entry_ids": ingested,
+            "distilled_count": distilled,
+        }
 
 
 def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
