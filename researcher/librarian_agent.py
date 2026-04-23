@@ -224,18 +224,33 @@ class LibrarianAgent(BaseAgent):
                 logger.exception("librarian ingest-event watcher failed")
                 await asyncio.sleep(2)
 
-    async def _ensure_snapshot(self, audience: str = "", reason: str = "bootstrap") -> dict[str, Any]:
+    async def _ensure_snapshot(
+        self, audience: str = "", reason: str = "bootstrap"
+    ) -> tuple[dict[str, Any], str]:
+        """Return ``(taxonomy_content, snapshot_id)`` for the latest snapshot.
+
+        Returning both together closes a race window: callers that persist
+        classifications tagged with ``source_snapshot_id`` must reference the
+        *same* snapshot whose taxonomy they consumed. A separate
+        ``self.store.latest_snapshot(audience)`` lookup done after
+        classification could see a newer snapshot published by a concurrent
+        rebuild, producing records whose ``source_snapshot_id`` does not
+        actually match the taxonomy used.
+
+        Callers that only need the taxonomy can discard the second element:
+        ``taxonomy, _ = await self._ensure_snapshot(...)``.
+        """
         snapshot = self.store.latest_snapshot(audience)
         if snapshot:
-            return snapshot.content
+            return snapshot.content, snapshot.snapshot_id
         # rebuild persists the snapshot; re-read from the store rather than
         # relying on the handler response (which is intentionally compact and
         # no longer carries the full taxonomy payload).
         await self.handle_rebuild_neighborhoods({"audience": audience, "reason": reason})
         refreshed = self.store.latest_snapshot(audience)
         if refreshed:
-            return refreshed.content
-        return {}
+            return refreshed.content, refreshed.snapshot_id
+        return {}, ""
 
     @handler("library_health")
     async def handle_library_health(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -360,7 +375,7 @@ class LibrarianAgent(BaseAgent):
 
     @handler("taxonomy_report")
     async def handle_taxonomy_report(self, args: dict[str, Any]) -> dict[str, Any]:
-        taxonomy = await self._ensure_snapshot(str(args.get("audience", "")).strip())
+        taxonomy, _ = await self._ensure_snapshot(str(args.get("audience", "")).strip())
         audience = str(args.get("audience", "")).strip()
         branch = str(args.get("branch", "")).strip()
         detail = str(args.get("detail", "brief")).strip() or "brief"
@@ -410,7 +425,7 @@ class LibrarianAgent(BaseAgent):
         query = str(args.get("query", "")).strip()
         audience = str(args.get("audience", "")).strip()
         graph = self._graph()
-        taxonomy = await self._ensure_snapshot(audience)
+        taxonomy, _ = await self._ensure_snapshot(audience)
         suggestions = suggest_entities(graph, query)
         groups = list(taxonomy.get("groups", []))
         if audience:
@@ -432,13 +447,14 @@ class LibrarianAgent(BaseAgent):
     async def handle_classify_paper(self, args: dict[str, Any]) -> dict[str, Any]:
         paper_id = str(args.get("paper_id", "")).strip()
         audience = str(args.get("audience", "")).strip()
-        taxonomy = await self._ensure_snapshot(audience)
+        # Capture both taxonomy and snapshot_id from a single store read so a
+        # concurrent rebuild landing between "pick taxonomy" and "persist
+        # source_snapshot_id" cannot make the persisted snapshot pointer
+        # disagree with the taxonomy that was actually classified against.
+        taxonomy, source_snapshot_id = await self._ensure_snapshot(audience)
         triples = self.pipeline.triples.get(min_confidence=0.5, limit=5000)
         result = classify_paper_from_triples(paper_id, triples, taxonomy, audience=audience)
         if result["status"] == "classified":
-            # Cache the latest-snapshot lookup once so a concurrent rebuild
-            # mid-classification can't make the two reads disagree.
-            latest = self.store.latest_snapshot(audience)
             record = self.store.upsert_classification(
                 PaperClassification(
                     paper_id=result["paper_id"],
@@ -446,7 +462,7 @@ class LibrarianAgent(BaseAgent):
                     audience_tags=result["audience_tags"],
                     confidence=result["confidence"],
                     rationale=result["rationale"],
-                    source_snapshot_id=latest.snapshot_id if latest else "",
+                    source_snapshot_id=source_snapshot_id,
                 )
             )
             await self.publish(
@@ -524,7 +540,7 @@ class LibrarianAgent(BaseAgent):
         branch = str(args.get("branch", "")).strip()
         detail = str(args.get("detail", "brief")).strip() or "brief"
         max_gaps = max(1, int(args.get("max_gaps", 25) or 25))
-        taxonomy = await self._ensure_snapshot(audience)
+        taxonomy, _ = await self._ensure_snapshot(audience)
         classifications = self.store.list_classifications(audience)
         gaps = identify_gap_candidates(taxonomy, classifications, audience=audience)
         if branch:

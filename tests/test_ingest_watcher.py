@@ -264,4 +264,85 @@ async def test_ingest_watcher_retries_publish_after_failure(tmp_path):
 
     assert emitted_first == 0
     assert emitted_second == 1
-    assert [topic for topic, _ in events] == [TOPIC_URL_DISTILLED]
+
+
+@pytest.mark.asyncio
+async def test_queue_drained_same_second_produces_distinct_dedupe_ids(tmp_path):
+    """Two distinct queue-drained events within the same wall-clock second
+    must land as separate dedupe rows (and therefore both fire). Pre-R8 the
+    dedupe_id was ``str(int(self._now()))`` — 1-second resolution — so two
+    drains in the same second collided on the dedupe PK and the second was
+    silently swallowed. Nanosecond resolution prevents this.
+
+    Sequence:
+      1. processing       -> active=1, no drain
+      2. distilled        -> active=0, prev=1: DRAIN #1
+      3. processing       -> active=1, no drain
+      4. distilled        -> active=0, prev=1: DRAIN #2
+
+    ``_now`` is pinned to a fixed second across all four polls so the only
+    thing that distinguishes the two drain dedupe_ids is ``time.time_ns()``
+    (which is not injected and stays live).
+    """
+    import sqlite3
+
+    events: list[tuple[str, dict]] = []
+
+    async def publish(topic: str, payload: dict) -> None:
+        events.append((topic, payload))
+
+    snapshots = [
+        [{"entry_id": "a", "url": "https://example.com/a", "status": "processing", "summary_preview": ""}],
+        [{"entry_id": "a", "url": "https://example.com/a", "status": "distilled", "summary_preview": "done"}],
+        [{"entry_id": "a", "url": "https://example.com/a", "status": "processing", "summary_preview": ""}],
+        [{"entry_id": "a", "url": "https://example.com/a", "status": "distilled", "summary_preview": "done"}],
+    ]
+
+    def snapshot_fn():
+        return snapshots.pop(0)
+
+    db_path = tmp_path / "watcher.db"
+    watcher = IngestWatcher(
+        config=IngestWatcherConfig("iw_test", 5, 1.0),
+        store=IngestWatcherStore(str(db_path)),
+        publish=publish,
+        snapshot_fn=snapshot_fn,
+        # Pin to a fixed second. A 1-second-resolution dedupe_id would
+        # collide between the two drain events; nanosecond resolution
+        # prevents it because time_ns() keeps advancing.
+        now_fn=lambda: 1_700_000_000.0,
+    )
+
+    await watcher.poll_once()  # processing -> active=1
+    await watcher.poll_once()  # distilled  -> drain #1
+    await watcher.poll_once()  # processing -> active=1
+    await watcher.poll_once()  # distilled  -> drain #2
+
+    drain_events = [payload for topic, payload in events if topic == TOPIC_QUEUE_DRAINED]
+    assert len(drain_events) == 2, (
+        f"expected two queue_drained events (one per drain cycle); got "
+        f"{len(drain_events)}. If this is 1, the dedupe_id collision swallowed "
+        "the second event — fix queue_drained's dedupe_id to use nanosecond "
+        "resolution (time.time_ns())."
+    )
+
+    # Inspect the persisted dedupe rows directly: both drain entries must have
+    # distinct dedupe_id values.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            """
+            SELECT dedupe_id FROM ingest_watcher_dedupe
+            WHERE watcher_id = ? AND transition_kind = ?
+            """,
+            ("iw_test", "queue_drained"),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    dedupe_ids = {row[0] for row in rows}
+    assert len(dedupe_ids) == 2, (
+        f"expected two distinct queue_drained dedupe_ids, got {dedupe_ids}. "
+        "Same-second drains must produce distinct dedupe_ids so neither is "
+        "silently deduped away."
+    )

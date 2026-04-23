@@ -188,7 +188,7 @@ async def test_taxonomy_report_caps_brief_output(tmp_path, monkeypatch):
     )
 
     async def fake_ensure_snapshot(audience: str = "", reason: str = "bootstrap"):
-        return {
+        taxonomy = {
             "groups": [
                 {"code": f"G{i}", "label": f"group {i}", "audience": ""}
                 for i in range(6)
@@ -198,6 +198,7 @@ async def test_taxonomy_report_caps_brief_output(tmp_path, monkeypatch):
                 for i in range(6)
             ],
         }
+        return taxonomy, "libsnap_test"
 
     monkeypatch.setattr(agent, "_ensure_snapshot", fake_ensure_snapshot)
 
@@ -222,7 +223,7 @@ async def test_suggest_missing_nodes_normalizes_group_labels(tmp_path, monkeypat
     )
 
     async def fake_ensure_snapshot(audience: str = "", reason: str = "bootstrap"):
-        return {
+        taxonomy = {
             "groups": [
                 {
                     "code": "DEV.001",
@@ -232,6 +233,7 @@ async def test_suggest_missing_nodes_normalizes_group_labels(tmp_path, monkeypat
             ],
             "relationships": [],
         }
+        return taxonomy, "libsnap_test"
 
     monkeypatch.setattr(agent, "_ensure_snapshot", fake_ensure_snapshot)
     monkeypatch.setattr(librarian_agent, "suggest_entities", lambda graph, query: [])
@@ -252,7 +254,7 @@ async def test_identify_gaps_caps_brief_output(tmp_path, monkeypatch):
     )
 
     async def fake_ensure_snapshot(audience: str = "", reason: str = "bootstrap"):
-        return {"groups": [], "relationships": []}
+        return {"groups": [], "relationships": []}, "libsnap_test"
 
     async def fake_publish(topic, payload):
         return None
@@ -550,9 +552,12 @@ async def test_rebuild_neighborhoods_concurrent_within_same_second_produces_dist
 
 @pytest.mark.asyncio
 async def test_classify_paper_caches_latest_snapshot_lookup(tmp_path, monkeypatch):
-    """handle_classify_paper must call store.latest_snapshot at most once per
-    classified path. Calling it twice in a single expression risks the two
-    reads disagreeing if a concurrent rebuild lands between them.
+    """handle_classify_paper must not call store.latest_snapshot after the
+    R8 refactor: ``_ensure_snapshot`` now returns ``(taxonomy, snapshot_id)``
+    so the classify handler gets both without a second store read. A separate
+    post-classification ``latest_snapshot`` call is exactly the race that R8
+    closes (a rebuild landing between the two reads would misalign the
+    persisted ``source_snapshot_id`` with the taxonomy actually used).
     """
     agent = LibrarianAgent(
         agent_id="librarian-test",
@@ -589,9 +594,9 @@ async def test_classify_paper_caches_latest_snapshot_lookup(tmp_path, monkeypatc
     )
 
     async def fake_ensure_snapshot(audience: str = "", reason: str = "bootstrap"):
-        # Minimal taxonomy shape the classifier will accept; actual classification
-        # behaviour isn't the contract under test — cache count is.
-        return {"groups": [], "relationships": []}
+        # Minimal taxonomy shape the classifier will accept plus the authoritative
+        # snapshot_id that handle_classify_paper must propagate verbatim.
+        return {"groups": [], "relationships": []}, "libsnap_test_from_ensure"
 
     async def fake_publish(topic, payload):
         return None
@@ -600,7 +605,7 @@ async def test_classify_paper_caches_latest_snapshot_lookup(tmp_path, monkeypatc
     monkeypatch.setattr(agent, "publish", fake_publish)
 
     # Force the classifier to report "classified" so the source_snapshot_id
-    # lookup is exercised (that's the code path with the double-read bug).
+    # path is exercised (that's where the race used to live).
     def fake_classify(paper_id, triples, taxonomy, audience=""):
         return {
             "status": "classified",
@@ -613,7 +618,7 @@ async def test_classify_paper_caches_latest_snapshot_lookup(tmp_path, monkeypatc
 
     monkeypatch.setattr(librarian_agent, "classify_paper_from_triples", fake_classify)
 
-    # Spy on latest_snapshot.
+    # Spy on latest_snapshot — classify must not call it at all.
     real_latest = agent.store.latest_snapshot
     calls = {"count": 0}
 
@@ -628,7 +633,123 @@ async def test_classify_paper_caches_latest_snapshot_lookup(tmp_path, monkeypatc
     )
 
     assert result["status"] == "classified"
-    assert calls["count"] == 1, (
-        f"latest_snapshot should be called exactly once per classify path; "
-        f"called {calls['count']} times. Cache the result in a local variable."
+    assert calls["count"] == 0, (
+        f"handle_classify_paper should not call latest_snapshot after R8; "
+        f"called {calls['count']} times. The snapshot_id must come from the "
+        f"_ensure_snapshot return value to avoid the rebuild-in-between race."
+    )
+    # And it must actually propagate the id from _ensure_snapshot.
+    assert result["record"]["source_snapshot_id"] == "libsnap_test_from_ensure"
+
+
+@pytest.mark.asyncio
+async def test_handle_classify_paper_source_snapshot_id_matches_taxonomy_used(
+    tmp_path, monkeypatch
+):
+    """R8 race fix contract: the ``source_snapshot_id`` persisted with the
+    classification must match the snapshot whose taxonomy was actually
+    consumed during classification — even if a rebuild publishes a newer
+    snapshot between taxonomy-read and persistence.
+
+    Setup: ``latest_snapshot`` is spied to return two distinct snapshots on
+    back-to-back calls (snapshot A first, snapshot B second). In the pre-R8
+    code path, ``_ensure_snapshot`` read A (and classify ran against A's
+    taxonomy), then the handler did a separate ``latest_snapshot`` lookup
+    which now returns B — so the persisted record carried B's id, a lie.
+    After R8, ``_ensure_snapshot`` returns ``(content_A, snapshot_id_A)``
+    in one read; the handler uses that id directly; no second lookup.
+    """
+    from khonliang_researcher import NeighborhoodSnapshot
+
+    agent = LibrarianAgent(
+        agent_id="librarian-test",
+        bus_url="http://localhost:8788",
+        config_path=_make_config(tmp_path),
+    )
+
+    agent.pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="paper-race",
+            tier=Tier.IMPORTED,
+            title="Race test paper",
+            content="paper",
+            source="paper-race",
+            scope="research",
+            tags=["paper"],
+            status=EntryStatus.DISTILLED,
+            metadata={"url": "https://example.com/paper-race"},
+        )
+    )
+    agent.pipeline.triples.add(
+        subject="Race Test Paper",
+        predicate="specializes",
+        obj="Race Behavior",
+        confidence=0.9,
+        source="paper:paper-race",
+    )
+    agent.pipeline.triples.add(
+        subject="Race Test Paper",
+        predicate="applies_to",
+        obj="Classification Race",
+        confidence=0.8,
+        source="paper:paper-race",
+    )
+
+    # Two concrete snapshots. Back-to-back latest_snapshot calls return
+    # these in order — this simulates a concurrent rebuild landing between
+    # taxonomy-read and (pre-R8) source_snapshot_id-read.
+    snapshot_a = NeighborhoodSnapshot(
+        snapshot_id="libsnap_A_taxonomy_used",
+        audience="",
+        artifact_id="art_a",
+        reason="initial",
+        content={"groups": [], "relationships": []},
+    )
+    snapshot_b = NeighborhoodSnapshot(
+        snapshot_id="libsnap_B_rebuild_raced_in",
+        audience="",
+        artifact_id="art_b",
+        reason="concurrent",
+        content={"groups": [{"code": "RACE.1"}], "relationships": []},
+    )
+
+    returns = [snapshot_a, snapshot_b]
+
+    def spying_latest(audience: str = ""):
+        # Pop so the first call returns A (taxonomy used by classify),
+        # and any second call would return B (stale rebuild sneaks in).
+        return returns.pop(0) if returns else snapshot_b
+
+    monkeypatch.setattr(agent.store, "latest_snapshot", spying_latest)
+
+    async def fake_publish(topic, payload):
+        return None
+
+    monkeypatch.setattr(agent, "publish", fake_publish)
+
+    def fake_classify(paper_id, triples, taxonomy, audience=""):
+        return {
+            "status": "classified",
+            "paper_id": paper_id,
+            "classification_code": "RACE.001",
+            "audience_tags": [audience] if audience else [],
+            "confidence": 0.9,
+            "rationale": "forced for race test",
+        }
+
+    monkeypatch.setattr(librarian_agent, "classify_paper_from_triples", fake_classify)
+
+    result = await agent.handle_classify_paper(
+        {"paper_id": "paper-race", "audience": ""}
+    )
+
+    assert result["status"] == "classified"
+    # The critical assertion: persisted source_snapshot_id must be A's id
+    # (the taxonomy-used snapshot), NOT B's id (the concurrent rebuild).
+    assert result["record"]["source_snapshot_id"] == snapshot_a.snapshot_id, (
+        "source_snapshot_id race: classification persisted with a snapshot_id "
+        f"({result['record']['source_snapshot_id']}) that does not match the "
+        f"snapshot whose taxonomy was consumed ({snapshot_a.snapshot_id}). "
+        "handle_classify_paper must use the snapshot_id returned by "
+        "_ensure_snapshot, not a separate latest_snapshot() lookup."
     )

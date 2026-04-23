@@ -219,11 +219,17 @@ class IngestWatcher:
             self.store.get_last_active_count(self.config.watcher_id),
         )
         if previous_active > 0 and active_count == 0:
+            # Nanosecond resolution prevents dedupe collisions when two
+            # distinct drain events land within the same wall-clock second
+            # (injected ``_now`` is typically second-granular in production;
+            # tests that pin ``_now`` to a fixed second rely on ``time_ns()``
+            # staying live for id distinctness). Same pattern as the R3
+            # snapshot_id fix in handle_rebuild_neighborhoods.
             if await self._emit(
                 TOPIC_QUEUE_DRAINED,
                 entry_id="_queue_",
                 transition_kind="queue_drained",
-                dedupe_id=str(int(self._now())),
+                dedupe_id=f"drained_{time.time_ns()}",
                 payload={
                     "drained_at": self._now(),
                     "total_items_processed": len(snapshot),
