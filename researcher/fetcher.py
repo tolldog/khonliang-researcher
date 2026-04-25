@@ -55,10 +55,52 @@ _ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?")
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
+    # Modern Chrome client-hints + Sec-Fetch-* set. Some Cloudflare-
+    # fronted hosts (Substack and others) return 403 to UA strings
+    # that aren't accompanied by these headers — the fingerprint
+    # mismatch flags the request as scripted (bug_researcher_06622a22).
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Linux"',
+    "Connection": "keep-alive",
 }
+
+
+# Hosts known to consistently 403 even with full browser-fingerprint
+# headers (Cloudflare interactive challenge, custom anti-bot, etc.).
+# Surfacing a hint at fetch time saves the caller from retrying with
+# the same request shape and points them at the WebFetch fallback the
+# dogfood that filed bug_researcher_06622a22 used to work around it.
+_KNOWN_BLOCKED_HOSTS = frozenset({
+    "substack.com",
+})
+
+
+def _is_known_blocked_host(host: str) -> bool:
+    """True if ``host`` (or its parent suffix) is a known anti-bot source."""
+    h = host.lower()
+    return any(h == known or h.endswith("." + known) for known in _KNOWN_BLOCKED_HOSTS)
+
+
+class FetchBlockedError(RuntimeError):
+    """The remote rejected the request despite a browser fingerprint.
+
+    Raised on 403 from any host, and on any 4xx/5xx from a host listed
+    in :data:`_KNOWN_BLOCKED_HOSTS` (those have a track record of
+    returning generic 4xx/5xx challenge pages, not always 403). Lets
+    callers distinguish "site refuses scripted access" from generic
+    transport failures and fall back to a browser-driven fetcher
+    (WebFetch, etc.) piped into ``ingest_file``.
+    """
+
 
 _LINKEDIN_REDIRECT_PAGE_KEY = "d_shortlink_frontend_external_link_redirect_interstitial"
 _MAX_SHORTLINK_REDIRECTS = 3
@@ -258,10 +300,38 @@ async def fetch_url(
 ) -> FetchResult:
     """Fetch any URL, auto-detect format, return clean text.
 
-    Handles HTML, PDF, Markdown, and plain text automatically.
+    Handles HTML, PDF, Markdown, and plain text automatically. Raises
+    :class:`FetchBlockedError` on 403 (and on any 4xx/5xx from
+    known-blocked hosts) so callers can fall back to a browser-driven
+    fetcher rather than retrying the same request.
     """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    known_blocked = _is_known_blocked_host(host)
     async with aiohttp.ClientSession(headers=_HEADERS) as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.status == 403 or (known_blocked and resp.status >= 400):
+                if known_blocked:
+                    detail = (
+                        f"{host} is on the known-anti-bot list; "
+                        "fingerprint headers don't bypass it."
+                    )
+                else:
+                    detail = (
+                        "403 may be a bot challenge or a real ACL deny; "
+                        "if scripted access shouldn't apply, try the "
+                        "fallback before assuming an authorization issue."
+                    )
+                # Don't echo the full url — it may carry userinfo or
+                # sensitive query params that would leak via logs. Show
+                # scheme://host/path only.
+                safe_ref = f"{parsed.scheme}://{host}{parsed.path or ''}"
+                raise FetchBlockedError(
+                    f"{safe_ref} returned {resp.status} despite browser "
+                    f"headers. {detail} Fall back to WebFetch (or a "
+                    "browser-driven fetcher) and pipe the result via "
+                    "ingest_file."
+                )
             resp.raise_for_status()
             content_type = resp.headers.get("Content-Type", "")
             fmt = _detect_format(url, content_type)
