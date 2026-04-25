@@ -347,9 +347,9 @@ def test_fetch_url_known_blocked_host_message_calls_out_anti_bot(monkeypatch):
 
 
 def test_is_known_blocked_host_uses_hostname_not_netloc(monkeypatch):
-    """fetch_url must extract host via .hostname so port/credentials in
-    the URL don't break the suffix match (urlparse(url).netloc keeps
-    them; .hostname strips them).
+    """fetch_url must extract host via .hostname so port AND userinfo
+    in the URL don't break the suffix match (urlparse(url).netloc keeps
+    both; .hostname strips both).
     """
 
     seen_hosts = []
@@ -398,8 +398,64 @@ def test_is_known_blocked_host_uses_hostname_not_netloc(monkeypatch):
     monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
 
     asyncio.run(fetcher.fetch_url("https://author.substack.com:443/p/x"))
+    asyncio.run(fetcher.fetch_url("https://user:pw@author.substack.com/p/x"))
 
-    assert seen_hosts == ["author.substack.com"]
+    # Both calls must extract the bare host — port stripped, userinfo
+    # stripped — so the substack suffix match still fires.
+    assert seen_hosts == ["author.substack.com", "author.substack.com"]
+
+
+def test_fetch_blocked_error_does_not_leak_userinfo_or_query(monkeypatch):
+    """The FetchBlockedError message must not echo userinfo or query
+    parameters. URLs with basic-auth or sensitive query strings would
+    otherwise leak via any caller that logs the exception.
+    """
+
+    class FakeResponse:
+        def __init__(self, url):
+            self.status = 403
+            self.headers = {"Content-Type": "text/html"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):  # pragma: no cover
+            raise AssertionError("FetchBlockedError must fire first")
+
+        async def text(self):  # pragma: no cover
+            return ""
+
+        async def read(self):  # pragma: no cover
+            return b""
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse(url)
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+
+    sensitive = "https://user:supersecret@example.com/path?token=abcd1234&id=42"
+    with pytest.raises(fetcher.FetchBlockedError) as ei:
+        asyncio.run(fetcher.fetch_url(sensitive))
+    msg = str(ei.value)
+    assert "supersecret" not in msg
+    assert "user" not in msg.split("/")[2] if "://" in msg else True
+    assert "abcd1234" not in msg
+    assert "token=" not in msg
+    # Sanity — host + path are still surfaced for debuggability.
+    assert "example.com/path" in msg
 
 
 def test_fetch_url_raises_for_known_blocked_host_on_any_4xx(monkeypatch):

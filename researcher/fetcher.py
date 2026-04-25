@@ -322,10 +322,15 @@ async def fetch_url(
                         "if scripted access shouldn't apply, try the "
                         "fallback before assuming an authorization issue."
                     )
+                # Don't echo the full url — it may carry userinfo or
+                # sensitive query params that would leak via logs. Show
+                # scheme://host/path only.
+                safe_ref = f"{parsed.scheme}://{host}{parsed.path or ''}"
                 raise FetchBlockedError(
-                    f"{url} returned {resp.status} despite browser headers. "
-                    f"{detail} Fall back to WebFetch (or a browser-driven "
-                    "fetcher) and pipe the result via ingest_file."
+                    f"{safe_ref} returned {resp.status} despite browser "
+                    f"headers. {detail} Fall back to WebFetch (or a "
+                    "browser-driven fetcher) and pipe the result via "
+                    "ingest_file."
                 )
             resp.raise_for_status()
             content_type = resp.headers.get("Content-Type", "")
