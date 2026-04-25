@@ -21,5 +21,12 @@ Rules:
 - methods: list the specific algorithms, frameworks, or techniques
 - results: include numbers (accuracy, speedup, etc.) when available
 - limitations: what the authors acknowledge or what is clearly missing
-- domains: broad categories (e.g., "multi-agent", "reinforcement-learning", "nlp", "finance")
-- keywords: specific terms for search (e.g., "GRPO", "Dec-POMDP", "consensus voting")
+- domains: broad categories the paper **substantively contributes to or
+  studies**. Each entry must be supported by methods, results, or
+  findings in the body — not just mentioned in passing or in related
+  work. Better to omit than to over-tag. Example domain strings:
+  "multi-agent", "nlp", "finance", "knowledge-graphs", "robotics",
+  "computer-vision", "distributed-systems". Pick what fits the paper;
+  do not default to a domain just because it is a popular ML topic.
+- keywords: specific terms for search (e.g., "GRPO", "Dec-POMDP",
+  "consensus voting")
