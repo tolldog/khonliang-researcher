@@ -24,6 +24,70 @@ from researcher.pipeline import create_pipeline, ResearchPipeline
 logger = logging.getLogger(__name__)
 
 
+def _render_summary_markdown(summary: dict[str, Any]) -> str:
+    """Render the summarizer's structured dict as markdown sections.
+
+    The previous distill_paper output dropped the whole summary as
+    ``json.dumps(..., indent=2)`` — visually a wall of escaped quotes
+    and braces inside the surrounding markdown. Per CLAUDE.md's
+    "every word must earn its place" rule, that JSON envelope is
+    pure noise: keys/quotes/commas add tokens without adding signal.
+
+    This renderer keeps every field the schema produces, but drops
+    JSON syntax in favor of bullets and short headings. Unknown
+    fields are surfaced verbatim under a generic "Other" section so
+    schema additions don't silently disappear.
+    """
+    if not isinstance(summary, dict) or not summary:
+        return ""
+    parts: list[str] = ["## Summary"]
+
+    # Authors line (single bullet for compact rendering).
+    authors = summary.get("authors")
+    if isinstance(authors, list) and authors:
+        parts.append(f"**Authors:** {', '.join(str(a) for a in authors)}")
+
+    abstract = summary.get("abstract")
+    if isinstance(abstract, str) and abstract.strip():
+        parts.append(f"**Abstract:** {abstract.strip()}")
+
+    def _bullets(label: str, key: str) -> None:
+        items = summary.get(key)
+        if isinstance(items, list) and items:
+            parts.append(f"\n### {label}")
+            for item in items:
+                if isinstance(item, str):
+                    parts.append(f"- {item.strip()}")
+                else:
+                    parts.append(f"- {item!r}")
+
+    _bullets("Key findings", "key_findings")
+    _bullets("Methods", "methods")
+    _bullets("Results", "results")
+    _bullets("Limitations", "limitations")
+
+    # Domains + keywords are token lists; render inline.
+    domains = summary.get("domains")
+    if isinstance(domains, list) and domains:
+        parts.append(f"\n**Domains:** {', '.join(str(d) for d in domains)}")
+    keywords = summary.get("keywords")
+    if isinstance(keywords, list) and keywords:
+        parts.append(f"**Keywords:** {', '.join(str(k) for k in keywords)}")
+
+    # Surface unknown fields so schema additions don't vanish silently.
+    known = {
+        "title", "authors", "abstract", "key_findings", "methods",
+        "results", "limitations", "domains", "keywords",
+    }
+    extras = {k: v for k, v in summary.items() if k not in known}
+    if extras:
+        parts.append("\n### Other")
+        for k, v in extras.items():
+            parts.append(f"- **{k}:** {v}")
+
+    return "\n".join(parts)
+
+
 def _compact_field(value: Any, limit: int = 80) -> str:
     """Sanitize a value for inclusion in pipe-delimited compact output.
 
@@ -342,8 +406,7 @@ Most tools accept detail="compact|brief|full":
         parts = [f"# {result.title}\n"]
 
         if result.summary:
-            parts.append("## Summary")
-            parts.append(json.dumps(result.summary, indent=2))
+            parts.append(_render_summary_markdown(result.summary))
 
         if result.triples:
             parts.append(f"\n## Relationships ({len(result.triples)} triples)")
