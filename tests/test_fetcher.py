@@ -404,8 +404,8 @@ def test_is_known_blocked_host_uses_hostname_not_netloc(monkeypatch):
 
 def test_fetch_url_raises_for_known_blocked_host_on_any_4xx(monkeypatch):
     """Substack and other listed hosts surface FetchBlockedError on any
-    non-2xx — they have a track record of returning 5xx / generic 4xx
-    pages from the bot challenge layer too, not always 403.
+    4xx/5xx response — they have a track record of returning 5xx /
+    generic 4xx pages from the bot challenge layer too, not always 403.
     """
 
     class FakeResponse:

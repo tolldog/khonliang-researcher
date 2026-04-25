@@ -93,10 +93,12 @@ def _is_known_blocked_host(host: str) -> bool:
 class FetchBlockedError(RuntimeError):
     """The remote rejected the request despite a browser fingerprint.
 
-    Raised on 403 (and analogous bot-challenge statuses) so callers can
-    distinguish "site refuses scripted access" from generic transport
-    failures and fall back to a browser-driven fetcher (WebFetch, etc.)
-    piped into ``ingest_file``.
+    Raised on 403 from any host, and on any 4xx/5xx from a host listed
+    in :data:`_KNOWN_BLOCKED_HOSTS` (those have a track record of
+    returning generic 4xx/5xx challenge pages, not always 403). Lets
+    callers distinguish "site refuses scripted access" from generic
+    transport failures and fall back to a browser-driven fetcher
+    (WebFetch, etc.) piped into ``ingest_file``.
     """
 
 
