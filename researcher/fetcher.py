@@ -299,20 +299,31 @@ async def fetch_url(
     """Fetch any URL, auto-detect format, return clean text.
 
     Handles HTML, PDF, Markdown, and plain text automatically. Raises
-    :class:`FetchBlockedError` on 403 (and on known-blocked hosts that
-    return any non-2xx) so callers can fall back to a browser-driven
+    :class:`FetchBlockedError` on 403 (and on any 4xx/5xx from
+    known-blocked hosts) so callers can fall back to a browser-driven
     fetcher rather than retrying the same request.
     """
-    host = urlparse(url).netloc.lower()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    known_blocked = _is_known_blocked_host(host)
     async with aiohttp.ClientSession(headers=_HEADERS) as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            if resp.status == 403 or (
-                _is_known_blocked_host(host) and resp.status >= 400
-            ):
+            if resp.status == 403 or (known_blocked and resp.status >= 400):
+                if known_blocked:
+                    detail = (
+                        f"{host} is on the known-anti-bot list; "
+                        "fingerprint headers don't bypass it."
+                    )
+                else:
+                    detail = (
+                        "403 may be a bot challenge or a real ACL deny; "
+                        "if scripted access shouldn't apply, try the "
+                        "fallback before assuming an authorization issue."
+                    )
                 raise FetchBlockedError(
-                    f"{url} returned {resp.status} despite browser headers; "
-                    "this host is known anti-bot. Fall back to WebFetch (or a "
-                    "browser-driven fetcher) and pipe the result via ingest_file."
+                    f"{url} returned {resp.status} despite browser headers. "
+                    f"{detail} Fall back to WebFetch (or a browser-driven "
+                    "fetcher) and pipe the result via ingest_file."
                 )
             resp.raise_for_status()
             content_type = resp.headers.get("Content-Type", "")

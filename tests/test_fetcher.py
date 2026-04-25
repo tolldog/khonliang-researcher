@@ -290,8 +290,116 @@ def test_fetch_url_raises_FetchBlockedError_on_403(monkeypatch):
 
     with pytest.raises(fetcher.FetchBlockedError) as ei:
         asyncio.run(fetcher.fetch_url("https://example.com/something"))
-    assert "WebFetch" in str(ei.value)
-    assert "403" in str(ei.value)
+    msg = str(ei.value)
+    assert "WebFetch" in msg
+    assert "403" in msg
+    # Generic 403 (host not in known-blocked list) — message must NOT
+    # claim the host is anti-bot, since 403 can also be a real ACL deny.
+    assert "known-anti-bot list" not in msg
+    assert "ACL deny" in msg or "bot challenge" in msg
+
+
+def test_fetch_url_known_blocked_host_message_calls_out_anti_bot(monkeypatch):
+    """The error message for a listed host says so explicitly, so the
+    caller knows fingerprint headers won't help and skips the retry.
+    """
+
+    class FakeResponse:
+        def __init__(self, url):
+            self.status = 403
+            self.headers = {"Content-Type": "text/html"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):  # pragma: no cover
+            raise AssertionError("FetchBlockedError must fire first")
+
+        async def text(self):  # pragma: no cover
+            return ""
+
+        async def read(self):  # pragma: no cover
+            return b""
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse(url)
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+
+    with pytest.raises(fetcher.FetchBlockedError) as ei:
+        asyncio.run(fetcher.fetch_url("https://author.substack.com:443/p/x"))
+    msg = str(ei.value)
+    assert "known-anti-bot list" in msg
+    assert "author.substack.com" in msg
+
+
+def test_is_known_blocked_host_uses_hostname_not_netloc(monkeypatch):
+    """fetch_url must extract host via .hostname so port/credentials in
+    the URL don't break the suffix match (urlparse(url).netloc keeps
+    them; .hostname strips them).
+    """
+
+    seen_hosts = []
+
+    real_predicate = fetcher._is_known_blocked_host
+
+    def spy(h):
+        seen_hosts.append(h)
+        return real_predicate(h)
+
+    monkeypatch.setattr(fetcher, "_is_known_blocked_host", spy)
+
+    class FakeResponse:
+        def __init__(self, url):
+            self.status = 200
+            self.headers = {"Content-Type": "text/plain"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def text(self):
+            return "ok"
+
+        async def read(self):
+            return b"ok"
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse(url)
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+
+    asyncio.run(fetcher.fetch_url("https://author.substack.com:443/p/x"))
+
+    assert seen_hosts == ["author.substack.com"]
 
 
 def test_fetch_url_raises_for_known_blocked_host_on_any_4xx(monkeypatch):
