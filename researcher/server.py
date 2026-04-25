@@ -24,7 +24,7 @@ from researcher.pipeline import create_pipeline, ResearchPipeline
 logger = logging.getLogger(__name__)
 
 
-def _render_summary_markdown(summary: dict[str, Any]) -> str:
+def _render_summary_markdown(summary: Any) -> str:
     """Render the summarizer's structured dict as markdown sections.
 
     The previous distill_paper output dropped the whole summary as
@@ -37,29 +37,54 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     JSON syntax in favor of bullets and short headings. Unknown
     fields are surfaced verbatim under a generic "Other" section so
     schema additions don't silently disappear.
+
+    Returns ``""`` when the input is not a non-empty dict, OR when
+    no known field renders (e.g. summary contains only ``title``,
+    which is rendered by the surrounding handler, not here).
     """
     if not isinstance(summary, dict) or not summary:
         return ""
-    parts: list[str] = ["## Summary"]
 
-    # Authors line (single bullet for compact rendering).
+    # Build the rendered body without the "## Summary" header — we'll
+    # only prepend the header if at least one section actually emits
+    # content. Stops a bare "## Summary" from appearing when none of
+    # the known fields have anything to render.
+    body: list[str] = []
+
+    # Authors render as an inline bold line for compact rendering.
     authors = summary.get("authors")
-    if isinstance(authors, list) and authors:
-        parts.append(f"**Authors:** {', '.join(str(a) for a in authors)}")
+    if isinstance(authors, list):
+        cleaned = [str(a).strip() for a in authors if str(a).strip()]
+        if cleaned:
+            body.append(f"**Authors:** {', '.join(cleaned)}")
 
     abstract = summary.get("abstract")
     if isinstance(abstract, str) and abstract.strip():
-        parts.append(f"**Abstract:** {abstract.strip()}")
+        body.append(f"**Abstract:** {abstract.strip()}")
 
     def _bullets(label: str, key: str) -> None:
         items = summary.get(key)
-        if isinstance(items, list) and items:
-            parts.append(f"\n### {label}")
-            for item in items:
-                if isinstance(item, str):
-                    parts.append(f"- {item.strip()}")
-                else:
-                    parts.append(f"- {item!r}")
+        if not isinstance(items, list):
+            return
+        # Drop blank/whitespace-only string items before deciding
+        # whether to emit the section — otherwise a list of empty
+        # strings would still produce "### Foo" with no bullets.
+        cleaned: list[Any] = []
+        for item in items:
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    cleaned.append(stripped)
+            else:
+                cleaned.append(item)
+        if not cleaned:
+            return
+        body.append(f"\n### {label}")
+        for item in cleaned:
+            if isinstance(item, str):
+                body.append(f"- {item}")
+            else:
+                body.append(f"- {item!r}")
 
     _bullets("Key findings", "key_findings")
     _bullets("Methods", "methods")
@@ -68,11 +93,15 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
 
     # Domains + keywords are token lists; render inline.
     domains = summary.get("domains")
-    if isinstance(domains, list) and domains:
-        parts.append(f"\n**Domains:** {', '.join(str(d) for d in domains)}")
+    if isinstance(domains, list):
+        cleaned = [str(d).strip() for d in domains if str(d).strip()]
+        if cleaned:
+            body.append(f"\n**Domains:** {', '.join(cleaned)}")
     keywords = summary.get("keywords")
-    if isinstance(keywords, list) and keywords:
-        parts.append(f"**Keywords:** {', '.join(str(k) for k in keywords)}")
+    if isinstance(keywords, list):
+        cleaned = [str(k).strip() for k in keywords if str(k).strip()]
+        if cleaned:
+            body.append(f"**Keywords:** {', '.join(cleaned)}")
 
     # Surface unknown fields so schema additions don't vanish silently.
     known = {
@@ -81,11 +110,13 @@ def _render_summary_markdown(summary: dict[str, Any]) -> str:
     }
     extras = {k: v for k, v in summary.items() if k not in known}
     if extras:
-        parts.append("\n### Other")
+        body.append("\n### Other")
         for k, v in extras.items():
-            parts.append(f"- **{k}:** {v}")
+            body.append(f"- **{k}:** {v}")
 
-    return "\n".join(parts)
+    if not body:
+        return ""
+    return "\n".join(["## Summary", *body])
 
 
 def _compact_field(value: Any, limit: int = 80) -> str:

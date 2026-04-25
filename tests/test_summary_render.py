@@ -74,9 +74,39 @@ def test_surfaces_unknown_schema_keys_under_other():
 
 
 def test_handles_non_dict_input():
-    assert _render_summary_markdown(None) == ""  # type: ignore[arg-type]
+    assert _render_summary_markdown(None) == ""
     assert _render_summary_markdown({}) == ""
-    assert _render_summary_markdown("garbage") == ""  # type: ignore[arg-type]
+    assert _render_summary_markdown("garbage") == ""
+
+
+def test_returns_empty_when_only_unrenderable_known_keys_present():
+    """`title` is rendered by the surrounding distill_paper handler,
+    not by this helper. A summary that contains only `title` (or
+    other keys that don't produce body content) must not emit a
+    bare "## Summary" header.
+    """
+    assert _render_summary_markdown({"title": "A Paper"}) == ""
+    # Same for keys whose values are present but render-empty.
+    assert _render_summary_markdown({"title": "A Paper", "authors": []}) == ""
+    assert _render_summary_markdown({"abstract": "   "}) == ""
+
+
+def test_filters_whitespace_only_list_items():
+    """Blank / whitespace-only entries in list fields drop out
+    instead of producing "- " bullets, and a section that has only
+    blank entries doesn't emit its header at all.
+    """
+    summary = {
+        "key_findings": ["", "  ", "real finding"],
+        "methods": ["", "   "],
+    }
+    out = _render_summary_markdown(summary)
+    assert "### Key findings" in out
+    assert "- real finding" in out
+    # No "- " on its own line (would indicate an empty bullet rendered).
+    assert "\n- \n" not in out and not out.endswith("- ")
+    # Methods section had only blank entries → no header.
+    assert "### Methods" not in out
 
 
 def test_renders_more_compactly_than_json_dumps():
