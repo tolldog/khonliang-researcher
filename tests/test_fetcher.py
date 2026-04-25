@@ -76,6 +76,7 @@ def test_fetch_url_resolves_linkedin_shortlink(monkeypatch):
 
     class FakeResponse:
         def __init__(self, url):
+            self.status = 200
             self.headers = {"Content-Type": responses[url][0]}
             self._text = responses[url][1]
 
@@ -141,6 +142,7 @@ def test_fetch_url_preserves_multi_hop_resolution_chain(monkeypatch):
 
     class FakeResponse:
         def __init__(self, url):
+            self.status = 200
             self.headers = {"Content-Type": responses[url][0]}
             self._text = responses[url][1]
 
@@ -195,6 +197,7 @@ def test_fetch_url_stops_at_shortlink_redirect_cap(monkeypatch):
 
     class FakeResponse:
         headers = {"Content-Type": "text/html"}
+        status = 200
 
         def __init__(self, url):
             current = int(url.rsplit("/", 1)[1])
@@ -242,3 +245,102 @@ def test_fetch_url_stops_at_shortlink_redirect_cap(monkeypatch):
     ]
     assert result.url == f"https://lnkd.in/{fetcher._MAX_SHORTLINK_REDIRECTS}"
     assert result.format == ContentFormat.HTML
+
+
+def test_fetch_url_raises_FetchBlockedError_on_403(monkeypatch):
+    """A 403 with browser headers means the host fingerprinted us as a
+    bot. Surface a typed error pointing at the WebFetch fallback so the
+    caller doesn't retry the same shape and pollute logs.
+    """
+
+    class FakeResponse:
+        def __init__(self, url):
+            self.status = 403
+            self.headers = {"Content-Type": "text/html"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):  # pragma: no cover - shouldn't reach
+            raise AssertionError("FetchBlockedError must fire before raise_for_status")
+
+        async def text(self):  # pragma: no cover
+            return ""
+
+        async def read(self):  # pragma: no cover
+            return b""
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse(url)
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+
+    with pytest.raises(fetcher.FetchBlockedError) as ei:
+        asyncio.run(fetcher.fetch_url("https://example.com/something"))
+    assert "WebFetch" in str(ei.value)
+    assert "403" in str(ei.value)
+
+
+def test_fetch_url_raises_for_known_blocked_host_on_any_4xx(monkeypatch):
+    """Substack and other listed hosts surface FetchBlockedError on any
+    non-2xx — they have a track record of returning 5xx / generic 4xx
+    pages from the bot challenge layer too, not always 403.
+    """
+
+    class FakeResponse:
+        def __init__(self, url):
+            self.status = 429
+            self.headers = {"Content-Type": "text/html"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):  # pragma: no cover
+            raise AssertionError("FetchBlockedError must fire before raise_for_status")
+
+        async def text(self):  # pragma: no cover
+            return ""
+
+        async def read(self):  # pragma: no cover
+            return b""
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse(url)
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+
+    with pytest.raises(fetcher.FetchBlockedError):
+        asyncio.run(fetcher.fetch_url("https://author.substack.com/p/post"))
+
+
+def test_is_known_blocked_host_matches_subdomain():
+    assert fetcher._is_known_blocked_host("substack.com")
+    assert fetcher._is_known_blocked_host("author.substack.com")
+    assert not fetcher._is_known_blocked_host("example.com")
+    assert not fetcher._is_known_blocked_host("substacky.example.com")
