@@ -104,7 +104,9 @@ def _render_summary_markdown(summary: Any) -> str:
     if isinstance(keywords, list):
         cleaned = [str(k).strip() for k in keywords if str(k).strip()]
         if cleaned:
-            body.append(f"**Keywords:** {', '.join(cleaned)}")
+            # Match Domains' leading "\n" so Keywords doesn't butt up
+            # against the previous line when Domains is absent.
+            body.append(f"\n**Keywords:** {', '.join(cleaned)}")
 
     # Surface unknown fields so schema additions don't vanish silently.
     known = {
