@@ -437,7 +437,15 @@ Most tools accept detail="compact|brief|full":
         parts = [f"# {result.title}\n"]
 
         if result.summary:
-            parts.append(_render_summary_markdown(result.summary))
+            # The renderer can legally return "" (e.g. summary
+            # contains only `title`, which the surrounding header
+            # already covers, or all renderable fields are blank).
+            # Skip the append in that case so we don't introduce
+            # an empty element into `parts` and a stray blank line
+            # into the final output.
+            rendered_summary = _render_summary_markdown(result.summary)
+            if rendered_summary:
+                parts.append(rendered_summary)
 
         if result.triples:
             parts.append(f"\n## Relationships ({len(result.triples)} triples)")
