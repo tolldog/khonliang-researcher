@@ -24,6 +24,106 @@ from researcher.pipeline import create_pipeline, ResearchPipeline
 logger = logging.getLogger(__name__)
 
 
+def _render_summary_markdown(summary: Any) -> str:
+    """Render the summarizer's structured dict as markdown sections.
+
+    The previous distill_paper output dropped the whole summary as
+    ``json.dumps(..., indent=2)`` — visually a wall of escaped quotes
+    and braces inside the surrounding markdown. Per CLAUDE.md's
+    "every word must earn its place" rule, that JSON envelope is
+    pure noise: keys/quotes/commas add tokens without adding signal.
+
+    This renderer keeps every field the schema produces, but drops
+    JSON syntax in favor of bullets and short headings. Unknown
+    fields are surfaced verbatim under a generic "Other" section so
+    schema additions don't silently disappear.
+
+    Returns ``""`` when the input is not a non-empty dict, OR when
+    no section emits content — i.e. when none of the known fields
+    have renderable values AND there are no unknown-key extras to
+    surface under "Other". (Summary containing only ``title`` is
+    the canonical case: the surrounding handler already renders it
+    as the top-level header.)
+    """
+    if not isinstance(summary, dict) or not summary:
+        return ""
+
+    # Build the rendered body without the "## Summary" header — we'll
+    # only prepend the header if at least one section actually emits
+    # content. Stops a bare "## Summary" from appearing when none of
+    # the known fields have anything to render.
+    body: list[str] = []
+
+    # Authors render as an inline bold line for compact rendering.
+    authors = summary.get("authors")
+    if isinstance(authors, list):
+        cleaned = [str(a).strip() for a in authors if str(a).strip()]
+        if cleaned:
+            body.append(f"**Authors:** {', '.join(cleaned)}")
+
+    abstract = summary.get("abstract")
+    if isinstance(abstract, str) and abstract.strip():
+        body.append(f"**Abstract:** {abstract.strip()}")
+
+    def _bullets(label: str, key: str) -> None:
+        items = summary.get(key)
+        if not isinstance(items, list):
+            return
+        # Drop blank/whitespace-only string items before deciding
+        # whether to emit the section — otherwise a list of empty
+        # strings would still produce "### Foo" with no bullets.
+        cleaned: list[Any] = []
+        for item in items:
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    cleaned.append(stripped)
+            else:
+                cleaned.append(item)
+        if not cleaned:
+            return
+        body.append(f"\n### {label}")
+        for item in cleaned:
+            if isinstance(item, str):
+                body.append(f"- {item}")
+            else:
+                body.append(f"- {item!r}")
+
+    _bullets("Key findings", "key_findings")
+    _bullets("Methods", "methods")
+    _bullets("Results", "results")
+    _bullets("Limitations", "limitations")
+
+    # Domains + keywords are token lists; render inline.
+    domains = summary.get("domains")
+    if isinstance(domains, list):
+        cleaned = [str(d).strip() for d in domains if str(d).strip()]
+        if cleaned:
+            body.append(f"\n**Domains:** {', '.join(cleaned)}")
+    keywords = summary.get("keywords")
+    if isinstance(keywords, list):
+        cleaned = [str(k).strip() for k in keywords if str(k).strip()]
+        if cleaned:
+            # Match Domains' leading "\n" so Keywords doesn't butt up
+            # against the previous line when Domains is absent.
+            body.append(f"\n**Keywords:** {', '.join(cleaned)}")
+
+    # Surface unknown fields so schema additions don't vanish silently.
+    known = {
+        "title", "authors", "abstract", "key_findings", "methods",
+        "results", "limitations", "domains", "keywords",
+    }
+    extras = {k: v for k, v in summary.items() if k not in known}
+    if extras:
+        body.append("\n### Other")
+        for k, v in extras.items():
+            body.append(f"- **{k}:** {v}")
+
+    if not body:
+        return ""
+    return "\n".join(["## Summary", *body])
+
+
 def _compact_field(value: Any, limit: int = 80) -> str:
     """Sanitize a value for inclusion in pipe-delimited compact output.
 
@@ -342,8 +442,15 @@ Most tools accept detail="compact|brief|full":
         parts = [f"# {result.title}\n"]
 
         if result.summary:
-            parts.append("## Summary")
-            parts.append(json.dumps(result.summary, indent=2))
+            # The renderer can legally return "" (e.g. summary
+            # contains only `title`, which the surrounding header
+            # already covers, or all renderable fields are blank).
+            # Skip the append in that case so we don't introduce
+            # an empty element into `parts` and a stray blank line
+            # into the final output.
+            rendered_summary = _render_summary_markdown(result.summary)
+            if rendered_summary:
+                parts.append(rendered_summary)
 
         if result.triples:
             parts.append(f"\n## Relationships ({len(result.triples)} triples)")
