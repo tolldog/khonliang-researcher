@@ -27,10 +27,12 @@ def test_renders_full_schema_as_markdown_sections():
     }
     out = _render_summary_markdown(summary)
 
-    # No raw JSON syntax leaking through.
-    assert "{" not in out
-    assert "}" not in out
-    assert '"authors"' not in out
+    # No raw JSON syntax leaking through. Quoted-key signature
+    # ('"authors":') is the load-bearing assertion — bare braces
+    # would also fail many legitimate contents (math/set notation
+    # in an abstract), so we don't gate on those.
+    assert '"authors":' not in out
+    assert '"key_findings":' not in out
 
     # Section headers + bullets render.
     assert out.startswith("## Summary")

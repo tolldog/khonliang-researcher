@@ -39,8 +39,11 @@ def _render_summary_markdown(summary: Any) -> str:
     schema additions don't silently disappear.
 
     Returns ``""`` when the input is not a non-empty dict, OR when
-    no known field renders (e.g. summary contains only ``title``,
-    which is rendered by the surrounding handler, not here).
+    no section emits content — i.e. when none of the known fields
+    have renderable values AND there are no unknown-key extras to
+    surface under "Other". (Summary containing only ``title`` is
+    the canonical case: the surrounding handler already renders it
+    as the top-level header.)
     """
     if not isinstance(summary, dict) or not summary:
         return ""
