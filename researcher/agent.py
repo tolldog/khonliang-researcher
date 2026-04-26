@@ -36,15 +36,27 @@ from researcher.ingest_watcher import IngestWatcherRegistry, IngestWatcherStore
 logger = logging.getLogger(__name__)
 
 
-async def stage_payload(agent: BaseAgent, args: dict) -> dict:
-    """Persist a payload as a store-primary artifact with provenance.
+# Per-call cap for ``ingest_from_artifact``'s body fetch. Sized
+# to the bus's REST-surface ceiling (``HARD_MAX_CHARS=20000``,
+# see ``khonliang_bus.bus.artifacts.HARD_MAX_CHARS`` and
+# ``khonliang_store.store.local_store.HARD_MAX_CHARS`` — both
+# enforce 20k on the read path) so the requested size matches
+# what we'll actually receive. Larger payloads will return
+# ``truncated=True`` from store; full retrieval gates on a
+# streaming endpoint (out of scope for this FR).
+_INGEST_FETCH_CAP_CHARS = 20_000
 
-    Thin wrapper over ``store-primary.artifact_create``: validates
-    the inbound shape, generates a sensible title when one wasn't
-    provided, builds the metadata dict, and surfaces the new
-    ``{artifact_id}`` (or the store's error envelope) to the
-    caller. Routing goes through ``agent.request(agent_type='store')``
-    so the store backend can move (composite / local-only / etc.)
+
+async def stage_payload(agent: BaseAgent, args: dict) -> dict:
+    """Persist a payload as a store artifact with provenance.
+
+    Thin wrapper over
+    ``agent.request(agent_type='store', operation='artifact_create')``:
+    validates the inbound shape, generates a sensible title when
+    one wasn't provided, builds the metadata dict, and surfaces
+    the new ``{artifact_id}`` (or the store's error envelope) to
+    the caller. Routing through the ``store`` agent type means
+    the store backend can move (composite / local-only / etc.)
     without researcher caring.
 
     Module-level so tests can call it with a mock ``agent``
@@ -59,14 +71,16 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
     title = str(args.get("title") or "").strip()
     if not title:
         # Short content preview so the artifact has a human
-        # name in ``artifact_list``. First non-empty line of
-        # the input, capped at 80 chars with an ellipsis.
-        preview_source = content.strip().splitlines()[0] if content.strip() else ""
-        title = (
-            (preview_source[:80] + "…")
-            if len(preview_source) > 80
-            else (preview_source or "staged payload")
-        )
+        # name in ``artifact_list``. First non-empty stripped
+        # line of the input, capped at 80 chars with an
+        # ellipsis. Single-pass to avoid materializing a full
+        # ``splitlines()`` list for large payloads.
+        first_line, _, _ = content.partition("\n")
+        preview = first_line.strip()
+        if len(preview) > 80:
+            title = preview[:80] + "…"
+        else:
+            title = preview or "staged payload"
     content_type = str(args.get("content_type") or "text/plain")
     source = args["source"] if "source" in args else {}
     if not isinstance(source, dict):
@@ -123,14 +137,21 @@ async def ingest_from_artifact(
         return {"error": "hints must be an object"}
     source_label_override = str(args.get("source_label") or "").strip()
 
-    # Pull the full artifact. The bus's REST surface caps
-    # reads at HARD_MAX_CHARS=20000 regardless of what we
-    # request; payloads beyond that ceiling are out of scope
-    # until streaming lands.
+    # Pull the artifact body. ``_INGEST_FETCH_CAP_CHARS`` matches
+    # the bus's HARD_MAX_CHARS=20000 clamp so we ask for
+    # what we can actually receive; larger payloads will return
+    # ``truncated=True`` from store, and ingesting a partial
+    # payload would mislead downstream tooling — handled by the
+    # empty-content / future-streaming guards rather than
+    # silently passing through.
     result = await agent.request(
         agent_type="store",
         operation="artifact_get",
-        args={"id": artifact_id, "offset": 0, "max_chars": 2_000_000},
+        args={
+            "id": artifact_id,
+            "offset": 0,
+            "max_chars": _INGEST_FETCH_CAP_CHARS,
+        },
     )
     payload = _unwrap_request_envelope(result)
     if isinstance(payload, dict) and "error" in payload:
@@ -250,8 +271,8 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "is attached so the artifact is self-describing. Pair with "
                 "ingest_from_artifact to ingest without re-transmitting the "
                 "payload (re-route after misclassification, retry after a "
-                "wedged worker, etc.). Routes through "
-                "store-primary.artifact_create.",
+                "wedged worker, etc.). Routes through the bus to "
+                "agent_type='store', operation='artifact_create'.",
                 {
                     "content": {"type": "string", "required": True},
                     "kind_hint": {"type": "string", "default": ""},
@@ -266,13 +287,14 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             Skill(
                 "ingest_from_artifact",
                 "Ingest a previously-staged store artifact through the "
-                "researcher idea pipeline. Pulls the body via "
-                "store-primary.artifact_get and routes it through "
-                "pipeline.ingest_idea (the canonical informal-text entry "
-                "today). Returns {idea_id, artifact_id} so downstream "
-                "consumers can trace the lineage. Auto-detected dispatch "
-                "is a separate FR; the hints arg is wired through so future "
-                "routing logic can break ties without an API change here.",
+                "researcher idea pipeline. Pulls the body via the bus "
+                "(agent_type='store', operation='artifact_get') and "
+                "routes it through pipeline.ingest_idea (the canonical "
+                "informal-text entry today). Returns {idea_id, "
+                "artifact_id} so downstream consumers can trace the "
+                "lineage. Auto-detected dispatch is a separate FR; the "
+                "hints arg is wired through so future routing logic can "
+                "break ties without an API change here.",
                 {
                     "artifact_id": {"type": "string", "required": True},
                     "hints": {"type": "object", "default": {}},
