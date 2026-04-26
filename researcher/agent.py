@@ -91,7 +91,10 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
     content = args["content"]
     if not isinstance(content, str):
         return {"error": "content must be a string"}
-    if not content:
+    # ``strip() == ""`` rather than just ``not content`` so a
+    # whitespace-only payload ("\n\n", "   ") doesn't get
+    # staged as a "valid" empty artifact.
+    if not content.strip():
         return {"error": "content is required"}
     # Type-strict on string fields: silent ``str()`` coercion
     # would let callers pass a number/object and quietly persist
@@ -263,7 +266,11 @@ async def ingest_from_artifact(
         or payload.get("content")
         or ""
     )
-    if not isinstance(text, str) or not text:
+    # ``text.strip()`` so a whitespace-only body — "\n\n", "   ",
+    # an artifact whose only content is page-break newlines —
+    # surfaces the empty-content error here rather than slipping
+    # into ``ingest_idea`` with garbage.
+    if not isinstance(text, str) or not text.strip():
         return {"error": "store returned empty content"}
 
     artifact_meta = (

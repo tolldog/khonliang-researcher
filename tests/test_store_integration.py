@@ -156,6 +156,19 @@ async def test_stage_payload_rejects_empty_content():
 
 
 @pytest.mark.asyncio
+async def test_stage_payload_rejects_whitespace_only_content():
+    """``"\\n\\n"`` / ``"   "`` shouldn't slip past the
+    "content is required" check just because the bytes are
+    technically non-empty — store would persist a useless
+    artifact and the dispatcher would later choke on it.
+    """
+    agent = _MockAgent()
+    result = await stage_payload(agent, {"content": "\n\n   \t  \n"})
+    assert result == {"error": "content is required"}
+    assert agent.calls == []
+
+
+@pytest.mark.asyncio
 async def test_stage_payload_rejects_non_string_kind_hint():
     """``kind_hint`` is metadata that the future dispatcher
     reads as a string. Silently coercing a number/object via
@@ -449,6 +462,26 @@ async def test_ingest_from_artifact_handles_empty_content():
         agent, pipeline, {"artifact_id": "art_empty"},
     )
     assert result == {"error": "store returned empty content"}
+
+
+@pytest.mark.asyncio
+async def test_ingest_from_artifact_handles_whitespace_only_content():
+    """An artifact whose body is just whitespace (page-break
+    newlines from a poorly-extracted PDF, etc.) should surface
+    as empty here — not slip into ``ingest_idea`` with garbage
+    that fails further downstream with a less actionable error.
+    """
+    agent = _MockAgent(response={"result": {
+        "artifact": {"id": "art_blank"},
+        "text": "   \n\n\t  \n   ",
+    }})
+    pipeline = _MockPipeline()
+    result = await ingest_from_artifact(
+        agent, pipeline, {"artifact_id": "art_blank"},
+    )
+    assert result == {"error": "store returned empty content"}
+    # Pipeline never reached.
+    assert pipeline.calls == []
 
 
 @pytest.mark.asyncio
