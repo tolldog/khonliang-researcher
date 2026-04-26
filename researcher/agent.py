@@ -50,17 +50,34 @@ _INGEST_FETCH_CAP_CHARS = 20_000
 async def stage_payload(agent: BaseAgent, args: dict) -> dict:
     """Persist a payload as a store artifact with provenance.
 
-    Thin wrapper over
-    ``agent.request(agent_type='store', operation='artifact_create')``:
-    validates the inbound shape, generates a sensible title when
-    one wasn't provided, builds the metadata dict, and surfaces
-    the new ``{artifact_id}`` (or the store's error envelope) to
-    the caller. Routing through the ``store`` agent type means
-    the store backend can move (composite / local-only / etc.)
-    without researcher caring.
+    Bus-skill handler shape: takes the request envelope's
+    ``args`` dict directly so the wiring in
+    ``_extend_with_native_handlers`` can register it as a
+    handler without an extra adapter. ``args`` reads:
+
+    * ``content`` (required, str): raw payload bytes.
+    * ``kind_hint`` (str, default ""): dispatcher hint
+      stored in metadata for the future auto-detected
+      dispatcher (sister fr_researcher_1ca5499e).
+    * ``title`` (str, default ""): human-readable artifact
+      name. Falls back to a 80-char first-non-empty-line
+      preview when omitted.
+    * ``content_type`` (str, default "text/plain").
+    * ``source`` (dict, default {}): provenance dict
+      (url, fetched_at, fetcher) attached to metadata.
+
+    Returns ``{"artifact_id": ...}`` on success, or the
+    store's error envelope verbatim. Thin wrapper over
+    ``agent.request(agent_type='store',
+    operation='artifact_create')`` — routing through the
+    ``store`` agent type means the store backend can move
+    (composite / local-only / etc.) without researcher
+    caring.
 
     Module-level so tests can call it with a mock ``agent``
-    without wiring through ``BaseAgent.from_mcp``.
+    without wiring through ``BaseAgent.from_mcp``. Direct
+    Python callers should pass an ``args`` dict the same
+    way the bus would.
     """
     content = args.get("content")
     if not isinstance(content, str):
@@ -139,6 +156,20 @@ async def ingest_from_artifact(
 ) -> dict:
     """Pull bytes from store, route through ``pipeline.ingest_idea``.
 
+    Bus-skill handler shape, like :func:`stage_payload`. ``args``
+    reads:
+
+    * ``artifact_id`` (required, str): id of a previously-
+      staged store artifact.
+    * ``hints`` (dict, default {}): forwarded to the future
+      auto-detected dispatcher (not consumed today).
+    * ``source_label`` (str, default ""): override for the
+      ingest_idea source label; falls back to the artifact's
+      ``producer`` when omitted.
+
+    Returns ``{"idea_id", "artifact_id", "source_label",
+    "hints"}`` so downstream consumers can trace lineage from
+    the resulting idea back to the staged artifact.
     Auto-detected dispatch is the sister FR; today this skill
     treats the artifact as informal text and feeds it to the
     existing idea pipeline. ``hints`` is accepted but not yet
