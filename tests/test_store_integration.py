@@ -88,15 +88,17 @@ async def test_stage_payload_routes_to_store_artifact_create():
 
 @pytest.mark.asyncio
 async def test_stage_payload_generates_default_title_from_content():
-    """Empty title field → preview-of-first-line, capped at 80 chars."""
+    """Empty title field → preview-of-first-line capped at 80
+    *total* chars (79 raw + ellipsis). The previous ``[:80] +
+    "…"`` overshot the documented limit by one.
+    """
     agent = _MockAgent(response={"result": {"id": "art_a"}})
     long_first_line = "x" * 200
     body = long_first_line + "\nsecond line"
     await stage_payload(agent, {"content": body})
     title = agent.calls[0]["args"]["title"]
-    # First 80 chars + ellipsis (which counts as one char in
-    # ``len`` even though it renders wider).
-    assert title == ("x" * 80) + "…"
+    assert title == ("x" * 79) + "…"
+    assert len(title) == 80
 
 
 @pytest.mark.asyncio

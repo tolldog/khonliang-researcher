@@ -83,7 +83,9 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
                 preview = stripped
                 break
         if len(preview) > 80:
-            title = preview[:80] + "…"
+            # 79 + ellipsis so the rendered title is exactly 80
+            # chars — the previous ``[:80] + "…"`` overshot by one.
+            title = preview[:79] + "…"
         else:
             title = preview or "staged payload"
     content_type = str(args.get("content_type") or "text/plain")
