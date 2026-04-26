@@ -36,6 +36,147 @@ from researcher.ingest_watcher import IngestWatcherRegistry, IngestWatcherStore
 logger = logging.getLogger(__name__)
 
 
+async def stage_payload(agent: BaseAgent, args: dict) -> dict:
+    """Persist a payload as a store-primary artifact with provenance.
+
+    Thin wrapper over ``store-primary.artifact_create``: validates
+    the inbound shape, generates a sensible title when one wasn't
+    provided, builds the metadata dict, and surfaces the new
+    ``{artifact_id}`` (or the store's error envelope) to the
+    caller. Routing goes through ``agent.request(agent_type='store')``
+    so the store backend can move (composite / local-only / etc.)
+    without researcher caring.
+
+    Module-level so tests can call it with a mock ``agent``
+    without wiring through ``BaseAgent.from_mcp``.
+    """
+    content = args.get("content")
+    if not isinstance(content, str):
+        return {"error": "content must be a string"}
+    if not content:
+        return {"error": "content is required"}
+    kind_hint = str(args.get("kind_hint") or "").strip()
+    title = str(args.get("title") or "").strip()
+    if not title:
+        # Short content preview so the artifact has a human
+        # name in ``artifact_list``. First non-empty line of
+        # the input, capped at 80 chars with an ellipsis.
+        preview_source = content.strip().splitlines()[0] if content.strip() else ""
+        title = (
+            (preview_source[:80] + "…")
+            if len(preview_source) > 80
+            else (preview_source or "staged payload")
+        )
+    content_type = str(args.get("content_type") or "text/plain")
+    source = args["source"] if "source" in args else {}
+    if not isinstance(source, dict):
+        return {"error": "source must be an object"}
+    # Provenance + the dispatcher hint live in metadata
+    # together — store doesn't define a schema for either,
+    # so the convention we set here is what the dispatcher
+    # FR will read. ``source.*`` fields stay nested so they
+    # don't collide with future top-level keys.
+    metadata: dict = {"source": source}
+    if kind_hint:
+        metadata["kind_hint"] = kind_hint
+    result = await agent.request(
+        agent_type="store",
+        operation="artifact_create",
+        args={
+            "kind": "staged_payload",
+            "title": title,
+            "content": content,
+            "content_type": content_type,
+            "producer": agent.agent_id,
+            "metadata": metadata,
+        },
+    )
+    payload = _unwrap_request_envelope(result)
+    if isinstance(payload, dict) and "error" in payload:
+        return payload
+    if not isinstance(payload, dict):
+        return {"error": "store returned unexpected response shape"}
+    artifact_id = payload.get("id")
+    if not artifact_id:
+        return {"error": "store created artifact without id"}
+    return {"artifact_id": artifact_id}
+
+
+async def ingest_from_artifact(
+    agent: BaseAgent, pipeline, args: dict,
+) -> dict:
+    """Pull bytes from store, route through ``pipeline.ingest_idea``.
+
+    Auto-detected dispatch is the sister FR; today this skill
+    treats the artifact as informal text and feeds it to the
+    existing idea pipeline. ``hints`` is accepted but not yet
+    consumed — wired through so future dispatcher logic can
+    break ties without an API change here.
+
+    Module-level for the same reason as :func:`stage_payload`.
+    """
+    artifact_id = str(args.get("artifact_id") or "").strip()
+    if not artifact_id:
+        return {"error": "artifact_id is required"}
+    hints = args["hints"] if "hints" in args else {}
+    if not isinstance(hints, dict):
+        return {"error": "hints must be an object"}
+    source_label_override = str(args.get("source_label") or "").strip()
+
+    # Pull the full artifact. The bus's REST surface caps
+    # reads at HARD_MAX_CHARS=20000 regardless of what we
+    # request; payloads beyond that ceiling are out of scope
+    # until streaming lands.
+    result = await agent.request(
+        agent_type="store",
+        operation="artifact_get",
+        args={"id": artifact_id, "offset": 0, "max_chars": 2_000_000},
+    )
+    payload = _unwrap_request_envelope(result)
+    if isinstance(payload, dict) and "error" in payload:
+        return payload
+    if not isinstance(payload, dict):
+        return {"error": "store returned unexpected response shape"}
+    text = payload.get("text") or payload.get("body") or ""
+    if not isinstance(text, str) or not text:
+        return {"error": "store returned empty content"}
+
+    artifact_meta = (
+        payload.get("artifact")
+        if isinstance(payload.get("artifact"), dict)
+        else {}
+    )
+    # Default the ingest source_label to the staged artifact's
+    # producer so the resulting idea points back at where the
+    # payload originated. Caller can override via
+    # ``source_label``.
+    source_label = source_label_override or str(artifact_meta.get("producer") or "")
+
+    try:
+        idea_id = await pipeline.ingest_idea(text, source_label)
+    except RuntimeError as exc:
+        return {"error": f"ingest failed: {exc}"}
+    return {
+        "idea_id": idea_id,
+        "artifact_id": artifact_id,
+        "source_label": source_label,
+        "hints": hints,
+    }
+
+
+def _unwrap_request_envelope(result):
+    """Pull ``result["result"]`` out of the bus request envelope.
+
+    ``BaseAgent.request`` returns the raw bus response — the
+    handler's return value lives nested under ``result``. Tests
+    can fake either shape (full envelope or raw result) by
+    routing through this helper.
+    """
+    if isinstance(result, dict):
+        return result.get("result", result)
+    return result
+
+
 def create_researcher_agent(
     agent_id: str,
     bus_url: str,
@@ -102,6 +243,43 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "Stop an ingest watcher.",
                 {"watcher_id": {"type": "string", "required": True}},
             ),
+            Skill(
+                "stage_payload",
+                "Persist raw ingest content as a store artifact, returning "
+                "an artifact_id. Provenance metadata (source dict, kind_hint) "
+                "is attached so the artifact is self-describing. Pair with "
+                "ingest_from_artifact to ingest without re-transmitting the "
+                "payload (re-route after misclassification, retry after a "
+                "wedged worker, etc.). Routes through "
+                "store-primary.artifact_create.",
+                {
+                    "content": {"type": "string", "required": True},
+                    "kind_hint": {"type": "string", "default": ""},
+                    "title": {"type": "string", "default": ""},
+                    "content_type": {
+                        "type": "string", "default": "text/plain",
+                    },
+                    "source": {"type": "object", "default": {}},
+                },
+                since="0.5.0",
+            ),
+            Skill(
+                "ingest_from_artifact",
+                "Ingest a previously-staged store artifact through the "
+                "researcher idea pipeline. Pulls the body via "
+                "store-primary.artifact_get and routes it through "
+                "pipeline.ingest_idea (the canonical informal-text entry "
+                "today). Returns {idea_id, artifact_id} so downstream "
+                "consumers can trace the lineage. Auto-detected dispatch "
+                "is a separate FR; the hints arg is wired through so future "
+                "routing logic can break ties without an API change here.",
+                {
+                    "artifact_id": {"type": "string", "required": True},
+                    "hints": {"type": "object", "default": {}},
+                    "source_label": {"type": "string", "default": ""},
+                },
+                since="0.5.0",
+            ),
         ]
         for skill in extras:
             if skill.name not in names:
@@ -139,6 +317,12 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         registry = await _get_ingest_registry(self)
         stopped = await registry.stop(watcher_id)
         return {"watcher_id": watcher_id, "stopped": stopped}
+
+    async def handle_stage_payload(self, args):
+        return await stage_payload(self, args)
+
+    async def handle_ingest_from_artifact(self, args):
+        return await ingest_from_artifact(self, pipeline, args)
 
     async def start(self):
         skills = self._all_skills()
@@ -200,6 +384,8 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["watch_ingest_queue"] = MethodType(handle_watch_ingest_queue, agent)
     agent._handlers["list_ingest_watchers"] = MethodType(handle_list_ingest_watchers, agent)
     agent._handlers["stop_ingest_watcher"] = MethodType(handle_stop_ingest_watcher, agent)
+    agent._handlers["stage_payload"] = MethodType(handle_stage_payload, agent)
+    agent._handlers["ingest_from_artifact"] = MethodType(handle_ingest_from_artifact, agent)
     agent.start = MethodType(start, agent)
     agent.shutdown = MethodType(shutdown, agent)
 
