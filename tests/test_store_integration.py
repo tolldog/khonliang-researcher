@@ -126,6 +126,19 @@ async def test_stage_payload_uses_explicit_title_when_provided():
 
 
 @pytest.mark.asyncio
+async def test_stage_payload_rejects_missing_content():
+    """Missing key vs. wrong type are distinct errors so callers
+    don't get "content must be a string" when they simply forgot
+    to pass the field. Matches ``artifact_id is required`` in
+    ``ingest_from_artifact`` for cross-skill consistency.
+    """
+    agent = _MockAgent()
+    result = await stage_payload(agent, {})
+    assert result == {"error": "content is required"}
+    assert agent.calls == []
+
+
+@pytest.mark.asyncio
 async def test_stage_payload_rejects_non_string_content():
     agent = _MockAgent()
     result = await stage_payload(agent, {"content": 42})

@@ -82,7 +82,13 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
     Python callers should pass an ``args`` dict the same
     way the bus would.
     """
-    content = args.get("content")
+    # Distinguish missing (required-field error) from wrong type
+    # (validation error) so callers don't see "must be a string"
+    # when they simply forgot the field. Mirrors the
+    # ``artifact_id is required`` shape in ``ingest_from_artifact``.
+    if "content" not in args:
+        return {"error": "content is required"}
+    content = args["content"]
     if not isinstance(content, str):
         return {"error": "content must be a string"}
     if not content:
