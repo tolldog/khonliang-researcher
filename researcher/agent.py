@@ -55,7 +55,10 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
     ``_extend_with_native_handlers`` can register it as a
     handler without an extra adapter. ``args`` reads:
 
-    * ``content`` (required, str): raw payload bytes.
+    * ``content`` (required, str): raw payload text. Binary
+      payloads (PDF bytes, etc.) need decoding upstream
+      first; the function rejects non-string inputs with a
+      clear error envelope.
     * ``kind_hint`` (str, default ""): dispatcher hint
       stored in metadata for the future auto-detected
       dispatcher (sister fr_researcher_1ca5499e).
