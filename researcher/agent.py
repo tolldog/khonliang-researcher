@@ -127,7 +127,9 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
     content_type_raw = args.get("content_type", "text/plain")
     if not isinstance(content_type_raw, str):
         return {"error": "content_type must be a string"}
-    content_type = content_type_raw or "text/plain"
+    # Strip + fallback so a whitespace-only or empty string
+    # doesn't reach store as an invalid MIME type.
+    content_type = content_type_raw.strip() or "text/plain"
     source = args["source"] if "source" in args else {}
     if not isinstance(source, dict):
         return {"error": "source must be an object"}

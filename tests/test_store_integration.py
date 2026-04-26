@@ -177,6 +177,25 @@ async def test_stage_payload_rejects_non_string_title():
 
 
 @pytest.mark.asyncio
+async def test_stage_payload_normalizes_whitespace_content_type():
+    """``'  text/markdown  '`` is the same MIME type as
+    ``'text/markdown'`` once you strip it; ``'   '`` (or
+    ``''``) is no MIME type at all and should fall back to
+    text/plain rather than reach store as invalid metadata.
+    """
+    agent = _MockAgent(response={"result": {"id": "art_a"}})
+    await stage_payload(agent, {
+        "content": "x",
+        "content_type": "  text/markdown  ",
+    })
+    assert agent.calls[0]["args"]["content_type"] == "text/markdown"
+
+    agent2 = _MockAgent(response={"result": {"id": "art_b"}})
+    await stage_payload(agent2, {"content": "x", "content_type": "   "})
+    assert agent2.calls[0]["args"]["content_type"] == "text/plain"
+
+
+@pytest.mark.asyncio
 async def test_stage_payload_rejects_non_string_content_type():
     agent = _MockAgent()
     result = await stage_payload(
