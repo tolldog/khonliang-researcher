@@ -143,6 +143,37 @@ async def test_stage_payload_rejects_empty_content():
 
 
 @pytest.mark.asyncio
+async def test_stage_payload_rejects_non_string_kind_hint():
+    """``kind_hint`` is metadata that the future dispatcher
+    reads as a string. Silently coercing a number/object via
+    ``str()`` would persist the repr() into the artifact and
+    hide the caller bug behind a confusing dispatch later.
+    """
+    agent = _MockAgent()
+    result = await stage_payload(agent, {"content": "x", "kind_hint": 42})
+    assert result == {"error": "kind_hint must be a string"}
+    assert agent.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stage_payload_rejects_non_string_title():
+    agent = _MockAgent()
+    result = await stage_payload(agent, {"content": "x", "title": ["a", "b"]})
+    assert result == {"error": "title must be a string"}
+    assert agent.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stage_payload_rejects_non_string_content_type():
+    agent = _MockAgent()
+    result = await stage_payload(
+        agent, {"content": "x", "content_type": {"mime": "text/plain"}},
+    )
+    assert result == {"error": "content_type must be a string"}
+    assert agent.calls == []
+
+
+@pytest.mark.asyncio
 async def test_stage_payload_rejects_non_dict_source():
     """``source`` is documented as a provenance dict; falsey
     invalids (e.g. ``[]`` or ``"string"``) used to coerce
@@ -224,6 +255,12 @@ async def test_ingest_from_artifact_pulls_body_then_dispatches_to_pipeline():
     assert fetch["agent_type"] == "store"
     assert fetch["operation"] == "artifact_get"
     assert fetch["args"]["id"] == "art_x"
+    # ``offset=0`` + ``max_chars=_INGEST_FETCH_CAP_CHARS`` (20000)
+    # are load-bearing for the truncated-response guard: a
+    # different ceiling here means a partial body could slip
+    # through without ``truncated=True`` ever being set.
+    assert fetch["args"]["offset"] == 0
+    assert fetch["args"]["max_chars"] == 20_000
 
 
 @pytest.mark.asyncio
@@ -280,6 +317,36 @@ async def test_ingest_from_artifact_requires_artifact_id():
     result = await ingest_from_artifact(agent, pipeline, {})
     assert result == {"error": "artifact_id is required"}
     # Bad input doesn't reach the store or the pipeline.
+    assert agent.calls == []
+    assert pipeline.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_from_artifact_rejects_non_string_artifact_id():
+    """A non-string ``artifact_id`` (int, None, dict) used to
+    coerce via ``str()`` and produce a different lookup id —
+    failing in store with a confusing not-found rather than
+    fast at the boundary.
+    """
+    agent = _MockAgent()
+    pipeline = _MockPipeline()
+    result = await ingest_from_artifact(
+        agent, pipeline, {"artifact_id": 12345},
+    )
+    assert result == {"error": "artifact_id must be a string"}
+    assert agent.calls == []
+    assert pipeline.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_from_artifact_rejects_non_string_source_label():
+    agent = _MockAgent()
+    pipeline = _MockPipeline()
+    result = await ingest_from_artifact(
+        agent, pipeline,
+        {"artifact_id": "art_x", "source_label": {"name": "x"}},
+    )
+    assert result == {"error": "source_label must be a string"}
     assert agent.calls == []
     assert pipeline.calls == []
 

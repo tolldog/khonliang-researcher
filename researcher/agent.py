@@ -87,8 +87,18 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
         return {"error": "content must be a string"}
     if not content:
         return {"error": "content is required"}
-    kind_hint = str(args.get("kind_hint") or "").strip()
-    title = str(args.get("title") or "").strip()
+    # Type-strict on string fields: silent ``str()`` coercion
+    # would let callers pass a number/object and quietly persist
+    # the repr() into artifact metadata, masking caller bugs
+    # well downstream of the actual mistake.
+    kind_hint_raw = args.get("kind_hint", "")
+    if not isinstance(kind_hint_raw, str):
+        return {"error": "kind_hint must be a string"}
+    kind_hint = kind_hint_raw.strip()
+    title_raw = args.get("title", "")
+    if not isinstance(title_raw, str):
+        return {"error": "title must be a string"}
+    title = title_raw.strip()
     if not title:
         # Short content preview so the artifact has a human
         # name in ``artifact_list``. First non-empty stripped
@@ -108,7 +118,10 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
             title = preview[:79] + "…"
         else:
             title = preview or "staged payload"
-    content_type = str(args.get("content_type") or "text/plain")
+    content_type_raw = args.get("content_type", "text/plain")
+    if not isinstance(content_type_raw, str):
+        return {"error": "content_type must be a string"}
+    content_type = content_type_raw or "text/plain"
     source = args["source"] if "source" in args else {}
     if not isinstance(source, dict):
         return {"error": "source must be an object"}
@@ -181,13 +194,19 @@ async def ingest_from_artifact(
 
     Module-level for the same reason as :func:`stage_payload`.
     """
-    artifact_id = str(args.get("artifact_id") or "").strip()
+    artifact_id_raw = args.get("artifact_id", "")
+    if not isinstance(artifact_id_raw, str):
+        return {"error": "artifact_id must be a string"}
+    artifact_id = artifact_id_raw.strip()
     if not artifact_id:
         return {"error": "artifact_id is required"}
     hints = args["hints"] if "hints" in args else {}
     if not isinstance(hints, dict):
         return {"error": "hints must be an object"}
-    source_label_override = str(args.get("source_label") or "").strip()
+    source_label_raw = args.get("source_label", "")
+    if not isinstance(source_label_raw, str):
+        return {"error": "source_label must be a string"}
+    source_label_override = source_label_raw.strip()
 
     # Pull the artifact body. ``_INGEST_FETCH_CAP_CHARS`` matches
     # the bus's HARD_MAX_CHARS=20000 clamp so we ask for
