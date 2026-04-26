@@ -101,6 +101,16 @@ DEFAULT_FEEDS: Dict[str, FeedConfig] = {
         url="https://developer.nvidia.com/blog/feed/",
         source="nvidia",
     ),
+    # Dev tooling + agentic patterns. github.blog is a high-signal
+    # source for Copilot announcements, Squad / agent skills,
+    # GitHub Actions changes, and security advisories that
+    # cross-reference into khonliang's PR-iteration loop. Was a gap
+    # surfaced by the 2026-04-26 architecture-review delta-pass.
+    "github_blog": FeedConfig(
+        name="The GitHub Blog",
+        url="https://github.blog/feed/",
+        source="github_blog",
+    ),
 }
 
 
