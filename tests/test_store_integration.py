@@ -100,6 +100,20 @@ async def test_stage_payload_generates_default_title_from_content():
 
 
 @pytest.mark.asyncio
+async def test_stage_payload_skips_leading_blank_lines_for_default_title():
+    """Markdown content often opens with a blank line before
+    the heading. ``partition("\\n")`` would have taken the
+    empty first line and produced ``"staged payload"`` as the
+    fallback title, hiding the real first content. The current
+    loop walks until it finds a non-empty stripped line.
+    """
+    agent = _MockAgent(response={"result": {"id": "art_a"}})
+    body = "\n\n# Real Title\n\nbody text"
+    await stage_payload(agent, {"content": body})
+    assert agent.calls[0]["args"]["title"] == "# Real Title"
+
+
+@pytest.mark.asyncio
 async def test_stage_payload_uses_explicit_title_when_provided():
     agent = _MockAgent(response={"result": {"id": "art_a"}})
     await stage_payload(agent, {
@@ -244,6 +258,31 @@ async def test_ingest_from_artifact_passes_through_store_not_found():
     )
     assert result == {"error": "artifact not found"}
     # Pipeline never reached.
+    assert pipeline.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_from_artifact_rejects_truncated_response():
+    """Store's REST surface caps reads at HARD_MAX_CHARS=20000;
+    larger artifacts come back with ``truncated=True`` and a
+    partial body. Ingesting that would produce an idea whose
+    claims/queries don't reflect the full source — surface a
+    clear error so the caller can wait on streaming support
+    rather than silently partially-ingesting.
+    """
+    agent = _MockAgent(response={"result": {
+        "artifact": {"id": "art_huge"},
+        "text": "first 20K of a much larger artifact",
+        "truncated": True,
+    }})
+    pipeline = _MockPipeline()
+    result = await ingest_from_artifact(
+        agent, pipeline, {"artifact_id": "art_huge"},
+    )
+    assert "error" in result
+    assert "truncated" in result["error"]
+    # Pipeline never reached — better to fail loudly than
+    # ingest a partial artifact and lie about completeness.
     assert pipeline.calls == []
 
 

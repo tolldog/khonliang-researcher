@@ -73,10 +73,15 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
         # Short content preview so the artifact has a human
         # name in ``artifact_list``. First non-empty stripped
         # line of the input, capped at 80 chars with an
-        # ellipsis. Single-pass to avoid materializing a full
-        # ``splitlines()`` list for large payloads.
-        first_line, _, _ = content.partition("\n")
-        preview = first_line.strip()
+        # ellipsis. Loop ensures a leading blank line doesn't
+        # produce an empty title — ``content.partition("\n")``
+        # always takes the first line, even if it's empty.
+        preview = ""
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped:
+                preview = stripped
+                break
         if len(preview) > 80:
             title = preview[:80] + "…"
         else:
@@ -158,6 +163,19 @@ async def ingest_from_artifact(
         return payload
     if not isinstance(payload, dict):
         return {"error": "store returned unexpected response shape"}
+    if payload.get("truncated") is True:
+        # Store / bus had to clamp the read at HARD_MAX_CHARS.
+        # Ingesting partial content would produce an idea
+        # whose claims and search queries don't reflect the
+        # full source — surface the truncation as a clean
+        # error so the caller can wait on streaming support
+        # (out of scope FR) or split the source upstream.
+        return {
+            "error": (
+                "store returned truncated content; "
+                "ingest_from_artifact requires the full body"
+            ),
+        }
     text = payload.get("text") or payload.get("body") or ""
     if not isinstance(text, str) or not text:
         return {"error": "store returned empty content"}
@@ -282,7 +300,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                     },
                     "source": {"type": "object", "default": {}},
                 },
-                since="0.5.0",
+                since="0.3.0",
             ),
             Skill(
                 "ingest_from_artifact",
@@ -300,7 +318,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                     "hints": {"type": "object", "default": {}},
                     "source_label": {"type": "string", "default": ""},
                 },
-                since="0.5.0",
+                since="0.3.0",
             ),
         ]
         for skill in extras:
