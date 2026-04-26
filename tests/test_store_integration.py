@@ -172,6 +172,21 @@ async def test_stage_payload_passes_through_store_error_envelope():
 
 
 @pytest.mark.asyncio
+async def test_stage_payload_accepts_nested_artifact_id_shape():
+    """Some artifact-create surfaces emit
+    ``{"artifact": {"id": ...}}`` instead of the flat
+    ``{"id": ...}`` shape (see LibrarianAgent._artifact_id for
+    the same-repo precedent). Tolerate both so a future store
+    surface tweak doesn't break the integration.
+    """
+    agent = _MockAgent(
+        response={"result": {"artifact": {"id": "art_nested", "kind": "staged_payload"}}},
+    )
+    result = await stage_payload(agent, {"content": "x"})
+    assert result == {"artifact_id": "art_nested"}
+
+
+@pytest.mark.asyncio
 async def test_stage_payload_handles_missing_id_in_response():
     """Defensive: a store that returns ``{}`` (without an
     ``id`` and without an ``error``) shouldn't claim success.
@@ -209,6 +224,38 @@ async def test_ingest_from_artifact_pulls_body_then_dispatches_to_pipeline():
     assert fetch["agent_type"] == "store"
     assert fetch["operation"] == "artifact_get"
     assert fetch["args"]["id"] == "art_x"
+
+
+@pytest.mark.asyncio
+async def test_ingest_from_artifact_accepts_content_field():
+    """Bus's ``/v1/artifacts/{id}/content`` route returns the
+    body under ``content``, not ``text``. Accept that shape so
+    surface variation doesn't turn a successful fetch into
+    "store returned empty content".
+    """
+    agent = _MockAgent(response={"result": {
+        "artifact": {"id": "art_x", "producer": "fetcher-a"},
+        "content": "raw bytes via content field",
+    }})
+    pipeline = _MockPipeline(idea_id="idea_99")
+    result = await ingest_from_artifact(agent, pipeline, {"artifact_id": "art_x"})
+    assert result["idea_id"] == "idea_99"
+    assert pipeline.calls == [("raw bytes via content field", "fetcher-a")]
+
+
+@pytest.mark.asyncio
+async def test_ingest_from_artifact_accepts_body_field():
+    """Historical alias — kept for backwards compat with any
+    callers that hand back ``{"body": ...}``.
+    """
+    agent = _MockAgent(response={"result": {
+        "artifact": {"id": "art_x"},
+        "body": "raw bytes via body field",
+    }})
+    pipeline = _MockPipeline(idea_id="idea_legacy")
+    result = await ingest_from_artifact(agent, pipeline, {"artifact_id": "art_x"})
+    assert result["idea_id"] == "idea_legacy"
+    assert pipeline.calls == [("raw bytes via body field", "")]
 
 
 @pytest.mark.asyncio

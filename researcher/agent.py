@@ -117,7 +117,18 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
         return payload
     if not isinstance(payload, dict):
         return {"error": "store returned unexpected response shape"}
+    # Tolerate both response shapes: a flat metadata dict
+    # (``LocalArtifactStore.create`` returns this today, with
+    # ``id`` at the top level) AND a nested
+    # ``{"artifact": {"id": ...}}`` envelope (the bus's REST
+    # ``view_response`` shape; other callers in the
+    # researcher repo already treat both as valid — see
+    # ``LibrarianAgent._artifact_id``).
     artifact_id = payload.get("id")
+    if not artifact_id:
+        nested = payload.get("artifact")
+        if isinstance(nested, dict):
+            artifact_id = nested.get("id")
     if not artifact_id:
         return {"error": "store created artifact without id"}
     return {"artifact_id": artifact_id}
@@ -178,7 +189,19 @@ async def ingest_from_artifact(
                 "ingest_from_artifact requires the full body"
             ),
         }
-    text = payload.get("text") or payload.get("body") or ""
+    # Accept any of ``text``, ``body``, ``content`` for the
+    # artifact body. Bus's ``view_response`` uses ``text``;
+    # ``/v1/artifacts/{id}/content`` puts the same payload
+    # under ``content``; ``body`` is a historical alias kept
+    # for backwards compatibility. Tolerating all three means
+    # a future store surface tweak doesn't quietly turn a
+    # successful fetch into "empty content" here.
+    text = (
+        payload.get("text")
+        or payload.get("body")
+        or payload.get("content")
+        or ""
+    )
     if not isinstance(text, str) or not text:
         return {"error": "store returned empty content"}
 
