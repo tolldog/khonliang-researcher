@@ -13,20 +13,29 @@ import pytest
 
 
 def test_librarian_welcome_is_populated():
-    """LibrarianAgent.WELCOME advertises role + entry_points."""
+    """LibrarianAgent.WELCOME advertises a complete cold-start surface."""
     try:
         from researcher.librarian_agent import LibrarianAgent
     except ImportError as exc:
-        # Pre-existing researcher-lib export gap (AmbiguityRecord);
-        # unrelated to welcome work — skip rather than red-fail.
-        pytest.skip(f"librarian_agent import fails on shared researcher-lib gap: {exc}")
+        # Narrow skip: only the known pre-existing researcher-lib export
+        # gap (AmbiguityRecord) is tolerated. Any other import failure —
+        # including welcome-side regressions that break this module —
+        # must red-fail so we notice.
+        if "AmbiguityRecord" in str(exc):
+            pytest.skip(f"pre-existing researcher-lib gap: {exc}")
+        raise
     w = LibrarianAgent.WELCOME
     assert w.role
     assert w.mission
+    assert w.not_responsible_for, "boundaries must list at least one excluded responsibility"
+    assert w.delegates_to, "librarian must declare at least one downstream delegate"
     assert w.entry_points
     advertised = {ep.skill for ep in w.entry_points}
     assert "taxonomy_report" in advertised
     assert "library_health" in advertised
+    for ep in w.entry_points:
+        assert ep.skill, "entry-point skill name must not be empty"
+        assert ep.when_to_use, f"entry-point '{ep.skill}' missing when_to_use"
 
 
 def test_researcher_welcome_is_populated_after_create_agent(monkeypatch, tmp_path):
@@ -36,7 +45,6 @@ def test_researcher_welcome_is_populated_after_create_agent(monkeypatch, tmp_pat
     uses ``BaseAgent.from_mcp()``, so the test mocks the heavier deps
     (pipeline + MCP server) and asserts the attached editorial.
     """
-    pytest.importorskip("khonliang_researcher")
     from khonliang_bus import Welcome
     from researcher import agent as agent_mod
 
@@ -73,6 +81,11 @@ def test_researcher_welcome_is_populated_after_create_agent(monkeypatch, tmp_pat
     assert isinstance(out.WELCOME, Welcome)
     assert out.WELCOME.role
     assert out.WELCOME.mission
+    assert out.WELCOME.not_responsible_for, "researcher must declare not_responsible_for"
+    assert out.WELCOME.delegates_to, "researcher must declare delegates_to"
     advertised = {ep.skill for ep in out.WELCOME.entry_points}
     assert "find_relevant" in advertised
     assert "brief_on" in advertised
+    for ep in out.WELCOME.entry_points:
+        assert ep.skill, "entry-point skill name must not be empty"
+        assert ep.when_to_use, f"entry-point '{ep.skill}' missing when_to_use"
