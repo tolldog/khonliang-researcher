@@ -24,7 +24,13 @@ def test_librarian_welcome_is_populated():
         if "AmbiguityRecord" in str(exc):
             pytest.skip(f"pre-existing researcher-lib gap: {exc}")
         raise
+    from khonliang_bus import Welcome
+
     w = LibrarianAgent.WELCOME
+    assert isinstance(w, Welcome), (
+        "WELCOME must be a Welcome instance — handle_welcome relies on "
+        "the dataclass shape and will raise TypeError for anything else."
+    )
     assert w.role
     assert w.mission
     assert w.not_responsible_for, "boundaries must list at least one excluded responsibility"
@@ -86,6 +92,11 @@ def test_researcher_welcome_is_populated_after_create_agent(monkeypatch, tmp_pat
     advertised = {ep.skill for ep in out.WELCOME.entry_points}
     assert "find_relevant" in advertised
     assert "brief_on" in advertised
+    assert out.WELCOME.guide_skill == "research_guide", (
+        "researcher must advertise research_guide as its guide_skill — "
+        "the welcome FR's acceptance criterion expects this pointer to "
+        "deeper context."
+    )
     for ep in out.WELCOME.entry_points:
         assert ep.skill, "entry-point skill name must not be empty"
         assert ep.when_to_use, f"entry-point '{ep.skill}' missing when_to_use"
