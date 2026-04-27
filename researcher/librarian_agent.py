@@ -13,7 +13,7 @@ from dataclasses import asdict
 from typing import Any
 
 from khonliang.knowledge.store import EntryStatus, Tier
-from khonliang_bus import BaseAgent, Skill, handler
+from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint, handler
 from khonliang_bus.connector import BusConnector
 from khonliang_researcher import (
     AmbiguityRecord,
@@ -36,6 +36,49 @@ logger = logging.getLogger(__name__)
 class LibrarianAgent(BaseAgent):
     agent_type = "librarian"
     module_name = "researcher.librarian_agent"
+
+    # Cold-start orientation surface (fr_khonliang-bus-lib_6a82732c).
+    # Read by ephemeral external LLM sessions via the welcome skill.
+    WELCOME = Welcome(
+        role="corpus health + taxonomy authority",
+        mission=(
+            "Curates the durable library — classification, neighborhoods, "
+            "taxonomy, gap identification, investigation promotion. "
+            "Researcher ingests; librarian organizes. Co-resident in the "
+            "researcher repo today; future extraction into a standalone "
+            "repo is queued."
+        ),
+        not_responsible_for=[
+            "paper / RSS / GitHub ingestion (researcher.fetch_paper / brief_on)",
+            "evidence retrieval and synthesis (researcher.find_relevant / brief_on)",
+            "FR / spec / milestone lifecycle (developer)",
+        ],
+        delegates_to={
+            "researcher": "ingest + retrieval + synthesis + distillation",
+        },
+        entry_points=[
+            WelcomeEntryPoint(
+                skill="taxonomy_report",
+                when_to_use="browse the durable library taxonomy — buckets, codes, entities",
+            ),
+            WelcomeEntryPoint(
+                skill="library_health",
+                when_to_use="summary of coverage, freshness, classified-vs-pending counts, ambiguity / gap totals",
+            ),
+            WelcomeEntryPoint(
+                skill="identify_gaps",
+                when_to_use="find under-covered taxonomy branches; emits research-request events for ingestion",
+            ),
+            WelcomeEntryPoint(
+                skill="classify_paper",
+                when_to_use="assign or refresh a stable library classification for a single paper",
+            ),
+            WelcomeEntryPoint(
+                skill="rebuild_neighborhoods",
+                when_to_use="deterministic taxonomy / neighborhood rebuild after batch ingest",
+            ),
+        ],
+    )
 
     def __init__(self, **kwargs: Any):
         super().__init__(**kwargs)

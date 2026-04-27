@@ -28,7 +28,7 @@ import os
 import sys
 from types import MethodType
 
-from khonliang_bus import BaseAgent, Skill
+from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint
 from khonliang_bus.connector import BusConnector
 
 from researcher.ingest_watcher import IngestWatcherRegistry, IngestWatcherStore
@@ -340,6 +340,54 @@ def create_researcher_agent(
         agent.version = version("khonliang-researcher")
     except Exception:
         agent.version = "0.0.0"
+
+    # Cold-start orientation surface (fr_khonliang-bus-lib_6a82732c).
+    # ``BaseAgent.from_mcp`` returns a BaseAgent instance, not a subclass,
+    # so we set WELCOME as an instance attribute (Python resolves
+    # instance-attr before class-attr — handle_welcome reads self.WELCOME).
+    agent.WELCOME = Welcome(
+        role="ingest + corpus authority",
+        mission=(
+            "Ingests external knowledge — papers, RSS feeds, GitHub repos, "
+            "free-form text — and distills it into a queryable corpus. "
+            "Surfaces evidence on demand for any consumer agent. Corpus "
+            "health and taxonomy belong to librarian; FR lifecycle belongs "
+            "to developer."
+        ),
+        not_responsible_for=[
+            "FR / spec / milestone lifecycle (developer)",
+            "corpus classification + taxonomy (librarian)",
+            "code review (reviewer)",
+        ],
+        delegates_to={
+            "developer": "FR / spec / milestone lifecycle changes",
+            "librarian": "classification, taxonomy, neighborhoods, gaps",
+            "store": "artifact-mediated large payloads (stage_payload / ingest_from_artifact)",
+        },
+        entry_points=[
+            WelcomeEntryPoint(
+                skill="brief_on",
+                when_to_use="topic-in-context brief over the corpus — multi-query retrieval, reuses distilled summaries",
+            ),
+            WelcomeEntryPoint(
+                skill="find_relevant",
+                when_to_use="embedding-based corpus search by topic; filter by project relevance",
+            ),
+            WelcomeEntryPoint(
+                skill="fetch_paper",
+                when_to_use="ingest a paper / blog post / arxiv URL into the corpus",
+            ),
+            WelcomeEntryPoint(
+                skill="stage_payload",
+                when_to_use="persist raw ingest content as a store artifact for ingest_from_artifact later",
+            ),
+            WelcomeEntryPoint(
+                skill="distill_paper",
+                when_to_use="run LLM distillation on a stored paper — produces summary + triples + applicability",
+            ),
+        ],
+        guide_skill="research_guide",
+    )
 
     logger.info(
         "Researcher agent %s created with %d skills",
