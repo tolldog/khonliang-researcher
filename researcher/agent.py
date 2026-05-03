@@ -31,6 +31,7 @@ from types import MethodType
 from khonliang_bus import BaseAgent, Skill
 from khonliang_bus.connector import BusConnector
 
+from researcher.ingest_jobs import IngestJobStore, run_ingest_job
 from researcher.ingest_watcher import IngestWatcherRegistry, IngestWatcherStore
 
 logger = logging.getLogger(__name__)
@@ -413,6 +414,49 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 },
                 since="0.3.0",
             ),
+            Skill(
+                "ingest_github_async",
+                "Schedule a GitHub-repo ingest as a background job. "
+                "Returns {job_id, accepted_at} immediately; progress "
+                "fires on bus topic 'research.ingest.progress'. Poll "
+                "with ingest_status(job_id) for direct lookup. "
+                "fr_researcher_2b22a2f3 + fr_researcher_bbf3cf69.",
+                {
+                    "repo_url": {"type": "string", "required": True},
+                    "label": {"type": "string", "default": ""},
+                    "depth": {"type": "string", "default": "readme+code"},
+                },
+                since="0.4.0",
+            ),
+            Skill(
+                "ingest_file_async",
+                "Schedule a local-file ingest as a background job. "
+                "Returns {job_id, accepted_at} immediately; progress "
+                "fires on 'research.ingest.progress'.",
+                {"path": {"type": "string", "required": True}},
+                since="0.4.0",
+            ),
+            Skill(
+                "ingest_idea_async",
+                "Schedule an idea-text ingest as a background job. "
+                "Returns {job_id, accepted_at} immediately; progress "
+                "fires on 'research.ingest.progress'.",
+                {
+                    "text": {"type": "string", "required": True},
+                    "source_label": {"type": "string", "default": ""},
+                },
+                since="0.4.0",
+            ),
+            Skill(
+                "ingest_status",
+                "Look up an async ingest job's current phase, "
+                "progress_pct, started_at, completed_at, result, "
+                "and history. Returns {error: 'not found'} when the "
+                "job_id is unknown (in-flight jobs always exist; only "
+                "old completed jobs are evicted under retention).",
+                {"job_id": {"type": "string", "required": True}},
+                since="0.4.0",
+            ),
         ]
         for skill in extras:
             if skill.name not in names:
@@ -456,6 +500,118 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
 
     async def handle_ingest_from_artifact(self, args):
         return await ingest_from_artifact(self, pipeline, args)
+
+    def _get_job_store(self) -> IngestJobStore:
+        store = getattr(self, "_ingest_job_store", None)
+        if store is None:
+            store = IngestJobStore()
+            self._ingest_job_store = store
+        return store
+
+    async def _spawn_ingest_job(self, skill: str, args: dict, work):
+        """Common scaffolding for the three ingest_*_async skills.
+
+        Creates a JobRecord, schedules ``run_ingest_job`` as a fire-
+        and-forget task, and returns ``{job_id, accepted_at, skill}``
+        immediately. ``work`` is an ``async (progress) -> dict``
+        coroutine that does the actual ingest and may call
+        ``progress(phase, progress_pct=..., detail=...)`` at phase
+        boundaries to fire ``research.ingest.progress`` bus events.
+        """
+        store = self._get_job_store()
+        job = await store.create(skill, args)
+
+        async def driver():
+            await run_ingest_job(store, self.publish, job, work)
+
+        # Schedule but don't await — the caller gets the job_id back
+        # immediately. The task is not tracked beyond logging because
+        # progress events + ingest_status are the supervision surface.
+        asyncio.create_task(driver(), name=f"ingest-job-{job.job_id}")
+        return {
+            "job_id": job.job_id,
+            "skill": job.skill,
+            "accepted_at": job.accepted_at,
+        }
+
+    async def handle_ingest_github_async(self, args):
+        repo_url = str(args.get("repo_url", "")).strip()
+        if not repo_url:
+            return {"error": "repo_url is required"}
+        label = str(args.get("label", ""))
+        depth = str(args.get("depth", "readme+code"))
+
+        async def work(progress):
+            return await pipeline.ingest_github_repo(
+                repo_url, label=label, depth=depth,
+                progress_callback=progress,
+            )
+
+        return await self._spawn_ingest_job(
+            "ingest_github", {"repo_url": repo_url, "label": label, "depth": depth}, work,
+        )
+
+    async def handle_ingest_file_async(self, args):
+        path = str(args.get("path", "")).strip()
+        if not path:
+            return {"error": "path is required"}
+
+        async def work(progress):
+            from researcher.fetcher import fetch_file
+            await progress("distilling", progress_pct=20)
+            result = await fetch_file(path)
+            await progress("storing", progress_pct=70)
+            if not result.content.strip():
+                return {"warning": f"no text content extracted from: {path}"}
+            import hashlib
+            from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+            entry_id = hashlib.sha256(path.encode()).hexdigest()[:16]
+            entry = KnowledgeEntry(
+                id=entry_id,
+                tier=Tier.IMPORTED,
+                title=result.title or path,
+                content=result.content,
+                source=result.url,
+                scope="research",
+                tags=["paper", f"format:{result.format.value}"],
+                status=EntryStatus.INGESTED,
+                metadata={
+                    "url": result.url,
+                    "format": result.format.value,
+                    "fetched_at": result.fetched_at,
+                    **result.metadata,
+                },
+            )
+            pipeline.knowledge.add(entry)
+            return {"entry_id": entry_id, "title": entry.title, "format": result.format.value}
+
+        return await self._spawn_ingest_job("ingest_file", {"path": path}, work)
+
+    async def handle_ingest_idea_async(self, args):
+        text = str(args.get("text", ""))
+        if not text.strip():
+            return {"error": "text is required"}
+        source_label = str(args.get("source_label", ""))
+
+        async def work(progress):
+            await progress("distilling", progress_pct=30)
+            idea_id = await pipeline.ingest_idea(text, source_label)
+            await progress("storing", progress_pct=80)
+            return {"idea_id": idea_id, "source_label": source_label}
+
+        return await self._spawn_ingest_job(
+            "ingest_idea", {"source_label": source_label}, work,
+        )
+
+    async def handle_ingest_status(self, args):
+        job_id = str(args.get("job_id", "")).strip()
+        if not job_id:
+            return {"error": "job_id is required"}
+        store = self._get_job_store()
+        job = await store.get(job_id)
+        if job is None:
+            return {"error": "not found", "job_id": job_id}
+        return job.to_status()
 
     async def start(self):
         skills = self._all_skills()
@@ -519,6 +675,12 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["stop_ingest_watcher"] = MethodType(handle_stop_ingest_watcher, agent)
     agent._handlers["stage_payload"] = MethodType(handle_stage_payload, agent)
     agent._handlers["ingest_from_artifact"] = MethodType(handle_ingest_from_artifact, agent)
+    agent._handlers["ingest_github_async"] = MethodType(handle_ingest_github_async, agent)
+    agent._handlers["ingest_file_async"] = MethodType(handle_ingest_file_async, agent)
+    agent._handlers["ingest_idea_async"] = MethodType(handle_ingest_idea_async, agent)
+    agent._handlers["ingest_status"] = MethodType(handle_ingest_status, agent)
+    agent._get_job_store = MethodType(_get_job_store, agent)
+    agent._spawn_ingest_job = MethodType(_spawn_ingest_job, agent)
     agent.start = MethodType(start, agent)
     agent.shutdown = MethodType(shutdown, agent)
 

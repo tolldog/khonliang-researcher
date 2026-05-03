@@ -16,7 +16,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import yaml
 
@@ -1142,15 +1142,32 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
 
     async def ingest_github_repo(
         self, repo_url: str, label: str = "", depth: str = "readme+code",
+        progress_callback: Optional[Callable[..., Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """Cleanroom ingest a GitHub repo: clone, AST-scan, store concepts, delete clone.
 
         Stores distilled capabilities and architecture as concepts — no code is retained.
         depth: "readme" (README only), "readme+code" (AST scan), "full" (README + code + docs)
+
+        ``progress_callback`` (optional, async) is invoked at phase
+        boundaries (cloning → ast_scanning → storing). Used by the
+        async-job wrapper (``researcher/ingest_jobs.py``) to publish
+        ``research.ingest.progress`` bus events. Default ``None``
+        keeps the synchronous path zero-cost and backward-compatible.
+        Each call passes ``phase`` (str) and ``progress_pct`` (int);
+        callback failures are not propagated.
         """
         import hashlib
         from researcher.synthesizer import Synthesizer
         from researcher.util import RepoTreeError, github_repo_key, repo_tree
+
+        async def _emit(phase: str, progress_pct: int) -> None:
+            if progress_callback is None:
+                return
+            try:
+                await progress_callback(phase=phase, progress_pct=progress_pct)
+            except Exception:  # pragma: no cover — callback is best-effort
+                logger.warning("progress_callback failed at phase=%s", phase, exc_info=True)
 
         try:
             repo_key = github_repo_key(repo_url)
@@ -1160,6 +1177,7 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
             return {"error": f"Invalid GitHub URL: {repo_url}"}
         entry_id = f"ghrepo_{hashlib.sha256(repo_key.encode()).hexdigest()[:12]}"
 
+        await _emit("cloning", 10)
         try:
             with repo_tree(repo_url, prefix="researcher_gh_") as repo_path:
                 # Extract package metadata
@@ -1185,6 +1203,7 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                     readme_claims = await self._extract_readme_claims(readme)
 
                 if depth in ("readme+code", "full"):
+                    await _emit("ast_scanning", 35)
                     # AST scan — same as scan_codebase but on temp dir
                     synth = Synthesizer(self.knowledge, self.triples, self.pool)
                     result = await synth.scan_codebase(
@@ -1259,6 +1278,7 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                 if doc_summary:
                     summary_parts.append(f"Documentation: {doc_summary[:1000]}")
 
+                await _emit("storing", 75)
                 # Store as knowledge entry
                 entry = KnowledgeEntry(
                     id=entry_id,
