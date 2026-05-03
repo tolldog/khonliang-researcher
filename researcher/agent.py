@@ -625,11 +625,24 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     _VALID_INGEST_DEPTHS = ("readme", "readme+code", "full")
 
     async def handle_ingest_github_async(self, args):
-        repo_url = str(args.get("repo_url", "")).strip()
+        # ``isinstance(str)``-validate at the API boundary rather
+        # than ``str()``-coerce. ``str(None)`` / ``str(123)`` would
+        # otherwise enqueue a job for the literal stringified value;
+        # other handlers in this module (``stage_payload``,
+        # ``ingest_from_artifact``) already do the strict check.
+        repo_url = args.get("repo_url", "")
+        if not isinstance(repo_url, str):
+            return {"error": f"repo_url must be a string, got {type(repo_url).__name__}"}
+        repo_url = repo_url.strip()
         if not repo_url:
             return {"error": "repo_url is required"}
-        label = str(args.get("label", ""))
-        depth = str(args.get("depth", "readme+code")).strip()
+        label = args.get("label", "")
+        if not isinstance(label, str):
+            return {"error": f"label must be a string, got {type(label).__name__}"}
+        depth = args.get("depth", "readme+code")
+        if not isinstance(depth, str):
+            return {"error": f"depth must be a string, got {type(depth).__name__}"}
+        depth = depth.strip()
         # Validate at the API boundary so a typo or surrounding
         # whitespace doesn't silently degrade to README-only ingest
         # while still reporting back as if the requested depth were
@@ -663,7 +676,10 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         )
 
     async def handle_ingest_file_async(self, args):
-        path = str(args.get("path", "")).strip()
+        path = args.get("path", "")
+        if not isinstance(path, str):
+            return {"error": f"path must be a string, got {type(path).__name__}"}
+        path = path.strip()
         if not path:
             return {"error": "path is required"}
 
@@ -751,7 +767,15 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         )
 
     async def handle_ingest_status(self, args):
-        job_id = str(args.get("job_id", "")).strip()
+        # Strict isinstance — ``None`` / ``{}`` / ``123`` should
+        # surface as a validation error, not get silently coerced
+        # to a non-existent job_id and report ``{"error": "not
+        # found"}``. That ambiguity made caller bugs
+        # indistinguishable from a genuinely missing job.
+        job_id = args.get("job_id", "")
+        if not isinstance(job_id, str):
+            return {"error": f"job_id must be a string, got {type(job_id).__name__}"}
+        job_id = job_id.strip()
         if not job_id:
             return {"error": "job_id is required"}
         store = self._get_job_store()

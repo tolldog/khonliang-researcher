@@ -1154,8 +1154,17 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         async-job wrapper (``researcher/ingest_jobs.py``) to publish
         ``research.ingest.progress`` bus events. Default ``None``
         keeps the synchronous path zero-cost and backward-compatible.
-        Each call passes ``phase`` (str) and ``progress_pct`` (int);
-        callback failures are not propagated.
+        Each call passes ``phase`` (str) and ``progress_pct`` (int).
+
+        Failure semantics: ordinary callback exceptions are caught
+        and logged but DO NOT propagate (best-effort).
+        ``asyncio.CancelledError`` is the one exception that DOES
+        propagate — a cancelled callback (e.g. connector
+        mid-shutdown) cancels the ingest cleanly so the asyncio
+        runtime can finalise the task. Callers that need true
+        fire-and-forget should swallow ``CancelledError`` in their
+        callback, but the ``ingest_jobs`` wrapper deliberately
+        re-raises so the JobRecord lands in ``phase=error``.
         """
         import hashlib
         from researcher.synthesizer import Synthesizer

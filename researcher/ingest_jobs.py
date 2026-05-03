@@ -310,22 +310,45 @@ async def run_ingest_job(
             detail={"result_keys": sorted(result.keys())},
         )
     except asyncio.CancelledError:
-        # Graceful shutdown / explicit cancel: record the cancel on
-        # the job and re-raise so the asyncio runtime can finalise
-        # the task properly. Subscribers see ``phase=error`` with
-        # the cancellation message. ``progress("error")`` itself
-        # might also be cancelled — wrap defensively so the
-        # ``set_error`` happens regardless and the JobRecord
-        # always lands in a terminal phase even if no progress
-        # event fires.
+        # Cancellation can hit at any point in the body. We need
+        # to distinguish "work failed mid-flight" (record error)
+        # from "work succeeded, cancellation hit during the
+        # bookkeeping tail" (don't downgrade to error — the
+        # entry was actually persisted).
+        #
+        # ``store.set_result`` runs after ``work()`` returns
+        # successfully; if the JobRecord's ``result`` is non-None
+        # at the cancel point, the work outcome is durable and
+        # marking ``phase=error`` would lie to subscribers.
+        #
+        # ``progress("done")`` calls ``store.transition`` BEFORE
+        # ``_publish_progress``; if the publish call raises
+        # CancelledError, ``phase`` is already ``"done"`` on the
+        # JobRecord. Same case as above — don't reclassify.
+        current = await store.get(job.job_id)
+        if current is not None and (
+            current.phase == "done" or current.result is not None
+        ):
+            # Mid-bookkeeping cancel after a successful work().
+            # If the phase is still "started" / a custom phase
+            # (set_result ran, progress("done") didn't), finalise
+            # to done so subscribers see a terminal phase that
+            # reflects reality.
+            if current.phase != "done":
+                await store.transition(
+                    job.job_id, phase="done", progress_pct=100,
+                )
+            raise
+
+        # Work didn't complete: record the cancellation. ``progress``
+        # itself may also be cancelled while emitting the error
+        # event; fall back to a direct phase transition so the
+        # JobRecord always lands terminal.
         logger.info("ingest job %s cancelled", job.job_id)
         await store.set_error(job.job_id, "CancelledError: cancelled")
         try:
             await progress("error")
         except asyncio.CancelledError:
-            # Best-effort: the JobRecord is already at error via
-            # set_error above; still need to record the phase
-            # transition so ingest_status reports terminal.
             await store.transition(job.job_id, phase="error")
         raise
     except Exception as e:

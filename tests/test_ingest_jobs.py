@@ -271,6 +271,43 @@ def test_progress_topic_is_canonical():
 
 
 @pytest.mark.asyncio
+async def test_run_ingest_job_cancel_during_done_publish_keeps_phase_done():
+    """If ``CancelledError`` lands during the FINAL
+    ``progress("done")`` publish — work() already succeeded, the
+    JobRecord already has ``phase=done`` and ``result`` populated —
+    the cancel handler must NOT downgrade to ``phase=error``.
+    Doing so would lie to subscribers about the persistence
+    outcome (the entry IS saved). Same shape: a cancel that
+    arrives between ``set_result`` and ``progress("done")`` should
+    still finalise to ``done`` since the durable write happened."""
+    store = IngestJobStore()
+    job = await store.create("ingest_idea", {})
+
+    publish_calls: list = []
+
+    async def cancel_after_done(topic, payload):
+        publish_calls.append(payload["phase"])
+        if payload["phase"] == "done":
+            # Work succeeded; cancel hits during the done event's
+            # publish AFTER store.transition(phase=done) already ran.
+            raise asyncio.CancelledError()
+
+    async def work(progress):
+        return {"idea_id": "ok"}
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_ingest_job(store, cancel_after_done, job, work)
+
+    fresh = await store.get(job.job_id)
+    assert fresh.phase == "done", (
+        f"work() succeeded — cancel during done-publish must not "
+        f"reclassify to error; got phase={fresh.phase!r}"
+    )
+    assert fresh.result == {"idea_id": "ok"}
+    assert fresh.error is None
+
+
+@pytest.mark.asyncio
 async def test_run_ingest_job_cancel_during_started_emit_still_terminates():
     """If ``CancelledError`` fires while ``progress("started")``
     itself is awaiting (e.g. the publish call mid-cancel), the

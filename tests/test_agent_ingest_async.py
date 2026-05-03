@@ -217,6 +217,49 @@ async def test_github_async_repo_url_required():
     assert out == {"error": "repo_url is required"}
 
 
+@pytest.mark.asyncio
+async def test_github_async_strict_isinstance_validation():
+    """``str()``-coercing ``repo_url`` / ``label`` / ``depth`` would
+    silently accept ``None`` / ``123`` / ``{...}`` and enqueue a
+    job for the literal stringified value. Validate at the API
+    boundary so caller bugs surface synchronously."""
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+    for bad in (None, 123, {"a": 1}, ["x"]):
+        out = await agent._handlers["ingest_github_async"]({"repo_url": bad})
+        assert "must be a string" in out.get("error", ""), out
+        out = await agent._handlers["ingest_github_async"]({
+            "repo_url": "https://github.com/o/r", "label": bad,
+        })
+        assert "must be a string" in out.get("error", ""), out
+        out = await agent._handlers["ingest_github_async"]({
+            "repo_url": "https://github.com/o/r", "depth": bad,
+        })
+        assert "must be a string" in out.get("error", ""), out
+
+
+@pytest.mark.asyncio
+async def test_file_async_strict_isinstance_validation():
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+    for bad in (None, 123, {"a": 1}, ["x"]):
+        out = await agent._handlers["ingest_file_async"]({"path": bad})
+        assert "must be a string" in out.get("error", ""), out
+
+
+@pytest.mark.asyncio
+async def test_status_strict_isinstance_validation():
+    """``ingest_status({"job_id": None})`` previously coerced to
+    the string ``"None"`` and returned ``{"error": "not found"}``,
+    making caller bugs indistinguishable from a genuinely missing
+    job. Reject non-string job_id with a validation error."""
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+    for bad in (None, 123, {"a": 1}, ["x"]):
+        out = await agent._handlers["ingest_status"]({"job_id": bad})
+        assert "must be a string" in out.get("error", ""), out
+
+
 # ---------------------------------------------------------------------------
 # ingest_idea_async
 # ---------------------------------------------------------------------------
@@ -484,8 +527,13 @@ async def test_in_flight_jobs_are_cancelled_when_agent_tasks_are_cancelled():
     cancellation message, then re-raises so the asyncio runtime
     finalises the task properly."""
     leave = asyncio.Event()
+    entered = asyncio.Event()
 
     async def parking_ingest(repo_url, label="", depth="readme+code", progress_callback=None):
+        # Signal entry deterministically so the test can advance
+        # without a wall-clock sleep — ``await asyncio.sleep(0.05)``
+        # is flaky on slow CI runners.
+        entered.set()
         await leave.wait()
         return {"repo": repo_url, "entry_id": "never-reached"}
 
@@ -495,8 +543,8 @@ async def test_in_flight_jobs_are_cancelled_when_agent_tasks_are_cancelled():
     accepted = await agent._handlers["ingest_github_async"]({
         "repo_url": "https://github.com/o/r",
     })
-    # Let the worker enter ``leave.wait()``.
-    await asyncio.sleep(0.05)
+    # Wait deterministically for the worker to enter parking_ingest.
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
     tasks = list(agent._ingest_tasks)
     assert len(tasks) == 1
     assert not tasks[0].done()
@@ -528,9 +576,13 @@ async def test_queued_jobs_are_cancelled_correctly_when_blocked_on_semaphore():
     ``phase=error`` with the cancellation message.
     """
     leave_a = asyncio.Event()
+    a_entered = asyncio.Event()
 
     async def parking_ingest(repo_url, label="", depth="readme+code", progress_callback=None):
-        # Job A holds the only slot until the test releases it.
+        # Signal entry deterministically so the test knows A
+        # holds the semaphore (and B must be queued behind it)
+        # without a wall-clock sleep.
+        a_entered.set()
         await leave_a.wait()
         return {"repo": repo_url, "entry_id": "a"}
 
@@ -541,8 +593,9 @@ async def test_queued_jobs_are_cancelled_correctly_when_blocked_on_semaphore():
     a = await agent._handlers["ingest_github_async"]({"repo_url": "https://github.com/o/a"})
     b = await agent._handlers["ingest_github_async"]({"repo_url": "https://github.com/o/b"})
 
-    # Let A enter the semaphore (it parks on leave_a). B is queued.
-    await asyncio.sleep(0.05)
+    # Wait deterministically for A to enter parking_ingest. B is
+    # therefore queued on the size-1 semaphore.
+    await asyncio.wait_for(a_entered.wait(), timeout=2.0)
     a_status = await agent._handlers["ingest_status"]({"job_id": a["job_id"]})
     b_status = await agent._handlers["ingest_status"]({"job_id": b["job_id"]})
     assert a_status["phase"] in ("started", "cloning", "ast_scanning", "storing")
