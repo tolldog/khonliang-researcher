@@ -288,17 +288,45 @@ async def run_ingest_job(
         if updated is not None:
             await _publish_progress(publish, updated, detail=detail)
 
-    await progress("started", progress_pct=0)
+    # The try/except spans EVERY await — including the
+    # ``progress("started")``, ``store.set_result``, and
+    # ``progress("done")`` calls — not just ``work()``. A
+    # ``CancelledError`` raised at any of those points (e.g.
+    # connector mid-shutdown cancels the publish) would otherwise
+    # bypass the error-path bookkeeping and leave the JobRecord
+    # stuck at the last successful transition (``accepted`` if
+    # ``progress("started")`` itself was the cancelled await).
+    # ``ingest_status`` callers would then poll a non-terminal
+    # phase indefinitely. Wrapping the whole body forces the
+    # cancellation through the same ``set_error`` + emit-error
+    # path as a mid-work cancel.
     try:
+        await progress("started", progress_pct=0)
         result = await work(progress)
+        await store.set_result(job.job_id, result)
+        await progress(
+            "done",
+            progress_pct=100,
+            detail={"result_keys": sorted(result.keys())},
+        )
     except asyncio.CancelledError:
         # Graceful shutdown / explicit cancel: record the cancel on
         # the job and re-raise so the asyncio runtime can finalise
         # the task properly. Subscribers see ``phase=error`` with
-        # the cancellation message.
+        # the cancellation message. ``progress("error")`` itself
+        # might also be cancelled — wrap defensively so the
+        # ``set_error`` happens regardless and the JobRecord
+        # always lands in a terminal phase even if no progress
+        # event fires.
         logger.info("ingest job %s cancelled", job.job_id)
         await store.set_error(job.job_id, "CancelledError: cancelled")
-        await progress("error")
+        try:
+            await progress("error")
+        except asyncio.CancelledError:
+            # Best-effort: the JobRecord is already at error via
+            # set_error above; still need to record the phase
+            # transition so ingest_status reports terminal.
+            await store.transition(job.job_id, phase="error")
         raise
     except Exception as e:
         # ``logger.warning`` (no stack) rather than
@@ -314,5 +342,3 @@ async def run_ingest_job(
         await store.set_error(job.job_id, f"{type(e).__name__}: {e}")
         await progress("error")
         return
-    await store.set_result(job.job_id, result)
-    await progress("done", progress_pct=100, detail={"result_keys": sorted(result.keys())})

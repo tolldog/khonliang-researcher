@@ -711,15 +711,39 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         return await self._spawn_ingest_job("ingest_file", {"path": path}, work)
 
     async def handle_ingest_idea_async(self, args):
-        text = str(args.get("text", ""))
+        # Validate type explicitly rather than ``str()``-coercing.
+        # ``str(123)`` / ``str(None)`` would otherwise silently
+        # enqueue a job with a bogus body — the other handlers in
+        # this module (``stage_payload``, ``ingest_from_artifact``)
+        # already do isinstance checks; align with them.
+        text = args.get("text", "")
+        if not isinstance(text, str):
+            return {"error": f"text must be a string, got {type(text).__name__}"}
         if not text.strip():
             return {"error": "text is required"}
-        source_label = str(args.get("source_label", ""))
+        source_label = args.get("source_label", "")
+        if not isinstance(source_label, str):
+            return {
+                "error": (
+                    f"source_label must be a string, got "
+                    f"{type(source_label).__name__}"
+                ),
+            }
 
         async def work(progress):
+            # ``pipeline.ingest_idea`` performs both distill AND
+            # store atomically — by the time it returns, the
+            # KnowledgeEntry is already persisted. Emit
+            # ``storing`` BEFORE the call so the phase represents
+            # intent ("we're about to write") rather than past
+            # tense ("we wrote, this event is informational").
+            # Emitting ``storing`` AFTER the persist would mean a
+            # cancellation between the persist and the event
+            # marks ``phase=error`` even though the idea was
+            # actually saved — false-failure for the caller.
             await progress("distilling", progress_pct=30)
-            idea_id = await pipeline.ingest_idea(text, source_label)
             await progress("storing", progress_pct=80)
+            idea_id = await pipeline.ingest_idea(text, source_label)
             return {"idea_id": idea_id, "source_label": source_label}
 
         return await self._spawn_ingest_job(

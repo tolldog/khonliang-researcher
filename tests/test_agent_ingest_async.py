@@ -248,6 +248,49 @@ async def test_idea_async_text_required():
     assert out == {"error": "text is required"}
 
 
+@pytest.mark.asyncio
+async def test_idea_async_text_must_be_string_not_other_type():
+    """Bare ``str()``-coerce of ``args.get("text")`` would happily
+    accept ``None`` or ``123`` and enqueue a bogus job. Validate
+    ``isinstance(str)`` at the API boundary so a caller passing the
+    wrong type sees the rejection synchronously."""
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+    for bad in (None, 123, ["a list"], {"a": "dict"}):
+        out = await agent._handlers["ingest_idea_async"]({"text": bad})
+        assert "error" in out
+        assert "must be a string" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_idea_async_storing_phase_fires_before_persist(monkeypatch):
+    """``pipeline.ingest_idea`` performs the persist atomically — by
+    the time it returns, the KnowledgeEntry has been written. The
+    ``storing`` phase event must fire BEFORE that call so it
+    accurately represents intent. A cancellation between
+    ``storing`` and the persist would otherwise mark
+    ``phase=error`` for an idea that was actually saved (false
+    failure for the caller)."""
+    seen_phases: list = []
+
+    async def fake_ingest_idea(text, source_label=""):
+        # By this point ``storing`` MUST already be in the history.
+        seen_phases.append("ingest_idea_running")
+        return "idea_xyz"
+
+    pipeline = _make_pipeline(stub_ingest_idea=fake_ingest_idea)
+    agent = _build_fake_agent(pipeline)
+    accepted = await agent._handlers["ingest_idea_async"]({"text": "claim"})
+    status = await _await_terminal(agent, accepted["job_id"])
+    assert status["phase"] == "done"
+    phases = [h["phase"] for h in status["history"]]
+    # ``storing`` appears in history BEFORE the worker completes
+    # — the contract under test.
+    assert phases.index("storing") < phases.index("done")
+    # The fake ingest_idea ran exactly once after the storing event.
+    assert seen_phases == ["ingest_idea_running"]
+
+
 # ---------------------------------------------------------------------------
 # ingest_file_async (file-specific behavior — fetch errors, empty content)
 # ---------------------------------------------------------------------------

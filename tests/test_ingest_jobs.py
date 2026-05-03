@@ -268,3 +268,33 @@ def test_terminal_phases_are_constants():
 
 def test_progress_topic_is_canonical():
     assert PROGRESS_TOPIC == "research.ingest.progress"
+
+
+@pytest.mark.asyncio
+async def test_run_ingest_job_cancel_during_started_emit_still_terminates():
+    """If ``CancelledError`` fires while ``progress("started")``
+    itself is awaiting (e.g. the publish call mid-cancel), the
+    JobRecord must still land in a terminal phase. Earlier code
+    only wrapped ``work()`` in the try/except, so a cancel here
+    bypassed bookkeeping and left the record at ``phase=accepted``
+    indefinitely — ``ingest_status`` callers would poll forever."""
+    store = IngestJobStore()
+    job = await store.create("ingest_idea", {})
+
+    publish_calls = {"n": 0}
+
+    async def cancel_on_first_publish(topic, payload):
+        publish_calls["n"] += 1
+        if publish_calls["n"] == 1:
+            # Simulate the connector being cancelled mid-publish.
+            raise asyncio.CancelledError()
+
+    async def work(progress):  # never reached if started is cancelled
+        return {"idea_id": "never"}
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_ingest_job(store, cancel_on_first_publish, job, work)
+
+    fresh = await store.get(job.job_id)
+    assert fresh.phase == "error"
+    assert "Cancelled" in (fresh.error or "")
