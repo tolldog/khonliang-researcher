@@ -164,8 +164,24 @@ async def test_github_async_invalid_depth_rejected_at_api_boundary():
     """A typo or surrounding whitespace in ``depth`` must NOT silently
     degrade to README-only ingest while still reporting back the
     caller's invalid value as if it were honoured. Validate before
-    spawn, return ``{"error": ...}`` synchronously."""
+    spawn, return ``{"error": ...}`` synchronously.
+
+    Stronger assertion: ``ingest_status`` returning ``not found`` for
+    a probe id is true regardless of whether a job was secretly
+    spawned, so it's a weak proof. Instead, also assert no progress
+    events were ever published (a spawned job would emit ``started``
+    on the same event loop tick) and a follow-up valid call gets a
+    fresh job_id that DOES show up via ingest_status — proving the
+    JobStore is unpolluted by the rejected attempt."""
     pipeline = _make_pipeline()
+    pipeline_calls = {"n": 0}
+    original = pipeline.ingest_github_repo
+
+    async def counting_ingest(*args, **kw):
+        pipeline_calls["n"] += 1
+        return await original(*args, **kw)
+
+    pipeline.ingest_github_repo = counting_ingest
     agent = _build_fake_agent(pipeline)
 
     out = await agent._handlers["ingest_github_async"]({
@@ -174,12 +190,23 @@ async def test_github_async_invalid_depth_rejected_at_api_boundary():
     })
     assert "error" in out
     assert "invalid depth" in out["error"]
-    # No job was created — verify via the public ingest_status
-    # surface rather than reaching into the JobStore. There is no
-    # job_id in the response (because none was minted), so we ask
-    # ingest_status for any plausible id and expect not_found.
-    probe = await agent._handlers["ingest_status"]({"job_id": "nope"})
-    assert probe["error"] == "not found"
+    # Yield to the event loop in case anything scheduled a task —
+    # nothing should have, but this gives any phantom worker a tick
+    # to publish a started event so the assertion below catches it.
+    await asyncio.sleep(0.01)
+    # No worker ran: pipeline never invoked, no progress events fired.
+    assert pipeline_calls["n"] == 0
+    assert agent.events == [], (
+        f"unexpected events after invalid-depth rejection: {agent.events!r}"
+    )
+
+    # Sanity: a follow-up valid call DOES spawn and reach the
+    # JobStore — proving the rejection didn't break the normal path.
+    valid = await agent._handlers["ingest_github_async"]({
+        "repo_url": "https://github.com/owner/repo",
+    })
+    status = await _await_terminal(agent, valid["job_id"])
+    assert status["phase"] == "done"
 
 
 @pytest.mark.asyncio

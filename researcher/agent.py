@@ -664,18 +664,21 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             from researcher.fetcher import fetch_file
             await progress("distilling", progress_pct=20)
             result = await fetch_file(path)
-            await progress("storing", progress_pct=70)
             if not result.content.strip():
                 # Empty extracted text means there is no entry_id to
                 # hand back. ``run_ingest_job`` would otherwise mark
                 # this ``phase=done``, which would mislead a caller
                 # into thinking the ingest succeeded. Surface as an
                 # error so the worker fires ``phase=error`` and the
-                # message is preserved on the job (Copilot review on
-                # PR #37 pass 2).
+                # message is preserved on the job. Don't fire the
+                # ``storing`` phase before this check: ``storing``
+                # implies a write was attempted and a phase-based
+                # monitor would otherwise see ``storing → error``
+                # for an ingest that never tried to persist anything.
                 raise RuntimeError(
                     f"no text content extracted from: {path}"
                 )
+            await progress("storing", progress_pct=70)
             import hashlib
             from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
             entry_id = hashlib.sha256(path.encode()).hexdigest()[:16]
@@ -792,9 +795,15 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         # e.g. ``repo_tree()`` blocking inside a 120s ``git clone``
         # subprocess that doesn't observe cancellation promptly —
         # can't hold the agent's shutdown indefinitely. After the
-        # timeout we abandon the survivors; their JobRecords stay
-        # at whatever phase they reached, and the bus connector
-        # closes regardless.
+        # timeout we abandon the survivors: detach them from the
+        # ingest-task set AND silence the
+        # ``Task was destroyed but it is pending!`` warning that
+        # ``asyncio.run`` would otherwise emit at loop teardown.
+        # The survivors continue to run on the loop until they
+        # observe cancellation or finish naturally; the agent's
+        # ``shutdown()`` returns within the bound and the bus
+        # connector closes regardless. Loop teardown will eventually
+        # collect them, but the agent is already unregistered.
         tasks = list(getattr(self, "_ingest_tasks", ()) or ())
         for task in tasks:
             if not task.done():
@@ -802,14 +811,24 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         if tasks:
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*tasks, return_exceptions=True),
+                    asyncio.shield(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                    ),
                     timeout=10.0,
                 )
             except asyncio.TimeoutError:
                 survivors = [t for t in tasks if not t.done()]
+                for t in survivors:
+                    # Suppress the runtime warning at loop teardown.
+                    # Setting ``_log_destroy_pending`` is the
+                    # documented escape hatch for "I deliberately
+                    # abandoned this task and accept the
+                    # consequences."
+                    t._log_destroy_pending = False
                 logger.warning(
                     "ingest shutdown abandoned %d task(s) still running "
-                    "after 10s cancel grace period",
+                    "after 10s cancel grace period; they will be "
+                    "collected at loop teardown",
                     len(survivors),
                 )
         await BaseAgent.shutdown(self)
