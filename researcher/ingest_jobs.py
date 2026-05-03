@@ -277,6 +277,15 @@ async def run_ingest_job(
     await progress("started", progress_pct=0)
     try:
         result = await work(progress)
+    except asyncio.CancelledError:
+        # Graceful shutdown / explicit cancel: record the cancel on
+        # the job and re-raise so the asyncio runtime can finalise
+        # the task properly. Subscribers see ``phase=error`` with
+        # the cancellation message.
+        logger.info("ingest job %s cancelled", job.job_id)
+        await store.set_error(job.job_id, "CancelledError: cancelled")
+        await progress("error")
+        raise
     except Exception as e:
         logger.exception("ingest job %s failed", job.job_id)
         await store.set_error(job.job_id, f"{type(e).__name__}: {e}")

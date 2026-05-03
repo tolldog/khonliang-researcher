@@ -459,8 +459,12 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "after the spawn returned, and ingest_status's "
                 "history field replays every phase transition the "
                 "job went through. Returns {error: 'not found'} when "
-                "the job_id is unknown (in-flight jobs always exist; "
-                "only old completed jobs are evicted under retention).",
+                "the job_id is unknown. Three causes: (a) the agent "
+                "process restarted (the JobStore is in-memory and "
+                "wipes on restart — including in-flight jobs); "
+                "(b) the job is older than the completed-job "
+                "retention cap (default 64); (c) the job_id was "
+                "never issued by this agent.",
                 {"job_id": {"type": "string", "required": True}},
                 since="0.4.0",
             ),
@@ -552,6 +556,12 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         returned. ``ingest_status(job_id)`` is the race-free authority
         for terminal state, and its ``history`` field replays every
         phase transition the job went through.
+
+        Lifecycle: every spawned task is retained in
+        ``self._ingest_tasks`` so ``shutdown()`` can cancel still-
+        running ingests instead of letting them publish progress
+        events into a closed connector. The task removes itself from
+        the set when it completes.
         """
         store = self._get_job_store()
         job = await store.create(skill, args)
@@ -565,10 +575,18 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             async with semaphore:
                 await run_ingest_job(store, self.publish, job, work)
 
-        # Schedule but don't await — the caller gets the job_id back
-        # immediately. The task is not tracked beyond logging because
-        # progress events + ingest_status are the supervision surface.
-        asyncio.create_task(driver(), name=f"ingest-job-{job.job_id}")
+        # Schedule and retain — progress events + ingest_status are
+        # the supervision surface for happy-path monitoring, but the
+        # agent also needs a handle on each task so ``shutdown()``
+        # can cancel them rather than leaving repo clones / LLM
+        # work running after the connector is closed.
+        tasks = getattr(self, "_ingest_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._ingest_tasks = tasks
+        task = asyncio.create_task(driver(), name=f"ingest-job-{job.job_id}")
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
         return {
             "job_id": job.job_id,
             "skill": job.skill,
@@ -626,7 +644,16 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             result = await fetch_file(path)
             await progress("storing", progress_pct=70)
             if not result.content.strip():
-                return {"warning": f"no text content extracted from: {path}"}
+                # Empty extracted text means there is no entry_id to
+                # hand back. ``run_ingest_job`` would otherwise mark
+                # this ``phase=done``, which would mislead a caller
+                # into thinking the ingest succeeded. Surface as an
+                # error so the worker fires ``phase=error`` and the
+                # message is preserved on the job (Copilot review on
+                # PR #37 pass 2).
+                raise RuntimeError(
+                    f"no text content extracted from: {path}"
+                )
             import hashlib
             from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
             entry_id = hashlib.sha256(path.encode()).hexdigest()[:16]
@@ -729,6 +756,27 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         registry = getattr(self, "_ingest_watcher_registry", None)
         if registry is not None:
             await registry.shutdown()
+        # Cancel any in-flight async ingest jobs so they don't publish
+        # progress events into a connector that's about to close.
+        # We snapshot the set first so the per-task ``done_callback``
+        # mutation doesn't race the iteration. Best-effort: a task
+        # already in the middle of an awaited library call will
+        # observe ``CancelledError`` on the next checkpoint, which
+        # ``run_ingest_job`` translates into ``phase=error`` with
+        # ``CancelledError`` recorded.
+        tasks = list(getattr(self, "_ingest_tasks", ()) or ())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                # Errors from cancelled / in-flight tasks are
+                # already recorded on their JobRecord by
+                # run_ingest_job; swallow here so shutdown
+                # completes regardless of any single job's outcome.
+                pass
         await BaseAgent.shutdown(self)
 
     import signal

@@ -174,11 +174,12 @@ async def test_github_async_invalid_depth_rejected_at_api_boundary():
     })
     assert "error" in out
     assert "invalid depth" in out["error"]
-    # No job was created — the JobStore stays empty (and is lazily
-    # initialised the first time a real spawn happens, so it may not
-    # exist on the agent yet).
-    job_store = getattr(agent, "_ingest_job_store", None)
-    assert job_store is None or job_store._jobs == {}
+    # No job was created — verify via the public ingest_status
+    # surface rather than reaching into the JobStore. There is no
+    # job_id in the response (because none was minted), so we ask
+    # ingest_status for any plausible id and expect not_found.
+    probe = await agent._handlers["ingest_status"]({"job_id": "nope"})
+    assert probe["error"] == "not found"
 
 
 @pytest.mark.asyncio
@@ -218,6 +219,54 @@ async def test_idea_async_text_required():
     agent = _build_fake_agent(pipeline)
     out = await agent._handlers["ingest_idea_async"]({"text": "   "})
     assert out == {"error": "text is required"}
+
+
+# ---------------------------------------------------------------------------
+# ingest_file_async (file-specific behavior — fetch errors, empty content)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_file_async_path_required():
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+    out = await agent._handlers["ingest_file_async"]({"path": "  "})
+    assert out == {"error": "path is required"}
+
+
+@pytest.mark.asyncio
+async def test_file_async_empty_content_becomes_phase_error(monkeypatch):
+    """``fetch_file`` returning empty text means there's nothing to
+    store and no entry_id to hand back. Without the explicit raise,
+    ``run_ingest_job`` would mark the job ``phase=done`` with a
+    warning dict, misleading the caller into thinking the ingest
+    succeeded. Closes the Copilot finding on PR #37 pass 2."""
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+
+    class _FakeFormat:
+        value = "txt"
+
+    class _FakeResult:
+        content = ""  # the failure mode under test
+        title = ""
+        url = "file:///empty.txt"
+        format = _FakeFormat()
+        fetched_at = 0
+        metadata = {}
+
+    async def fake_fetch_file(path):
+        return _FakeResult()
+
+    # Stub the fetcher import in researcher.fetcher.
+    import researcher.fetcher as fetcher_mod
+    monkeypatch.setattr(fetcher_mod, "fetch_file", fake_fetch_file)
+
+    accepted = await agent._handlers["ingest_file_async"]({"path": "/tmp/empty.txt"})
+    status = await _await_terminal(agent, accepted["job_id"])
+    assert status["phase"] == "error"
+    assert "no text content extracted" in (status["error"] or "")
+    assert status["result"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +342,51 @@ async def test_concurrent_async_jobs_respect_semaphore_cap():
         await _await_terminal(agent, a["job_id"], timeout=3.0)
     # All four eventually run, but never more than 2 at once.
     assert peak <= 2
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: in-flight tasks are tracked and cancelled on shutdown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_in_flight_jobs_are_cancelled_when_agent_tasks_are_cancelled():
+    """Spawned ingest tasks are retained on the agent so a graceful
+    shutdown can cancel them rather than leaving repo clones / LLM
+    work running after the bus connector closes. ``run_ingest_job``
+    translates the ``CancelledError`` into ``phase=error`` with the
+    cancellation message, then re-raises so the asyncio runtime
+    finalises the task properly."""
+    leave = asyncio.Event()
+
+    async def parking_ingest(repo_url, label="", depth="readme+code", progress_callback=None):
+        await leave.wait()
+        return {"repo": repo_url, "entry_id": "never-reached"}
+
+    pipeline = _make_pipeline(stub_ingest_github_repo=parking_ingest)
+    agent = _build_fake_agent(pipeline)
+
+    accepted = await agent._handlers["ingest_github_async"]({
+        "repo_url": "https://github.com/o/r",
+    })
+    # Let the worker enter ``leave.wait()``.
+    await asyncio.sleep(0.05)
+    tasks = list(agent._ingest_tasks)
+    assert len(tasks) == 1
+    assert not tasks[0].done()
+
+    # Cancel all in-flight tasks (mimics what ``shutdown()`` does).
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    status = await agent._handlers["ingest_status"]({"job_id": accepted["job_id"]})
+    assert status["phase"] == "error"
+    assert "Cancelled" in (status["error"] or "")
 
 
 # ---------------------------------------------------------------------------
