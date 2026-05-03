@@ -5,8 +5,14 @@ pipeline entirely and the ``ingest_jobs`` tests exercise a fake
 worker. That left no test for the actual integration point — a typo
 in the keyword name (``progress_callback`` → ``progress_cb``) or a
 missed phase name would slip through. This file pins the contract:
-the pipeline emits ``cloning`` BEFORE the URL/clone error path can
-fire, and the kwarg name is exactly ``progress_callback``.
+
+  - URL validation runs BEFORE the first progress event, so an
+    invalid-URL rejection short-circuits without any callback fire.
+  - When validation passes and the clone is reached, ``cloning``
+    fires before the clone-failure path can return an error dict
+    (a clone-failure callback recorder sees ``["cloning"]``, not
+    ``[]``).
+  - The kwarg name is exactly ``progress_callback``.
 """
 
 from __future__ import annotations

@@ -308,6 +308,98 @@ async def test_run_ingest_job_cancel_during_done_publish_keeps_phase_done():
 
 
 @pytest.mark.asyncio
+async def test_run_ingest_job_cancel_during_set_result_still_finalises_done():
+    """Cancellation that lands at ``await store.set_result(...)``
+    — between ``work()`` returning and the JobRecord recording the
+    result — must still finalise to ``done``. Several call sites
+    (``ingest_idea``) have already persisted their durable state
+    inside ``work()`` itself; reclassifying to ``error`` would lie
+    to the caller about a successfully-saved entry."""
+    store = IngestJobStore()
+    job = await store.create("ingest_idea", {})
+
+    real_set_result = store.set_result
+    cancel_state = {"first_call": True}
+
+    async def cancel_set_result(job_id, result):
+        # First call (from the happy-path ``set_result`` in run_ingest_job)
+        # raises CancelledError BEFORE writing the result, simulating a
+        # connector mid-shutdown cancel that lands exactly at this
+        # await point. Subsequent calls (from the cancel-handler's
+        # forced finalisation) go through to the real method.
+        if cancel_state["first_call"]:
+            cancel_state["first_call"] = False
+            raise asyncio.CancelledError()
+        return await real_set_result(job_id, result)
+
+    store.set_result = cancel_set_result  # type: ignore[method-assign]
+
+    async def work(progress):
+        return {"idea_id": "persisted"}
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_ingest_job(store, _Recorder(), job, work)
+
+    fresh = await store.get(job.job_id)
+    assert fresh.phase == "done"
+    assert fresh.result == {"idea_id": "persisted"}
+    assert fresh.error is None
+
+
+@pytest.mark.asyncio
+async def test_run_ingest_job_cancel_during_finalise_emits_done_event():
+    """When the cancel handler forces the JobRecord to ``phase=done``
+    after a mid-tail cancel, it must also emit the ``done`` progress
+    event. Subscribers following ``research.ingest.progress``
+    (instead of polling ``ingest_status``) would otherwise see the
+    last pre-terminal phase and wait forever for a terminal event
+    that the durable state already supports."""
+    store = IngestJobStore()
+    job = await store.create("ingest_idea", {})
+
+    rec = _Recorder()
+    cancel_state = {"first_call": True}
+    real_set_result = store.set_result
+
+    async def cancel_set_result(job_id, result):
+        if cancel_state["first_call"]:
+            cancel_state["first_call"] = False
+            raise asyncio.CancelledError()
+        return await real_set_result(job_id, result)
+
+    store.set_result = cancel_set_result  # type: ignore[method-assign]
+
+    async def work(progress):
+        return {"idea_id": "persisted"}
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_ingest_job(store, rec, job, work)
+
+    phases = [p["phase"] for _, p in rec.events]
+    assert "done" in phases, (
+        f"cancel-during-finalise must still emit done event for "
+        f"event-driven subscribers; got phases={phases!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_phases_empty_returns_empty_not_all():
+    """``phases=[]`` (caller intersected two phase sets to nothing)
+    must return ``[]``, not every job in the store. Earlier code
+    used ``if phases else None`` which collapsed the empty list to
+    "no filter" and leaked the full job list."""
+    store = IngestJobStore()
+    a = await store.create("ingest_github", {})
+    b = await store.create("ingest_idea", {})
+    await store.transition(a.job_id, phase="started", progress_pct=0)
+    await store.transition(b.job_id, phase="done")
+
+    assert await store.list(phases=[]) == []
+    # Sanity: ``phases=None`` still returns everything (existing contract).
+    assert {j.job_id for j in await store.list(phases=None)} == {a.job_id, b.job_id}
+
+
+@pytest.mark.asyncio
 async def test_run_ingest_job_cancel_during_started_emit_still_terminates():
     """If ``CancelledError`` fires while ``progress("started")``
     itself is awaiting (e.g. the publish call mid-cancel), the

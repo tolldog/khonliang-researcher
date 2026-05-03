@@ -679,8 +679,14 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         path = args.get("path", "")
         if not isinstance(path, str):
             return {"error": f"path must be a string, got {type(path).__name__}"}
-        path = path.strip()
-        if not path:
+        # Validate emptiness on a stripped copy, but pass the raw
+        # ``path`` through to ``fetch_file``. Leading/trailing
+        # whitespace is legal in POSIX filenames; stripping the
+        # path itself would silently mis-target a file like
+        # ``" notes.txt "`` to ``"notes.txt"`` and either ingest
+        # the wrong file or report ``not found`` for a path the
+        # synchronous ``ingest_file`` skill would accept verbatim.
+        if not path.strip():
             return {"error": "path is required"}
 
         async def work(progress):
