@@ -1166,6 +1166,16 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                 return
             try:
                 await progress_callback(phase=phase, progress_pct=progress_pct)
+            except asyncio.CancelledError:
+                # ``except Exception`` does not catch
+                # ``CancelledError`` on Python 3.11+. Re-raise here
+                # so the actual cancellation reaches the caller —
+                # ``run_ingest_job``'s wrapper records ``phase=error``
+                # and finalises the task properly. Without this
+                # branch a cancelled callback would still tear down
+                # the worker, but as an unswallowed exception
+                # rather than as a clean cancel.
+                raise
             except Exception:  # pragma: no cover — callback is best-effort
                 logger.warning("progress_callback failed at phase=%s", phase, exc_info=True)
 

@@ -235,6 +235,20 @@ async def _publish_progress(
         payload["detail"] = dict(detail)
     try:
         await publish(PROGRESS_TOPIC, payload)
+    except asyncio.CancelledError:
+        # Re-raise so the calling task observes the cancellation;
+        # we just want this swallow-noise pattern to not eat the
+        # cancel. ``Exception`` does not catch ``CancelledError``
+        # on Python 3.11+, so without this branch a cancelled
+        # ``publish()`` (e.g. connector mid-shutdown) would tear
+        # down the worker even though progress events are meant
+        # to be best-effort. Logging at debug — operators don't
+        # need to see every cancelled publish.
+        logger.debug(
+            "publish %s cancelled for job_id=%s phase=%s",
+            PROGRESS_TOPIC, job.job_id, job.phase,
+        )
+        raise
     except Exception as e:  # pragma: no cover — best-effort
         logger.warning(
             "publish %s failed for job_id=%s phase=%s: %s",

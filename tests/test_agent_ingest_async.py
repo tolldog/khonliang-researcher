@@ -294,6 +294,62 @@ async def test_file_async_empty_content_becomes_phase_error(monkeypatch):
     assert status["phase"] == "error"
     assert "no text content extracted" in (status["error"] or "")
     assert status["result"] is None
+    # ``storing`` is reserved for "we tried to persist": it must NOT
+    # fire when the empty-content check skipped the write. Subscribers
+    # using phase-based monitors would otherwise see ``storing →
+    # error`` and infer a write was attempted.
+    phases = [h["phase"] for h in status["history"]]
+    assert "storing" not in phases
+    assert phases == ["started", "distilling", "error"]
+
+
+@pytest.mark.asyncio
+async def test_file_async_happy_path_reaches_done_with_entry_id(monkeypatch):
+    """Happy-path coverage for ``ingest_file_async``: fetch returns
+    real text, the worker hands the content to ``pipeline.knowledge``,
+    and the job reaches ``phase=done`` with a populated result. Was
+    missing — the file-async surface only had failure-path coverage,
+    so a regression in the actual storage path could go green."""
+    pipeline = _make_pipeline()
+
+    # Track what the pipeline's knowledge store was asked to add.
+    added: list = []
+    pipeline.knowledge = SimpleNamespace(add=lambda entry: added.append(entry))
+
+    agent = _build_fake_agent(pipeline)
+
+    class _FakeFormat:
+        value = "md"
+
+    class _FakeResult:
+        content = "Hello, world. This file has actual content."
+        title = "test.md"
+        url = "file:///tmp/test.md"
+        format = _FakeFormat()
+        fetched_at = 1234567890
+        metadata = {"size": 42}
+
+    async def fake_fetch_file(path):
+        return _FakeResult()
+
+    import researcher.fetcher as fetcher_mod
+    monkeypatch.setattr(fetcher_mod, "fetch_file", fake_fetch_file)
+
+    accepted = await agent._handlers["ingest_file_async"]({"path": "/tmp/test.md"})
+    status = await _await_terminal(agent, accepted["job_id"])
+
+    assert status["phase"] == "done"
+    assert status["error"] is None
+    result = status["result"]
+    assert result["entry_id"]
+    assert result["title"] == "test.md"
+    assert result["format"] == "md"
+    # Phases include both distilling AND storing on the happy path.
+    phases = [h["phase"] for h in status["history"]]
+    assert phases == ["started", "distilling", "storing", "done"]
+    # Pipeline knowledge store actually received an entry.
+    assert len(added) == 1
+    assert added[0].title == "test.md"
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +520,19 @@ async def test_queued_jobs_are_cancelled_correctly_when_blocked_on_semaphore():
     b_final = await agent._handlers["ingest_status"]({"job_id": b["job_id"]})
     assert b_final["phase"] == "error"
     assert "cancelled before start" in (b_final["error"] or "").lower()
+
+    # An event-driven subscriber must also see the terminal phase —
+    # the queued-cancel path used to record ``phase=error`` on the
+    # JobRecord but never emit the matching progress event, so a
+    # caller waiting on ``research.ingest.progress`` would just hang.
+    b_phase_events = [
+        p for topic, p in agent.events
+        if topic == "research.ingest.progress"
+        and p.get("job_id") == b["job_id"]
+    ]
+    assert any(p["phase"] == "error" for p in b_phase_events), (
+        f"queued-cancel did not emit phase=error event; got {b_phase_events!r}"
+    )
 
     # A still finishes cleanly when released, proving the cancel
     # didn't disturb the queue mechanics.

@@ -31,7 +31,7 @@ from types import MethodType
 from khonliang_bus import BaseAgent, Skill
 from khonliang_bus.connector import BusConnector
 
-from researcher.ingest_jobs import IngestJobStore, run_ingest_job
+from researcher.ingest_jobs import IngestJobStore, _publish_progress, run_ingest_job
 from researcher.ingest_watcher import IngestWatcherRegistry, IngestWatcherStore
 
 logger = logging.getLogger(__name__)
@@ -579,22 +579,29 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 # Two cancel sites converge here:
                 # (a) cancelled DURING ``run_ingest_job`` —
                 #     ``run_ingest_job`` already recorded
-                #     ``phase=error`` and re-raised, so phase is no
-                #     longer ``accepted`` and we just propagate.
+                #     ``phase=error`` and emitted the matching
+                #     progress event, then re-raised. Phase is no
+                #     longer ``accepted`` so we skip the recovery
+                #     block and just propagate.
                 # (b) cancelled WHILE QUEUED on the semaphore —
                 #     ``run_ingest_job`` never entered, so the
                 #     ``phase=accepted`` JobRecord would otherwise
                 #     stay stuck forever and ``ingest_status``
                 #     callers would poll indefinitely. Detect that
-                #     case by checking the current phase and record
-                #     the cancellation so the supervision surface
-                #     stays honest.
+                #     case by checking the current phase, record
+                #     the cancellation, AND emit the matching
+                #     ``research.ingest.progress`` event so an
+                #     event-driven subscriber sees the terminal
+                #     phase rather than only the supervision-poll
+                #     state.
                 current = await store.get(job.job_id)
                 if current is not None and current.phase == "accepted":
                     await store.set_error(
                         job.job_id, "CancelledError: cancelled before start",
                     )
-                    await store.transition(job.job_id, phase="error")
+                    final = await store.transition(job.job_id, phase="error")
+                    if final is not None:
+                        await _publish_progress(self.publish, final)
                 raise
 
         # Schedule and retain — progress events + ingest_status are
@@ -818,6 +825,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 )
             except asyncio.TimeoutError:
                 survivors = [t for t in tasks if not t.done()]
+                tracked = self._ingest_tasks
                 for t in survivors:
                     # Suppress the runtime warning at loop teardown.
                     # Setting ``_log_destroy_pending`` is the
@@ -825,6 +833,14 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                     # abandoned this task and accept the
                     # consequences."
                     t._log_destroy_pending = False
+                    # Detach from the agent's tracked set too, so a
+                    # second shutdown signal doesn't re-iterate the
+                    # same already-cancelled-but-stuck tasks and
+                    # eat another 10s cancel grace period waiting
+                    # on them. The per-task ``done_callback`` would
+                    # eventually do this when the task finishes
+                    # naturally, but we don't want to wait.
+                    tracked.discard(t)
                 logger.warning(
                     "ingest shutdown abandoned %d task(s) still running "
                     "after 10s cancel grace period; they will be "
