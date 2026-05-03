@@ -419,7 +419,9 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "Schedule a GitHub-repo ingest as a background job. "
                 "Returns {job_id, accepted_at} immediately; progress "
                 "fires on bus topic 'research.ingest.progress'. Poll "
-                "with ingest_status(job_id) for direct lookup. "
+                "with ingest_status(job_id) for the race-free "
+                "authority on terminal state. depth must be one of "
+                "'readme' / 'readme+code' / 'full'. "
                 "fr_researcher_2b22a2f3 + fr_researcher_bbf3cf69.",
                 {
                     "repo_url": {"type": "string", "required": True},
@@ -451,9 +453,14 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "ingest_status",
                 "Look up an async ingest job's current phase, "
                 "progress_pct, started_at, completed_at, result, "
-                "and history. Returns {error: 'not found'} when the "
-                "job_id is unknown (in-flight jobs always exist; only "
-                "old completed jobs are evicted under retention).",
+                "error, and history. Race-free authority on terminal "
+                "state — a fast job can move through started → done "
+                "before a caller subscribed via bus_wait_for_event "
+                "after the spawn returned, and ingest_status's "
+                "history field replays every phase transition the "
+                "job went through. Returns {error: 'not found'} when "
+                "the job_id is unknown (in-flight jobs always exist; "
+                "only old completed jobs are evicted under retention).",
                 {"job_id": {"type": "string", "required": True}},
                 since="0.4.0",
             ),
@@ -508,21 +515,55 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             self._ingest_job_store = store
         return store
 
+    def _get_ingest_semaphore(self) -> asyncio.Semaphore:
+        """Bound the number of concurrent ingest workers.
+
+        Without this, a burst of async-ingest calls can spawn an
+        arbitrary number of repo clones / distill jobs in parallel
+        and exhaust process resources long before the JobStore's
+        completed-job retention cap helps. The cap is configurable
+        via ``config.ingest_async_concurrency`` (default 4); jobs
+        beyond the cap stay in ``phase=accepted`` until a slot
+        opens, which subscribers see as a delayed
+        ``accepted → started`` transition (with the wait time
+        visible in the history timestamps).
+        """
+        sem = getattr(self, "_ingest_semaphore", None)
+        if sem is None:
+            cap = int(pipeline.config.get("ingest_async_concurrency", 4))
+            sem = asyncio.Semaphore(max(1, cap))
+            self._ingest_semaphore = sem
+        return sem
+
     async def _spawn_ingest_job(self, skill: str, args: dict, work):
         """Common scaffolding for the three ingest_*_async skills.
 
-        Creates a JobRecord, schedules ``run_ingest_job`` as a fire-
-        and-forget task, and returns ``{job_id, accepted_at, skill}``
-        immediately. ``work`` is an ``async (progress) -> dict``
-        coroutine that does the actual ingest and may call
-        ``progress(phase, progress_pct=..., detail=...)`` at phase
-        boundaries to fire ``research.ingest.progress`` bus events.
+        Creates a JobRecord, schedules a worker task gated on the
+        agent's ingest semaphore, and returns
+        ``{job_id, accepted_at, skill}`` immediately. ``work`` is an
+        ``async (progress) -> dict`` coroutine that does the actual
+        ingest and may call ``progress(phase, progress_pct=...,
+        detail=...)`` at phase boundaries to fire
+        ``research.ingest.progress`` bus events.
+
+        Race note: events are best-effort for monitoring; a fast job
+        can transition through ``started → done`` before a caller
+        subscribed via ``bus_wait_for_event`` after this call
+        returned. ``ingest_status(job_id)`` is the race-free authority
+        for terminal state, and its ``history`` field replays every
+        phase transition the job went through.
         """
         store = self._get_job_store()
         job = await store.create(skill, args)
+        semaphore = self._get_ingest_semaphore()
 
         async def driver():
-            await run_ingest_job(store, self.publish, job, work)
+            # Bound concurrency: jobs beyond ``ingest_async_concurrency``
+            # park at ``phase=accepted`` until a slot opens. The wait
+            # time shows up as the accepted_at→started_at delta in the
+            # job's history, so a subscriber can spot pile-ups.
+            async with semaphore:
+                await run_ingest_job(store, self.publish, job, work)
 
         # Schedule but don't await — the caller gets the job_id back
         # immediately. The task is not tracked beyond logging because
@@ -534,18 +575,41 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             "accepted_at": job.accepted_at,
         }
 
+    _VALID_INGEST_DEPTHS = ("readme", "readme+code", "full")
+
     async def handle_ingest_github_async(self, args):
         repo_url = str(args.get("repo_url", "")).strip()
         if not repo_url:
             return {"error": "repo_url is required"}
         label = str(args.get("label", ""))
-        depth = str(args.get("depth", "readme+code"))
+        depth = str(args.get("depth", "readme+code")).strip()
+        # Validate at the API boundary so a typo or surrounding
+        # whitespace doesn't silently degrade to README-only ingest
+        # while still reporting back as if the requested depth were
+        # honoured (raised by Copilot review on PR #37).
+        if depth not in _VALID_INGEST_DEPTHS:
+            return {
+                "error": (
+                    f"invalid depth: {depth!r} "
+                    f"(expected one of {list(_VALID_INGEST_DEPTHS)})"
+                ),
+            }
 
         async def work(progress):
-            return await pipeline.ingest_github_repo(
+            result = await pipeline.ingest_github_repo(
                 repo_url, label=label, depth=depth,
                 progress_callback=progress,
             )
+            # ``ingest_github_repo`` reports invalid URLs / clone
+            # failures by returning ``{"error": "..."}`` instead of
+            # raising. Translate that into an exception here so
+            # ``run_ingest_job`` surfaces ``phase=error`` and stores
+            # the message; otherwise subscribers would see
+            # ``phase=done`` on a failed ingest (Copilot review on
+            # PR #37).
+            if isinstance(result, dict) and result.get("error"):
+                raise RuntimeError(result["error"])
+            return result
 
         return await self._spawn_ingest_job(
             "ingest_github", {"repo_url": repo_url, "label": label, "depth": depth}, work,
@@ -680,6 +744,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["ingest_idea_async"] = MethodType(handle_ingest_idea_async, agent)
     agent._handlers["ingest_status"] = MethodType(handle_ingest_status, agent)
     agent._get_job_store = MethodType(_get_job_store, agent)
+    agent._get_ingest_semaphore = MethodType(_get_ingest_semaphore, agent)
     agent._spawn_ingest_job = MethodType(_spawn_ingest_job, agent)
     agent.start = MethodType(start, agent)
     agent.shutdown = MethodType(shutdown, agent)
