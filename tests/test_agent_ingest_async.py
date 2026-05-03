@@ -389,6 +389,62 @@ async def test_in_flight_jobs_are_cancelled_when_agent_tasks_are_cancelled():
     assert "Cancelled" in (status["error"] or "")
 
 
+@pytest.mark.asyncio
+async def test_queued_jobs_are_cancelled_correctly_when_blocked_on_semaphore():
+    """A job cancelled WHILE STILL QUEUED on the concurrency
+    semaphore (i.e. ``run_ingest_job`` never entered) used to stay
+    in ``phase=accepted`` forever — ``ingest_status`` callers would
+    poll indefinitely. The driver's ``except CancelledError`` branch
+    now records the cancel directly on the JobRecord.
+
+    Setup: cap concurrency at 1, spawn two jobs (job A runs, job B
+    queues on the semaphore), cancel B's task, verify B reaches
+    ``phase=error`` with the cancellation message.
+    """
+    leave_a = asyncio.Event()
+
+    async def parking_ingest(repo_url, label="", depth="readme+code", progress_callback=None):
+        # Job A holds the only slot until the test releases it.
+        await leave_a.wait()
+        return {"repo": repo_url, "entry_id": "a"}
+
+    pipeline = _make_pipeline(stub_ingest_github_repo=parking_ingest)
+    pipeline.config = {"ingest_async_concurrency": 1}
+    agent = _build_fake_agent(pipeline)
+
+    a = await agent._handlers["ingest_github_async"]({"repo_url": "https://github.com/o/a"})
+    b = await agent._handlers["ingest_github_async"]({"repo_url": "https://github.com/o/b"})
+
+    # Let A enter the semaphore (it parks on leave_a). B is queued.
+    await asyncio.sleep(0.05)
+    a_status = await agent._handlers["ingest_status"]({"job_id": a["job_id"]})
+    b_status = await agent._handlers["ingest_status"]({"job_id": b["job_id"]})
+    assert a_status["phase"] in ("started", "cloning", "ast_scanning", "storing")
+    assert b_status["phase"] == "accepted"
+
+    # Find B's task and cancel it. Because B is queued on the
+    # semaphore, run_ingest_job has not entered.
+    tasks = {t.get_name(): t for t in agent._ingest_tasks}
+    b_task = tasks[f"ingest-job-{b['job_id']}"]
+    b_task.cancel()
+    try:
+        await b_task
+    except asyncio.CancelledError:
+        pass
+
+    # B should now report phase=error with a cancellation message,
+    # not phase=accepted (which would be the bug).
+    b_final = await agent._handlers["ingest_status"]({"job_id": b["job_id"]})
+    assert b_final["phase"] == "error"
+    assert "cancelled before start" in (b_final["error"] or "").lower()
+
+    # A still finishes cleanly when released, proving the cancel
+    # didn't disturb the queue mechanics.
+    leave_a.set()
+    a_final = await _await_terminal(agent, a["job_id"], timeout=2.0)
+    assert a_final["phase"] == "done"
+
+
 # ---------------------------------------------------------------------------
 # Bus events
 # ---------------------------------------------------------------------------

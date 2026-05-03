@@ -572,8 +572,30 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             # park at ``phase=accepted`` until a slot opens. The wait
             # time shows up as the accepted_at→started_at delta in the
             # job's history, so a subscriber can spot pile-ups.
-            async with semaphore:
-                await run_ingest_job(store, self.publish, job, work)
+            try:
+                async with semaphore:
+                    await run_ingest_job(store, self.publish, job, work)
+            except asyncio.CancelledError:
+                # Two cancel sites converge here:
+                # (a) cancelled DURING ``run_ingest_job`` —
+                #     ``run_ingest_job`` already recorded
+                #     ``phase=error`` and re-raised, so phase is no
+                #     longer ``accepted`` and we just propagate.
+                # (b) cancelled WHILE QUEUED on the semaphore —
+                #     ``run_ingest_job`` never entered, so the
+                #     ``phase=accepted`` JobRecord would otherwise
+                #     stay stuck forever and ``ingest_status``
+                #     callers would poll indefinitely. Detect that
+                #     case by checking the current phase and record
+                #     the cancellation so the supervision surface
+                #     stays honest.
+                current = await store.get(job.job_id)
+                if current is not None and current.phase == "accepted":
+                    await store.set_error(
+                        job.job_id, "CancelledError: cancelled before start",
+                    )
+                    await store.transition(job.job_id, phase="error")
+                raise
 
         # Schedule and retain — progress events + ingest_status are
         # the supervision surface for happy-path monitoring, but the
@@ -760,23 +782,36 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         # progress events into a connector that's about to close.
         # We snapshot the set first so the per-task ``done_callback``
         # mutation doesn't race the iteration. Best-effort: a task
-        # already in the middle of an awaited library call will
-        # observe ``CancelledError`` on the next checkpoint, which
+        # already in the middle of an awaited library call observes
+        # ``CancelledError`` on the next checkpoint, which
         # ``run_ingest_job`` translates into ``phase=error`` with
-        # ``CancelledError`` recorded.
+        # ``CancelledError`` recorded; tasks queued on the semaphore
+        # are handled by the driver's own except branch.
+        #
+        # Bounded with a hard timeout so a single slow operation —
+        # e.g. ``repo_tree()`` blocking inside a 120s ``git clone``
+        # subprocess that doesn't observe cancellation promptly —
+        # can't hold the agent's shutdown indefinitely. After the
+        # timeout we abandon the survivors; their JobRecords stay
+        # at whatever phase they reached, and the bus connector
+        # closes regardless.
         tasks = list(getattr(self, "_ingest_tasks", ()) or ())
         for task in tasks:
             if not task.done():
                 task.cancel()
-        for task in tasks:
+        if tasks:
             try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                # Errors from cancelled / in-flight tasks are
-                # already recorded on their JobRecord by
-                # run_ingest_job; swallow here so shutdown
-                # completes regardless of any single job's outcome.
-                pass
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                survivors = [t for t in tasks if not t.done()]
+                logger.warning(
+                    "ingest shutdown abandoned %d task(s) still running "
+                    "after 10s cancel grace period",
+                    len(survivors),
+                )
         await BaseAgent.shutdown(self)
 
     import signal

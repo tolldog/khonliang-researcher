@@ -287,7 +287,16 @@ async def run_ingest_job(
         await progress("error")
         raise
     except Exception as e:
-        logger.exception("ingest job %s failed", job.job_id)
+        # ``logger.warning`` (no stack) rather than
+        # ``logger.exception`` because a large fraction of failures
+        # here are expected user-facing errors —
+        # ``handle_ingest_github_async`` translates pipeline error
+        # dicts (invalid GitHub URL, clone permission denied, …)
+        # into ``RuntimeError`` so the job surfaces ``phase=error``,
+        # and a full traceback for those would be log noise. The
+        # error message and exception type still land on the
+        # JobRecord and stream through the progress event.
+        logger.warning("ingest job %s failed: %s: %s", job.job_id, type(e).__name__, e)
         await store.set_error(job.job_id, f"{type(e).__name__}: {e}")
         await progress("error")
         return
