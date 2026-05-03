@@ -31,6 +31,7 @@ from types import MethodType
 from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint
 from khonliang_bus.connector import BusConnector
 
+from researcher.ingest_jobs import IngestJobStore, _publish_progress, run_ingest_job
 from researcher.ingest_watcher import IngestWatcherRegistry, IngestWatcherStore
 
 logger = logging.getLogger(__name__)
@@ -461,6 +462,60 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 },
                 since="0.3.0",
             ),
+            Skill(
+                "ingest_github_async",
+                "Schedule a GitHub-repo ingest as a background job. "
+                "Returns {job_id, accepted_at} immediately; progress "
+                "fires on bus topic 'research.ingest.progress'. Poll "
+                "with ingest_status(job_id) for the race-free "
+                "authority on terminal state. depth must be one of "
+                "'readme' / 'readme+code' / 'full'. "
+                "fr_researcher_2b22a2f3 + fr_researcher_bbf3cf69.",
+                {
+                    "repo_url": {"type": "string", "required": True},
+                    "label": {"type": "string", "default": ""},
+                    "depth": {"type": "string", "default": "readme+code"},
+                },
+                since="0.4.0",
+            ),
+            Skill(
+                "ingest_file_async",
+                "Schedule a local-file ingest as a background job. "
+                "Returns {job_id, accepted_at} immediately; progress "
+                "fires on 'research.ingest.progress'.",
+                {"path": {"type": "string", "required": True}},
+                since="0.4.0",
+            ),
+            Skill(
+                "ingest_idea_async",
+                "Schedule an idea-text ingest as a background job. "
+                "Returns {job_id, accepted_at} immediately; progress "
+                "fires on 'research.ingest.progress'.",
+                {
+                    "text": {"type": "string", "required": True},
+                    "source_label": {"type": "string", "default": ""},
+                },
+                since="0.4.0",
+            ),
+            Skill(
+                "ingest_status",
+                "Look up an async ingest job's current phase, "
+                "progress_pct, started_at, completed_at, result, "
+                "error, and history. Race-free authority on terminal "
+                "state — a fast job can move through started → done "
+                "before a caller subscribed via bus_wait_for_event "
+                "after the spawn returned, and ingest_status's "
+                "history field replays every phase transition the "
+                "job went through. Returns {error: 'not found'} when "
+                "the job_id is unknown. Three causes: (a) the agent "
+                "process restarted (the JobStore is in-memory and "
+                "wipes on restart — including in-flight jobs); "
+                "(b) the job is older than the completed-job "
+                "retention cap (default 64); (c) the job_id was "
+                "never issued by this agent.",
+                {"job_id": {"type": "string", "required": True}},
+                since="0.4.0",
+            ),
         ]
         for skill in extras:
             if skill.name not in names:
@@ -504,6 +559,284 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
 
     async def handle_ingest_from_artifact(self, args):
         return await ingest_from_artifact(self, pipeline, args)
+
+    def _get_job_store(self) -> IngestJobStore:
+        store = getattr(self, "_ingest_job_store", None)
+        if store is None:
+            store = IngestJobStore()
+            self._ingest_job_store = store
+        return store
+
+    def _get_ingest_semaphore(self) -> asyncio.Semaphore:
+        """Bound the number of concurrent ingest workers.
+
+        Without this, a burst of async-ingest calls can spawn an
+        arbitrary number of repo clones / distill jobs in parallel
+        and exhaust process resources long before the JobStore's
+        completed-job retention cap helps. The cap is configurable
+        via ``config.ingest_async_concurrency`` (default 4); jobs
+        beyond the cap stay in ``phase=accepted`` until a slot
+        opens, which subscribers see as a delayed
+        ``accepted → started`` transition (with the wait time
+        visible in the history timestamps).
+        """
+        sem = getattr(self, "_ingest_semaphore", None)
+        if sem is None:
+            cap = int(pipeline.config.get("ingest_async_concurrency", 4))
+            sem = asyncio.Semaphore(max(1, cap))
+            self._ingest_semaphore = sem
+        return sem
+
+    async def _spawn_ingest_job(self, skill: str, args: dict, work):
+        """Common scaffolding for the three ingest_*_async skills.
+
+        Creates a JobRecord, schedules a worker task gated on the
+        agent's ingest semaphore, and returns
+        ``{job_id, accepted_at, skill}`` immediately. ``work`` is an
+        ``async (progress) -> dict`` coroutine that does the actual
+        ingest and may call ``progress(phase, progress_pct=...,
+        detail=...)`` at phase boundaries to fire
+        ``research.ingest.progress`` bus events.
+
+        Race note: events are best-effort for monitoring; a fast job
+        can transition through ``started → done`` before a caller
+        subscribed via ``bus_wait_for_event`` after this call
+        returned. ``ingest_status(job_id)`` is the race-free authority
+        for terminal state, and its ``history`` field replays every
+        phase transition the job went through.
+
+        Lifecycle: every spawned task is retained in
+        ``self._ingest_tasks`` so ``shutdown()`` can cancel still-
+        running ingests instead of letting them publish progress
+        events into a closed connector. The task removes itself from
+        the set when it completes.
+        """
+        store = self._get_job_store()
+        job = await store.create(skill, args)
+        semaphore = self._get_ingest_semaphore()
+
+        async def driver():
+            # Bound concurrency: jobs beyond ``ingest_async_concurrency``
+            # park at ``phase=accepted`` until a slot opens. The wait
+            # time shows up as the accepted_at→started_at delta in the
+            # job's history, so a subscriber can spot pile-ups.
+            try:
+                async with semaphore:
+                    await run_ingest_job(store, self.publish, job, work)
+            except asyncio.CancelledError:
+                # Two cancel sites converge here:
+                # (a) cancelled DURING ``run_ingest_job`` —
+                #     ``run_ingest_job`` already recorded
+                #     ``phase=error`` and emitted the matching
+                #     progress event, then re-raised. Phase is no
+                #     longer ``accepted`` so we skip the recovery
+                #     block and just propagate.
+                # (b) cancelled WHILE QUEUED on the semaphore —
+                #     ``run_ingest_job`` never entered, so the
+                #     ``phase=accepted`` JobRecord would otherwise
+                #     stay stuck forever and ``ingest_status``
+                #     callers would poll indefinitely. Detect that
+                #     case by checking the current phase, record
+                #     the cancellation, AND emit the matching
+                #     ``research.ingest.progress`` event so an
+                #     event-driven subscriber sees the terminal
+                #     phase rather than only the supervision-poll
+                #     state.
+                current = await store.get(job.job_id)
+                if current is not None and current.phase == "accepted":
+                    await store.set_error(
+                        job.job_id, "CancelledError: cancelled before start",
+                    )
+                    final = await store.transition(job.job_id, phase="error")
+                    if final is not None:
+                        await _publish_progress(self.publish, final)
+                raise
+
+        # Schedule and retain — progress events + ingest_status are
+        # the supervision surface for happy-path monitoring, but the
+        # agent also needs a handle on each task so ``shutdown()``
+        # can cancel them rather than leaving repo clones / LLM
+        # work running after the connector is closed.
+        tasks = getattr(self, "_ingest_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._ingest_tasks = tasks
+        task = asyncio.create_task(driver(), name=f"ingest-job-{job.job_id}")
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return {
+            "job_id": job.job_id,
+            "skill": job.skill,
+            "accepted_at": job.accepted_at,
+        }
+
+    _VALID_INGEST_DEPTHS = ("readme", "readme+code", "full")
+
+    async def handle_ingest_github_async(self, args):
+        # ``isinstance(str)``-validate at the API boundary rather
+        # than ``str()``-coerce. ``str(None)`` / ``str(123)`` would
+        # otherwise enqueue a job for the literal stringified value;
+        # other handlers in this module (``stage_payload``,
+        # ``ingest_from_artifact``) already do the strict check.
+        repo_url = args.get("repo_url", "")
+        if not isinstance(repo_url, str):
+            return {"error": f"repo_url must be a string, got {type(repo_url).__name__}"}
+        repo_url = repo_url.strip()
+        if not repo_url:
+            return {"error": "repo_url is required"}
+        label = args.get("label", "")
+        if not isinstance(label, str):
+            return {"error": f"label must be a string, got {type(label).__name__}"}
+        depth = args.get("depth", "readme+code")
+        if not isinstance(depth, str):
+            return {"error": f"depth must be a string, got {type(depth).__name__}"}
+        depth = depth.strip()
+        # Validate at the API boundary so a typo or surrounding
+        # whitespace doesn't silently degrade to README-only ingest
+        # while still reporting back as if the requested depth were
+        # honoured (raised by Copilot review on PR #37).
+        if depth not in _VALID_INGEST_DEPTHS:
+            return {
+                "error": (
+                    f"invalid depth: {depth!r} "
+                    f"(expected one of {list(_VALID_INGEST_DEPTHS)})"
+                ),
+            }
+
+        async def work(progress):
+            result = await pipeline.ingest_github_repo(
+                repo_url, label=label, depth=depth,
+                progress_callback=progress,
+            )
+            # ``ingest_github_repo`` reports invalid URLs / clone
+            # failures by returning ``{"error": "..."}`` instead of
+            # raising. Translate that into an exception here so
+            # ``run_ingest_job`` surfaces ``phase=error`` and stores
+            # the message; otherwise subscribers would see
+            # ``phase=done`` on a failed ingest (Copilot review on
+            # PR #37).
+            if isinstance(result, dict) and result.get("error"):
+                raise RuntimeError(result["error"])
+            return result
+
+        return await self._spawn_ingest_job(
+            "ingest_github", {"repo_url": repo_url, "label": label, "depth": depth}, work,
+        )
+
+    async def handle_ingest_file_async(self, args):
+        path = args.get("path", "")
+        if not isinstance(path, str):
+            return {"error": f"path must be a string, got {type(path).__name__}"}
+        # Validate emptiness on a stripped copy, but pass the raw
+        # ``path`` through to ``fetch_file``. Leading/trailing
+        # whitespace is legal in POSIX filenames; stripping the
+        # path itself would silently mis-target a file like
+        # ``" notes.txt "`` to ``"notes.txt"`` and either ingest
+        # the wrong file or report ``not found`` for a path the
+        # synchronous ``ingest_file`` skill would accept verbatim.
+        if not path.strip():
+            return {"error": "path is required"}
+
+        async def work(progress):
+            from researcher.fetcher import fetch_file
+            await progress("distilling", progress_pct=20)
+            result = await fetch_file(path)
+            if not result.content.strip():
+                # Empty extracted text means there is no entry_id to
+                # hand back. ``run_ingest_job`` would otherwise mark
+                # this ``phase=done``, which would mislead a caller
+                # into thinking the ingest succeeded. Surface as an
+                # error so the worker fires ``phase=error`` and the
+                # message is preserved on the job. Don't fire the
+                # ``storing`` phase before this check: ``storing``
+                # implies a write was attempted and a phase-based
+                # monitor would otherwise see ``storing → error``
+                # for an ingest that never tried to persist anything.
+                raise RuntimeError(
+                    f"no text content extracted from: {path}"
+                )
+            await progress("storing", progress_pct=70)
+            import hashlib
+            from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+            entry_id = hashlib.sha256(path.encode()).hexdigest()[:16]
+            entry = KnowledgeEntry(
+                id=entry_id,
+                tier=Tier.IMPORTED,
+                title=result.title or path,
+                content=result.content,
+                source=result.url,
+                scope="research",
+                tags=["paper", f"format:{result.format.value}"],
+                status=EntryStatus.INGESTED,
+                metadata={
+                    "url": result.url,
+                    "format": result.format.value,
+                    "fetched_at": result.fetched_at,
+                    **result.metadata,
+                },
+            )
+            pipeline.knowledge.add(entry)
+            return {"entry_id": entry_id, "title": entry.title, "format": result.format.value}
+
+        return await self._spawn_ingest_job("ingest_file", {"path": path}, work)
+
+    async def handle_ingest_idea_async(self, args):
+        # Validate type explicitly rather than ``str()``-coercing.
+        # ``str(123)`` / ``str(None)`` would otherwise silently
+        # enqueue a job with a bogus body — the other handlers in
+        # this module (``stage_payload``, ``ingest_from_artifact``)
+        # already do isinstance checks; align with them.
+        text = args.get("text", "")
+        if not isinstance(text, str):
+            return {"error": f"text must be a string, got {type(text).__name__}"}
+        if not text.strip():
+            return {"error": "text is required"}
+        source_label = args.get("source_label", "")
+        if not isinstance(source_label, str):
+            return {
+                "error": (
+                    f"source_label must be a string, got "
+                    f"{type(source_label).__name__}"
+                ),
+            }
+
+        async def work(progress):
+            # ``pipeline.ingest_idea`` performs both distill AND
+            # store atomically — by the time it returns, the
+            # KnowledgeEntry is already persisted. Emit
+            # ``storing`` BEFORE the call so the phase represents
+            # intent ("we're about to write") rather than past
+            # tense ("we wrote, this event is informational").
+            # Emitting ``storing`` AFTER the persist would mean a
+            # cancellation between the persist and the event
+            # marks ``phase=error`` even though the idea was
+            # actually saved — false-failure for the caller.
+            await progress("distilling", progress_pct=30)
+            await progress("storing", progress_pct=80)
+            idea_id = await pipeline.ingest_idea(text, source_label)
+            return {"idea_id": idea_id, "source_label": source_label}
+
+        return await self._spawn_ingest_job(
+            "ingest_idea", {"source_label": source_label}, work,
+        )
+
+    async def handle_ingest_status(self, args):
+        # Strict isinstance — ``None`` / ``{}`` / ``123`` should
+        # surface as a validation error, not get silently coerced
+        # to a non-existent job_id and report ``{"error": "not
+        # found"}``. That ambiguity made caller bugs
+        # indistinguishable from a genuinely missing job.
+        job_id = args.get("job_id", "")
+        if not isinstance(job_id, str):
+            return {"error": f"job_id must be a string, got {type(job_id).__name__}"}
+        job_id = job_id.strip()
+        if not job_id:
+            return {"error": "job_id is required"}
+        store = self._get_job_store()
+        job = await store.get(job_id)
+        if job is None:
+            return {"error": "not found", "job_id": job_id}
+        return job.to_status()
 
     async def start(self):
         skills = self._all_skills()
@@ -557,6 +890,65 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         registry = getattr(self, "_ingest_watcher_registry", None)
         if registry is not None:
             await registry.shutdown()
+        # Cancel any in-flight async ingest jobs so they don't publish
+        # progress events into a connector that's about to close.
+        # We snapshot the set first so the per-task ``done_callback``
+        # mutation doesn't race the iteration. Best-effort: a task
+        # already in the middle of an awaited library call observes
+        # ``CancelledError`` on the next checkpoint, which
+        # ``run_ingest_job`` translates into ``phase=error`` with
+        # ``CancelledError`` recorded; tasks queued on the semaphore
+        # are handled by the driver's own except branch.
+        #
+        # Bounded with a hard timeout so a single slow operation —
+        # e.g. ``repo_tree()`` blocking inside a 120s ``git clone``
+        # subprocess that doesn't observe cancellation promptly —
+        # can't hold the agent's shutdown indefinitely. After the
+        # timeout we abandon the survivors: detach them from the
+        # ingest-task set AND silence the
+        # ``Task was destroyed but it is pending!`` warning that
+        # ``asyncio.run`` would otherwise emit at loop teardown.
+        # The survivors continue to run on the loop until they
+        # observe cancellation or finish naturally; the agent's
+        # ``shutdown()`` returns within the bound and the bus
+        # connector closes regardless. Loop teardown will eventually
+        # collect them, but the agent is already unregistered.
+        tasks = list(getattr(self, "_ingest_tasks", ()) or ())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                    ),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                survivors = [t for t in tasks if not t.done()]
+                tracked = self._ingest_tasks
+                for t in survivors:
+                    # Suppress the runtime warning at loop teardown.
+                    # Setting ``_log_destroy_pending`` is the
+                    # documented escape hatch for "I deliberately
+                    # abandoned this task and accept the
+                    # consequences."
+                    t._log_destroy_pending = False
+                    # Detach from the agent's tracked set too, so a
+                    # second shutdown signal doesn't re-iterate the
+                    # same already-cancelled-but-stuck tasks and
+                    # eat another 10s cancel grace period waiting
+                    # on them. The per-task ``done_callback`` would
+                    # eventually do this when the task finishes
+                    # naturally, but we don't want to wait.
+                    tracked.discard(t)
+                logger.warning(
+                    "ingest shutdown abandoned %d task(s) still running "
+                    "after 10s cancel grace period; they will be "
+                    "collected at loop teardown",
+                    len(survivors),
+                )
         await BaseAgent.shutdown(self)
 
     import signal
@@ -567,6 +959,13 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["stop_ingest_watcher"] = MethodType(handle_stop_ingest_watcher, agent)
     agent._handlers["stage_payload"] = MethodType(handle_stage_payload, agent)
     agent._handlers["ingest_from_artifact"] = MethodType(handle_ingest_from_artifact, agent)
+    agent._handlers["ingest_github_async"] = MethodType(handle_ingest_github_async, agent)
+    agent._handlers["ingest_file_async"] = MethodType(handle_ingest_file_async, agent)
+    agent._handlers["ingest_idea_async"] = MethodType(handle_ingest_idea_async, agent)
+    agent._handlers["ingest_status"] = MethodType(handle_ingest_status, agent)
+    agent._get_job_store = MethodType(_get_job_store, agent)
+    agent._get_ingest_semaphore = MethodType(_get_ingest_semaphore, agent)
+    agent._spawn_ingest_job = MethodType(_spawn_ingest_job, agent)
     agent.start = MethodType(start, agent)
     agent.shutdown = MethodType(shutdown, agent)
 
