@@ -6,10 +6,16 @@ artifact suitable for prompt augmentation during code review. The intent is
 to hand reviewers a project's "conventions" without forcing the original
 10–20k tokens of narrative markdown into every review prompt.
 
-This module exposes pure functions (hashing, corpus normalization, LLM
-extraction). Caching against the bus store and storage of the resulting
-artifact live in the agent-side handler so this layer stays testable in
-isolation.
+Layering:
+
+* Pure helpers (``normalize_corpus``, ``compute_corpus_hash``,
+  ``cache_fingerprint``, ``cache_artifact_id``, ``extract_normative_claims``)
+  have no I/O.
+* ``distill_repo_docs`` is the cache-aware orchestrator. It takes a
+  ``store_request`` callable so the actual store RPC mechanism (bus request
+  envelope unwrap, agent-type routing) lives in the agent-side handler.
+  Tests inject a fake store_request to exercise hit/miss branches without
+  bringing up the bus.
 """
 
 from __future__ import annotations
@@ -52,6 +58,16 @@ DOCS:
 # Sized to fit qwen2.5:7b's 32k-token context with room for the prompt
 # scaffold + response. Tunable per-call.
 MAX_CORPUS_CHARS = 80_000
+
+# Read-side cap on cache-hit ``artifact_get`` calls. Matches the
+# bus/store HARD_MAX_CHARS=20000 ceiling (see
+# ``khonliang_bus.bus.artifacts.HARD_MAX_CHARS`` and
+# ``khonliang_store.store.local_store.HARD_MAX_CHARS``) so the requested
+# size matches what we'll actually receive. Distillations land well
+# under this (``max_tokens=3000`` ≈ 12 KB of text), so a cache hit
+# returning ``truncated=True`` is an integrity signal worth surfacing
+# rather than something to silently work around.
+_CACHE_GET_MAX_CHARS = 20_000
 
 
 def normalize_corpus(content: dict[str, str]) -> str:
@@ -216,17 +232,32 @@ async def distill_repo_docs(
     cached_meta = _unwrap(cached)
     if isinstance(cached_meta, dict) and "error" not in cached_meta:
         body_envelope = await store_request(
-            "artifact_get", {"id": artifact_id, "max_chars": max_tokens * 8},
+            "artifact_get",
+            {"id": artifact_id, "offset": 0, "max_chars": _CACHE_GET_MAX_CHARS},
         )
         body_payload = _unwrap(body_envelope)
-        digest = ""
-        if isinstance(body_payload, dict):
-            digest = (
-                body_payload.get("text")
-                or body_payload.get("content")
-                or body_payload.get("body")
-                or ""
-            )
+        # Cache hit means metadata exists. Body retrieval failures should be
+        # surfaced, not papered over with an empty-string digest — mirrors
+        # ``ingest_from_artifact``'s handling so a store regression doesn't
+        # silently leak partial content as ``cache_hit=True``.
+        if not isinstance(body_payload, dict):
+            return {"error": "store returned unexpected response shape on cache hit"}
+        if "error" in body_payload:
+            return body_payload
+        if body_payload.get("truncated") is True:
+            return {
+                "error": (
+                    f"cached distillation {artifact_id} exceeds "
+                    f"{_CACHE_GET_MAX_CHARS}-char read cap; refusing to return "
+                    "a partial digest"
+                ),
+            }
+        digest = (
+            body_payload.get("text")
+            or body_payload.get("content")
+            or body_payload.get("body")
+            or ""
+        )
         meta = cached_meta.get("artifact") if isinstance(cached_meta.get("artifact"), dict) else cached_meta
         return {
             "artifact_id": artifact_id,

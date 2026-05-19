@@ -307,6 +307,71 @@ async def test_distill_repo_docs_prompt_version_invalidates_cache():
 
 
 @pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_surfaces_get_error():
+    """If artifact_metadata hits but artifact_get errors, surface the error — don't return empty digest as cache_hit=True."""
+
+    pool = _FakePool(_FakeClient())
+
+    # Sequence: metadata says it exists, but the body read returns an error.
+    async def hit_then_get_error(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"id": args["id"], "metadata": {
+                "source_sha256": "x", "model": "qwen2.5:7b", "prompt_version": "v1",
+            }}}
+        if operation == "artifact_get":
+            return {"result": {"error": "content missing"}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_then_get_error,
+    )
+    assert result == {"error": "content missing"}
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_rejects_truncated_body():
+    """A truncated cache-hit body is an integrity signal; surface as error, never return partial."""
+
+    pool = _FakePool(_FakeClient())
+
+    async def hit_with_truncation(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"id": args["id"], "metadata": {}}}
+        if operation == "artifact_get":
+            return {"result": {"text": "partial body", "truncated": True}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_with_truncation,
+    )
+    assert "error" in result
+    assert "truncated" in result["error"] or "partial digest" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_get_passes_bounded_max_chars():
+    """The cache-hit artifact_get must bound max_chars at HARD_MAX_CHARS=20000."""
+
+    pool = _FakePool(_FakeClient())
+    captured_get_args: dict = {}
+
+    async def capture(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"id": args["id"], "metadata": {}}}
+        if operation == "artifact_get":
+            captured_get_args.update(args)
+            return {"result": {"text": "cached digest"}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=capture,
+    )
+    assert result["cache_hit"] is True
+    assert captured_get_args["max_chars"] == 20_000
+    assert captured_get_args.get("offset") == 0
+
+
+@pytest.mark.asyncio
 async def test_distill_repo_docs_store_create_error_surfaces():
     """Store-side failure during artifact_create returns the error envelope verbatim."""
 
