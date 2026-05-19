@@ -297,6 +297,57 @@ async def ingest_from_artifact(
     }
 
 
+async def distill_repo_docs_handler(
+    agent: BaseAgent, pipeline, args: dict,
+) -> dict:
+    """Bus-skill handler for ``distill_repo_docs``.
+
+    Validates ``args``, builds the store-routing closure, and delegates to
+    :func:`researcher.repo_docs.distill_repo_docs`. Module-level so tests
+    can drive it without wiring through ``BaseAgent.from_mcp`` — pass a
+    fake agent (with ``request`` + ``agent_id``) and a fake pipeline (with
+    ``pool``).
+    """
+    from researcher.repo_docs import distill_repo_docs
+
+    content_raw = args.get("content")
+    if not isinstance(content_raw, dict):
+        return {"error": "content must be an object mapping path -> body"}
+    if not content_raw:
+        return {"error": "content is required"}
+    # Defer per-file type-checking to repo_docs.normalize_corpus — it raises
+    # TypeError with the offending path, which we surface as a clean envelope.
+    repo_name_raw = args.get("repo_name", "")
+    if not isinstance(repo_name_raw, str):
+        return {"error": "repo_name must be a string"}
+    model_role_raw = args.get("model_role", "summarizer")
+    if not isinstance(model_role_raw, str) or not model_role_raw.strip():
+        return {"error": "model_role must be a non-empty string"}
+    prompt_version_raw = args.get("prompt_version", "v1")
+    if not isinstance(prompt_version_raw, str) or not prompt_version_raw.strip():
+        return {"error": "prompt_version must be a non-empty string"}
+
+    async def store_request(operation: str, op_args: dict) -> dict:
+        return await agent.request(
+            agent_type="store",
+            operation=operation,
+            args=op_args,
+        )
+
+    try:
+        return await distill_repo_docs(
+            content=content_raw,
+            pool=pipeline.pool,
+            store_request=store_request,
+            repo_name=repo_name_raw.strip(),
+            model_role=model_role_raw.strip(),
+            prompt_version=prompt_version_raw.strip(),
+            producer=getattr(agent, "agent_id", ""),
+        )
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+
+
 def _unwrap_request_envelope(result):
     """Pull ``result["result"]`` out of the bus request envelope.
 
@@ -516,6 +567,26 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 {"job_id": {"type": "string", "required": True}},
                 since="0.4.0",
             ),
+            Skill(
+                "distill_repo_docs",
+                "Distill a repository's docs corpus (READMEs, "
+                "ARCHITECTURE.md, conventions, CLAUDE.md, ...) into a "
+                "compact bulleted list of normative claims — invariants, "
+                "must / must-not rules, architectural decisions — suitable "
+                "for prompt augmentation during code review. Cached by "
+                "content sha256 + model + prompt_version: identical inputs "
+                "return the existing artifact without re-running the LLM. "
+                "The stored artifact lives on store-primary as "
+                "kind='researcher_distillation' with a deterministic "
+                "art_repodocs_<hex> id. See fr_researcher_86a810a3.",
+                {
+                    "content": {"type": "object", "required": True},
+                    "repo_name": {"type": "string", "default": ""},
+                    "model_role": {"type": "string", "default": "summarizer"},
+                    "prompt_version": {"type": "string", "default": "v1"},
+                },
+                since="0.5.0",
+            ),
         ]
         for skill in extras:
             if skill.name not in names:
@@ -559,6 +630,9 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
 
     async def handle_ingest_from_artifact(self, args):
         return await ingest_from_artifact(self, pipeline, args)
+
+    async def handle_distill_repo_docs(self, args):
+        return await distill_repo_docs_handler(self, pipeline, args)
 
     def _get_job_store(self) -> IngestJobStore:
         store = getattr(self, "_ingest_job_store", None)
@@ -959,6 +1033,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["stop_ingest_watcher"] = MethodType(handle_stop_ingest_watcher, agent)
     agent._handlers["stage_payload"] = MethodType(handle_stage_payload, agent)
     agent._handlers["ingest_from_artifact"] = MethodType(handle_ingest_from_artifact, agent)
+    agent._handlers["distill_repo_docs"] = MethodType(handle_distill_repo_docs, agent)
     agent._handlers["ingest_github_async"] = MethodType(handle_ingest_github_async, agent)
     agent._handlers["ingest_file_async"] = MethodType(handle_ingest_file_async, agent)
     agent._handlers["ingest_idea_async"] = MethodType(handle_ingest_idea_async, agent)
