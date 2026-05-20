@@ -307,6 +307,72 @@ async def test_distill_repo_docs_prompt_version_invalidates_cache():
 
 
 @pytest.mark.asyncio
+async def test_distill_repo_docs_metadata_non_not_found_error_is_surfaced():
+    """A real store failure on artifact_metadata must NOT be silently treated as a cache miss."""
+
+    pool = _FakePool(_FakeClient())
+    llm_calls = {"count": 0}
+
+    async def perm_denied_store(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"error": "permission denied"}}
+        # If the orchestrator wrongly treated the error as a miss, it would
+        # call artifact_create — which we'd reach here and which must NOT happen.
+        raise AssertionError(f"unexpected op after metadata error: {operation}")
+
+    # Wrap the pool's client to detect any LLM call (also must not happen).
+    original_generate = pool.client.generate
+    async def tracking_generate(**kwargs):
+        llm_calls["count"] += 1
+        return await original_generate(**kwargs)
+    pool.client.generate = tracking_generate  # type: ignore[assignment]
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=perm_denied_store,
+    )
+    assert result == {"error": "permission denied"}
+    assert llm_calls["count"] == 0  # LLM must not have run
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_metadata_non_dict_response_is_surfaced():
+    """A non-dict response on artifact_metadata is a contract break; abort cleanly."""
+
+    pool = _FakePool(_FakeClient())
+
+    async def garbage_store(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": "not a dict"}  # contract break
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=garbage_store,
+    )
+    assert "error" in result
+    assert "unexpected response shape" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_create_non_dict_response_is_surfaced():
+    """A non-dict response on artifact_create is a contract break; abort cleanly."""
+
+    pool = _FakePool(_FakeClient(response="- [source:a.md] r"))
+
+    async def half_broken_store(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"error": "not found"}}
+        if operation == "artifact_create":
+            return {"result": ["not a dict"]}  # contract break
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"a.md": "rule"}, pool=pool, store_request=half_broken_store,
+    )
+    assert "error" in result
+    assert "unexpected response shape" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_distill_repo_docs_cache_hit_surfaces_get_error():
     """If artifact_metadata hits but artifact_get errors, surface the error — don't return empty digest as cache_hit=True."""
 

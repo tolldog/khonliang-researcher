@@ -8,14 +8,16 @@ to hand reviewers a project's "conventions" without forcing the original
 
 Layering:
 
-* Pure helpers (``normalize_corpus``, ``compute_corpus_hash``,
-  ``cache_fingerprint``, ``cache_artifact_id``, ``extract_normative_claims``)
-  have no I/O.
-* ``distill_repo_docs`` is the cache-aware orchestrator. It takes a
-  ``store_request`` callable so the actual store RPC mechanism (bus request
-  envelope unwrap, agent-type routing) lives in the agent-side handler.
-  Tests inject a fake store_request to exercise hit/miss branches without
-  bringing up the bus.
+* Stateless helpers (``normalize_corpus``, ``compute_corpus_hash``,
+  ``cache_fingerprint``, ``cache_artifact_id``) have no I/O at all.
+* ``extract_normative_claims`` is also store-free, but it does call the
+  LLM via the supplied ``pool``. Use it as the building block when you
+  want the transform without the cache.
+* ``distill_repo_docs`` is the cache-aware orchestrator. It calls the LLM
+  AND routes store I/O through a ``store_request`` callable so the bus
+  RPC mechanism (envelope unwrap, agent-type routing) lives in the
+  agent-side handler. Tests inject a fake store_request to exercise
+  hit/miss / error / truncated branches without bringing up the bus.
 """
 
 from __future__ import annotations
@@ -200,10 +202,15 @@ async def distill_repo_docs(
     """End-to-end: compute hash, check cache, run LLM on miss, store result.
 
     ``store_request`` is an async callable ``(operation, args) -> envelope``
-    that routes a single store skill call (``artifact_metadata`` or
-    ``artifact_create``). The agent-side handler wires this to
+    that routes a single store skill call. Three operations are issued:
+
+    * ``artifact_metadata`` (always, to probe the cache key)
+    * ``artifact_get`` (on cache hit, to fetch the body)
+    * ``artifact_create`` (on cache miss, after the LLM run)
+
+    The agent-side handler wires this to
     ``agent.request(agent_type='store', operation=op, args=args)``; tests
-    can pass a fake to exercise the cache-hit / cache-miss branches
+    pass a fake to exercise the hit / miss / error / truncated branches
     without bringing up the bus.
 
     Returns the cache shape on success:
@@ -216,7 +223,10 @@ async def distill_repo_docs(
             "cache_hit": bool,
             "repo_name": str,
         }
-    Or an ``{"error": ...}`` envelope from store, surfaced verbatim.
+    Or an ``{"error": ...}`` envelope from store, surfaced verbatim. The
+    ``artifact_metadata`` "not found" error is treated as a cache miss
+    rather than surfaced; any other metadata error is a real failure and
+    aborts the call.
     """
     source_sha256 = compute_corpus_hash(content)
     # Resolve the client exactly once: the effective model determines the
@@ -230,7 +240,18 @@ async def distill_repo_docs(
         "artifact_metadata", {"id": artifact_id},
     )
     cached_meta = _unwrap(cached)
-    if isinstance(cached_meta, dict) and "error" not in cached_meta:
+    # Fail fast on an unparseable response — a non-dict here means the
+    # store contract is broken; better to abort than mistake it for a
+    # cache miss and silently run the LLM.
+    if not isinstance(cached_meta, dict):
+        return {"error": "store returned unexpected response shape on metadata lookup"}
+    if "error" in cached_meta:
+        # "not found" is the documented cache-miss sentinel; everything
+        # else (permission, network, integrity) is a real failure and
+        # must surface — don't silently fall through to an LLM run.
+        if not _is_not_found_error(cached_meta["error"]):
+            return cached_meta
+    else:
         body_envelope = await store_request(
             "artifact_get",
             {"id": artifact_id, "offset": 0, "max_chars": _CACHE_GET_MAX_CHARS},
@@ -313,15 +334,18 @@ async def distill_repo_docs(
         },
     )
     create_payload = _unwrap(create_envelope)
-    if isinstance(create_payload, dict) and "error" in create_payload:
+    # Mirror stage_payload / ingest_from_artifact: require a dict payload.
+    # A non-dict here would silently get treated as "success" without an
+    # id, masking real store-shape regressions.
+    if not isinstance(create_payload, dict):
+        return {"error": "store returned unexpected response shape on artifact_create"}
+    if "error" in create_payload:
         return create_payload
-    stored_id = artifact_id
-    if isinstance(create_payload, dict):
-        stored_id = (
-            create_payload.get("id")
-            or (create_payload.get("artifact") or {}).get("id")
-            or artifact_id
-        )
+    stored_id = (
+        create_payload.get("id")
+        or (create_payload.get("artifact") or {}).get("id")
+        or artifact_id
+    )
     return {
         "artifact_id": stored_id,
         "digest": digest,
@@ -343,3 +367,16 @@ def _unwrap(envelope: Any) -> Any:
     if isinstance(envelope, dict):
         return envelope.get("result", envelope)
     return envelope
+
+
+def _is_not_found_error(message: Any) -> bool:
+    """True if a store error envelope's ``error`` string means cache-miss.
+
+    Store agents return errors as opaque strings; this is the conventional
+    sentinel (``"not found"``, possibly with extra context). Anything else
+    — permission denied, transport failure, integrity failure — must be
+    surfaced rather than swallowed as a miss.
+    """
+    if not isinstance(message, str):
+        return False
+    return "not found" in message.lower()
