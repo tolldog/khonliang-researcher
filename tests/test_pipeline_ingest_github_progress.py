@@ -90,3 +90,66 @@ async def test_ingest_github_repo_invokes_progress_callback_with_keyword_args():
 
     assert len(seen) == 1, f"expected exactly one progress call, got {seen!r}"
     assert seen[0] == {"phase": "cloning", "progress_pct": 10}
+
+
+@pytest.mark.asyncio
+async def test_ingest_github_repo_stores_research_scope(tmp_path):
+    """Regression for bug_researcher_0be22a09: GitHub-ingested entries must be
+    stored under scope='research' so Pipeline.search — the retrieval path behind
+    find_relevant and brief_on — actually reaches them. The prior scope='external'
+    left them in the knowledge table but invisible to retrieval (the search
+    filters to scope=research/global).
+
+    Drives the real ``ingest_github_repo`` with ``depth='readme'`` against an
+    empty repo dir (no README, no AST scan → no LLM calls), stubbing only the
+    store/triple/digest/score collaborators, and asserts the entry handed to
+    ``knowledge.add`` carries scope='research'."""
+    from contextlib import contextmanager
+
+    from researcher.pipeline import ResearchPipeline
+
+    captured: dict = {}
+
+    class _FakeKnowledge:
+        def add(self, entry):
+            captured["entry"] = entry
+
+    class _FakeTriples:
+        def add(self, **kwargs):
+            pass
+
+    class _FakeDigest:
+        def record(self, **kwargs):
+            pass
+
+    async def _fake_score(entry_id):
+        return {}
+
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.knowledge = _FakeKnowledge()
+    pipe.triples = _FakeTriples()
+    pipe.digest = _FakeDigest()
+    pipe.score_relevance = _fake_score
+    pipe._extract_package_metadata = lambda repo_path: {
+        "description": "", "dependencies": [], "entry_points": [], "mcp_tools": [],
+    }
+
+    @contextmanager
+    def _fake_repo_tree(url, prefix=""):
+        yield tmp_path  # empty dir → no README, no LLM calls on the readme path
+
+    with patch("researcher.util.github_repo_key", return_value="o/r"), \
+         patch("researcher.util.repo_tree", _fake_repo_tree):
+        result = await ResearchPipeline.ingest_github_repo(
+            pipe, repo_url="https://github.com/o/r", depth="readme",
+        )
+
+    assert "error" not in result, result
+    entry = captured.get("entry")
+    assert entry is not None, "knowledge.add was never called"
+    assert entry.scope == "research", (
+        f"GitHub entries must be scope='research' to be retrievable via "
+        f"find_relevant/brief_on; got {entry.scope!r}"
+    )
+    # external-origin distinction must still be preserved out-of-band.
+    assert "external" in entry.tags
