@@ -248,6 +248,29 @@ async def test_file_async_strict_isinstance_validation():
 
 
 @pytest.mark.asyncio
+async def test_watch_ingest_queue_rejects_non_int_interval():
+    """``int(args["interval_s"])`` crashed with an unhandled ValueError on a
+    non-numeric string and silently truncated floats / coerced bools. Validate
+    strictly (rejecting bool, an int subclass) and return an error envelope."""
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+    for bad in ("abc", 2.5, None, {"a": 1}, True, False):
+        out = await agent._handlers["watch_ingest_queue"]({"interval_s": bad})
+        assert "must be an integer" in out.get("error", ""), (bad, out)
+
+
+@pytest.mark.asyncio
+async def test_stop_ingest_watcher_rejects_non_string_id():
+    """``str(args["watcher_id"])`` stringified None/123 into a bogus id and
+    masked the caller bug as a silent 'watcher not found'."""
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+    for bad in (None, 123, {"a": 1}, ["x"]):
+        out = await agent._handlers["stop_ingest_watcher"]({"watcher_id": bad})
+        assert "must be a string" in out.get("error", ""), (bad, out)
+
+
+@pytest.mark.asyncio
 async def test_status_strict_isinstance_validation():
     """``ingest_status({"job_id": None})`` previously coerced to
     the string ``"None"`` and returned ``{"error": "not found"}``,

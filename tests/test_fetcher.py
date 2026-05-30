@@ -19,6 +19,29 @@ LINKEDIN_INTERSTITIAL = """
 """
 
 
+def test_detect_format_pdf_url_served_as_html_is_html():
+    # A .pdf URL that the server explicitly serves as HTML is an error/
+    # challenge page, not a PDF — must not be routed to the PDF parser.
+    assert (
+        fetcher._detect_format("https://x/paper.pdf", "text/html; charset=utf-8")
+        == ContentFormat.HTML
+    )
+
+
+def test_detect_format_pdf_extension_wins_for_ambiguous_content_type():
+    # The legitimate "server miscategorizes a real PDF" case is preserved:
+    # ambiguous/empty/text-plain Content-Type on a .pdf URL stays PDF.
+    assert fetcher._detect_format("https://x/paper.pdf", "") == ContentFormat.PDF
+    assert (
+        fetcher._detect_format("https://x/paper.pdf", "text/plain")
+        == ContentFormat.PDF
+    )
+    assert (
+        fetcher._detect_format("https://x/paper.pdf", "application/pdf")
+        == ContentFormat.PDF
+    )
+
+
 def test_extract_linkedin_external_url():
     assert (
         fetcher._extract_linkedin_external_url(

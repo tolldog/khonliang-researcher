@@ -606,7 +606,13 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         return registry
 
     async def handle_watch_ingest_queue(self, args):
-        interval_s = int(args.get("interval_s", 5))
+        interval_s = args.get("interval_s", 5)
+        # Strict isinstance (rejecting bool, which is an int subclass) like the
+        # other handlers — ``int(...)`` would crash on a non-numeric string
+        # with an unhandled ValueError instead of returning an error envelope,
+        # and silently truncate floats / coerce bools.
+        if not isinstance(interval_s, int) or isinstance(interval_s, bool):
+            return {"error": "interval_s must be an integer"}
         if interval_s <= 0:
             return {"error": "interval_s must be positive"}
         registry = await _get_ingest_registry(self)
@@ -618,7 +624,13 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         return {"watchers": registry.list_watchers()}
 
     async def handle_stop_ingest_watcher(self, args):
-        watcher_id = str(args.get("watcher_id", "")).strip()
+        watcher_id_raw = args.get("watcher_id", "")
+        # Strict type check rather than str()-coercion, which would stringify
+        # None/123/objects into a bogus id ("None", "123") and mask a caller
+        # type error as a silent "watcher not found".
+        if not isinstance(watcher_id_raw, str):
+            return {"error": "watcher_id must be a string"}
+        watcher_id = watcher_id_raw.strip()
         if not watcher_id:
             return {"error": "watcher_id is required"}
         registry = await _get_ingest_registry(self)

@@ -140,7 +140,14 @@ def load_opml(path: str) -> Dict[str, FeedConfig]:
                         category = cat
                         break
 
-            key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:30]
+            base = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:30]
+            # Two feeds whose sanitized+truncated names collide must not
+            # overwrite each other; disambiguate with a numeric suffix.
+            key = base
+            n = 2
+            while key in feeds:
+                key = f"{base}_{n}"
+                n += 1
             feeds[key] = FeedConfig(name=name, url=url, source=key)
 
     return feeds
@@ -177,6 +184,28 @@ def _parse_feed(xml_text: str, source: str) -> List[EngineResult]:
                 url=url,
                 source=source,
                 metadata={"published": published},
+            ))
+    elif root.tag.endswith("}RDF") or "rdf-syntax-ns" in root.tag:
+        # RSS 1.0 (RDF): <item> elements are namespaced under the RSS 1.0
+        # namespace and sit under the RDF root, not inside <channel>. Plain
+        # ``findall("item")`` (the RSS 2.0 path below) matches nothing here,
+        # so these feeds would otherwise parse to zero entries silently.
+        rss1 = {
+            "rss": "http://purl.org/rss/1.0/",
+            "dc": "http://purl.org/dc/elements/1.1/",
+        }
+        for item in root.findall("rss:item", rss1):
+            title = _text(item.find("rss:title", rss1))
+            desc = _text(item.find("rss:description", rss1))
+            url = _text(item.find("rss:link", rss1))
+            pub_date = _text(item.find("dc:date", rss1))
+
+            results.append(EngineResult(
+                title=title,
+                content=_strip_html(desc)[:500] if desc else "",
+                url=url,
+                source=source,
+                metadata={"published": pub_date},
             ))
     else:
         # RSS 2.0 feed
@@ -250,6 +279,11 @@ class RSSEngine(BaseEngine):
         # Simple keyword search across cached entries
         query_lower = query.lower()
         keywords = query_lower.split()
+        if not keywords:
+            # No searchable terms — return nothing rather than dividing by
+            # len(keywords)==0 below (ZeroDivisionError, which BaseEngine.query
+            # would swallow into a silent empty result).
+            return []
         results = []
 
         for entry in self._cache:
