@@ -1,0 +1,684 @@
+"""Tests for repo-docs distillation primitives (fr_researcher_86a810a3)."""
+
+from __future__ import annotations
+
+import pytest
+
+from researcher.repo_docs import (
+    MAX_CORPUS_CHARS,
+    NORMATIVE_CLAIM_PROMPT_VERSION,
+    cache_artifact_id,
+    cache_fingerprint,
+    compute_corpus_hash,
+    distill_repo_docs,
+    extract_normative_claims,
+    fingerprint_matches,
+    normalize_corpus,
+)
+
+
+def test_normalize_corpus_sorted_by_path():
+    out = normalize_corpus({"b.md": "B", "a.md": "A"})
+    assert out.index("# a.md") < out.index("# b.md")
+
+
+def test_normalize_corpus_normalizes_line_endings_and_trailing_whitespace():
+    a = normalize_corpus({"x.md": "line1  \r\nline2\t \r\n"})
+    b = normalize_corpus({"x.md": "line1\nline2\n"})
+    assert a == b
+
+
+def test_normalize_corpus_rejects_non_dict():
+    with pytest.raises(TypeError):
+        normalize_corpus("not a dict")  # type: ignore[arg-type]
+
+
+def test_normalize_corpus_rejects_empty_dict():
+    with pytest.raises(ValueError, match="content is required"):
+        normalize_corpus({})
+
+
+def test_normalize_corpus_rejects_non_string_body():
+    with pytest.raises(TypeError, match="must be a string"):
+        normalize_corpus({"x.md": 123})  # type: ignore[dict-item]
+
+
+def test_compute_corpus_hash_is_stable_across_dict_order_and_line_endings():
+    h1 = compute_corpus_hash({"a.md": "x\r\n", "b.md": "y  \n"})
+    h2 = compute_corpus_hash({"b.md": "y\n", "a.md": "x\n"})
+    assert h1 == h2
+
+
+def test_compute_corpus_hash_differs_on_content_change():
+    h1 = compute_corpus_hash({"a.md": "rule one"})
+    h2 = compute_corpus_hash({"a.md": "rule two"})
+    assert h1 != h2
+
+
+def test_compute_corpus_hash_is_64_hex_chars():
+    h = compute_corpus_hash({"a.md": "anything"})
+    assert len(h) == 64
+    assert all(c in "0123456789abcdef" for c in h)
+
+
+def test_cache_fingerprint_round_trips():
+    fp = cache_fingerprint(
+        source_sha256="deadbeef", model="qwen2.5:7b", prompt_version="v1",
+    )
+    assert fingerprint_matches(fp, fp)
+    # Missing key -> no match
+    assert not fingerprint_matches({"source_sha256": "deadbeef"}, fp)
+    # Different value -> no match
+    assert not fingerprint_matches(
+        {**fp, "model": "qwen2.5:32b"}, fp,
+    )
+
+
+def test_fingerprint_matches_rejects_non_dict_metadata():
+    fp = cache_fingerprint(source_sha256="x", model="y", prompt_version="v1")
+    assert not fingerprint_matches(None, fp)
+    assert not fingerprint_matches("string", fp)
+
+
+# ---------------------------------------------------------------------------
+# extract_normative_claims (LLM transform with a mocked pool)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClient:
+    """Captures call args; returns a fixed digest."""
+
+    def __init__(self, response: str = "- [source:README.md] never panic", model: str = "qwen2.5:7b"):
+        self.response = response
+        self.model = model
+        self.last_kwargs: dict | None = None
+
+    async def generate(self, **kwargs) -> str:
+        self.last_kwargs = kwargs
+        return self.response
+
+
+class _FakePool:
+    def __init__(self, client: _FakeClient):
+        self.client = client
+        self.last_role: str | None = None
+
+    def get_client(self, role: str) -> _FakeClient:
+        self.last_role = role
+        return self.client
+
+
+def _hit_metadata(content: dict[str, str], *, model: str = "qwen2.5:7b",
+                  prompt_version: str = "v1", **extra) -> dict:
+    """Stored-metadata payload that satisfies the cache-hit fingerprint check.
+
+    The cache-hit path verifies the artifact's metadata carries the requested
+    (source_sha256, model, prompt_version) fingerprint before trusting its
+    digest, so body-branch tests must return metadata that actually matches the
+    content/model they call with — otherwise they short-circuit on the
+    integrity error before reaching the branch under test.
+    """
+    fp = cache_fingerprint(
+        source_sha256=compute_corpus_hash(content),
+        model=model,
+        prompt_version=prompt_version,
+    )
+    return {"metadata": {**fp, **extra}}
+
+
+@pytest.mark.asyncio
+async def test_extract_normative_claims_calls_summarizer_with_corpus():
+    client = _FakeClient(response="- [source:README.md] always use Result types\n")
+    pool = _FakePool(client)
+    result = await extract_normative_claims(
+        {"README.md": "All errors MUST be returned as Result.", "docs/intro.md": "Welcome!"},
+        pool,
+    )
+    assert result["digest"] == "- [source:README.md] always use Result types"
+    assert result["model"] == "qwen2.5:7b"
+    assert result["prompt_version"] == NORMATIVE_CLAIM_PROMPT_VERSION
+    assert pool.last_role == "summarizer"
+    # Corpus must be present in the prompt, both paths included.
+    prompt = client.last_kwargs["prompt"]
+    assert "# README.md" in prompt
+    assert "# docs/intro.md" in prompt
+    assert client.last_kwargs["temperature"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_extract_normative_claims_respects_model_role_override():
+    client = _FakeClient()
+    pool = _FakePool(client)
+    await extract_normative_claims(
+        {"x.md": "Never block on I/O."},
+        pool,
+        model_role="reviewer",
+    )
+    assert pool.last_role == "reviewer"
+
+
+@pytest.mark.asyncio
+async def test_extract_normative_claims_rejects_oversized_corpus():
+    big = "x" * (MAX_CORPUS_CHARS + 1)
+    pool = _FakePool(_FakeClient())
+    with pytest.raises(ValueError, match="exceeds max_corpus_chars"):
+        await extract_normative_claims({"big.md": big}, pool)
+
+
+# ---------------------------------------------------------------------------
+# cache_artifact_id + distill_repo_docs end-to-end with a fake store
+# ---------------------------------------------------------------------------
+
+
+def test_cache_artifact_id_is_deterministic_and_prefixed():
+    a = cache_artifact_id("deadbeef", "qwen2.5:7b", "v1")
+    b = cache_artifact_id("deadbeef", "qwen2.5:7b", "v1")
+    c = cache_artifact_id("deadbeef", "qwen2.5:32b", "v1")
+    d = cache_artifact_id("deadbeef", "qwen2.5:7b", "v2")
+    assert a == b
+    assert a != c
+    assert a != d
+    assert a.startswith("art_repodocs_")
+
+
+class _FakeStore:
+    """Records (operation, args) calls; returns scripted envelopes."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+        # Artifacts keyed by id; populated on artifact_create, read on
+        # artifact_metadata + artifact_get.
+        self.artifacts: dict[str, dict] = {}
+
+    async def __call__(self, operation: str, args: dict) -> dict:
+        self.calls.append((operation, args))
+        if operation == "artifact_metadata":
+            existing = self.artifacts.get(args["id"])
+            if existing is None:
+                return {"result": {"error": "not found"}}
+            return {"result": existing["meta"]}
+        if operation == "artifact_get":
+            existing = self.artifacts.get(args["id"])
+            if existing is None:
+                return {"result": {"error": "not found"}}
+            return {"result": {"text": existing["content"]}}
+        if operation == "artifact_create":
+            aid = args["id"]
+            self.artifacts[aid] = {
+                "content": args["content"],
+                "meta": {
+                    "id": aid,
+                    "kind": args["kind"],
+                    "title": args["title"],
+                    "metadata": args.get("metadata", {}),
+                    "producer": args.get("producer", ""),
+                },
+            }
+            return {"result": {"id": aid}}
+        raise AssertionError(f"unexpected operation: {operation}")
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_miss_then_hit():
+    """First call runs LLM + stores; second call with identical content reuses."""
+    client = _FakeClient(response="- [source:README.md] never panic")
+    pool = _FakePool(client)
+    store = _FakeStore()
+    content = {"README.md": "All errors MUST return Result."}
+
+    first = await distill_repo_docs(
+        content=content, pool=pool, store_request=store,
+        repo_name="myrepo", producer="researcher-test",
+    )
+    assert first["cache_hit"] is False
+    assert first["digest"] == "- [source:README.md] never panic"
+    assert first["artifact_id"].startswith("art_repodocs_")
+
+    # Second call with same content -> hits cache.
+    pool.client.last_kwargs = None  # reset so a second LLM call would be detectable
+    second = await distill_repo_docs(
+        content=content, pool=pool, store_request=store,
+        repo_name="myrepo", producer="researcher-test",
+    )
+    assert second["cache_hit"] is True
+    assert second["artifact_id"] == first["artifact_id"]
+    assert second["digest"] == first["digest"]
+    # Second call must not have invoked the LLM.
+    assert pool.client.last_kwargs is None
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_changed_content_misses_cache():
+    pool = _FakePool(_FakeClient(response="- [source:a.md] rule"))
+    store = _FakeStore()
+
+    a = await distill_repo_docs(
+        content={"a.md": "Original."}, pool=pool, store_request=store,
+    )
+    b = await distill_repo_docs(
+        content={"a.md": "Changed."}, pool=pool, store_request=store,
+    )
+    assert a["cache_hit"] is False
+    assert b["cache_hit"] is False
+    assert a["artifact_id"] != b["artifact_id"]
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_model_change_invalidates_cache():
+    """Switching model role -> different effective model -> different cache key."""
+
+    class _SwapClient:
+        """Returns a different model name on each get_client call to simulate role swap."""
+
+        def __init__(self):
+            self.models = ["qwen2.5:7b", "qwen2.5:32b"]
+            self.idx = 0
+            self.model = self.models[0]
+            self.last_kwargs = None
+
+        async def generate(self, **kwargs):
+            self.last_kwargs = kwargs
+            return f"- [source:x.md] rule under {self.model}"
+
+    swap_client = _SwapClient()
+
+    class _SwapPool:
+        def __init__(self, client):
+            self.client = client
+
+        def get_client(self, role):
+            # advance to next model on each call (mocking summarizer -> reviewer swap)
+            self.client.model = self.client.models[min(self.client.idx, len(self.client.models) - 1)]
+            self.client.idx += 1
+            return self.client
+
+    pool = _SwapPool(swap_client)
+    store = _FakeStore()
+    content = {"x.md": "Always check for None before calling."}
+
+    first = await distill_repo_docs(
+        content=content, pool=pool, store_request=store, model_role="summarizer",
+    )
+    second = await distill_repo_docs(
+        content=content, pool=pool, store_request=store, model_role="reviewer",
+    )
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is False
+    assert first["artifact_id"] != second["artifact_id"]
+    assert first["model"] == "qwen2.5:7b"
+    assert second["model"] == "qwen2.5:32b"
+
+
+@pytest.mark.asyncio
+async def test_prompt_version_is_part_of_cache_key():
+    # prompt_version participates in the cache key, so once a real v2 prompt
+    # exists it won't collide with v1's artifact. Asserted at the pure
+    # ``cache_artifact_id`` level: ``distill_repo_docs`` now rejects unsupported
+    # versions outright (see test_distill_repo_docs_rejects_unsupported_prompt_version),
+    # so the runtime path can't exercise two distinct versions until v2 lands.
+    a = cache_artifact_id("sha", "qwen2.5:7b", "v1")
+    b = cache_artifact_id("sha", "qwen2.5:7b", "v2")
+    assert a != b
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_metadata_non_not_found_error_is_surfaced():
+    """A real store failure on artifact_metadata must NOT be silently treated as a cache miss."""
+
+    pool = _FakePool(_FakeClient())
+    llm_calls = {"count": 0}
+
+    async def perm_denied_store(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"error": "permission denied"}}
+        # If the orchestrator wrongly treated the error as a miss, it would
+        # call artifact_create — which we'd reach here and which must NOT happen.
+        raise AssertionError(f"unexpected op after metadata error: {operation}")
+
+    # Wrap the pool's client to detect any LLM call (also must not happen).
+    original_generate = pool.client.generate
+    async def tracking_generate(**kwargs):
+        llm_calls["count"] += 1
+        return await original_generate(**kwargs)
+    pool.client.generate = tracking_generate  # type: ignore[assignment]
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=perm_denied_store,
+    )
+    assert result == {"error": "permission denied"}
+    assert llm_calls["count"] == 0  # LLM must not have run
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_metadata_non_dict_response_is_surfaced():
+    """A non-dict response on artifact_metadata is a contract break; abort cleanly."""
+
+    pool = _FakePool(_FakeClient())
+
+    async def garbage_store(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": "not a dict"}  # contract break
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=garbage_store,
+    )
+    assert "error" in result
+    assert "unexpected response shape" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_create_non_dict_response_is_surfaced():
+    """A non-dict response on artifact_create is a contract break; abort cleanly."""
+
+    pool = _FakePool(_FakeClient(response="- [source:a.md] r"))
+
+    async def half_broken_store(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"error": "not found"}}
+        if operation == "artifact_create":
+            return {"result": ["not a dict"]}  # contract break
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"a.md": "rule"}, pool=pool, store_request=half_broken_store,
+    )
+    assert "error" in result
+    assert "unexpected response shape" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_surfaces_get_error():
+    """If artifact_metadata hits but artifact_get errors, surface the error — don't return empty digest as cache_hit=True."""
+
+    pool = _FakePool(_FakeClient())
+
+    # Sequence: metadata says it exists, but the body read returns an error.
+    async def hit_then_get_error(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": _hit_metadata({"x.md": "rule"})}
+        if operation == "artifact_get":
+            return {"result": {"error": "content missing"}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_then_get_error,
+    )
+    assert result == {"error": "content missing"}
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_rejects_truncated_body():
+    """A truncated cache-hit body is an integrity signal; surface as error, never return partial."""
+
+    pool = _FakePool(_FakeClient())
+
+    async def hit_with_truncation(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": _hit_metadata({"x.md": "rule"})}
+        if operation == "artifact_get":
+            return {"result": {"text": "partial body", "truncated": True}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_with_truncation,
+    )
+    assert "error" in result
+    assert "truncated" in result["error"] or "partial digest" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_get_passes_bounded_max_chars():
+    """The cache-hit artifact_get must bound max_chars at HARD_MAX_CHARS=20000."""
+
+    pool = _FakePool(_FakeClient())
+    captured_get_args: dict = {}
+
+    async def capture(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": _hit_metadata({"x.md": "rule"})}
+        if operation == "artifact_get":
+            captured_get_args.update(args)
+            return {"result": {"text": "cached digest"}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=capture,
+    )
+    assert result["cache_hit"] is True
+    assert captured_get_args["max_chars"] == 20_000
+    assert captured_get_args.get("offset") == 0
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_fingerprint_mismatch_is_integrity_error():
+    """An artifact existing under the derived id but carrying a different
+    fingerprint (hash collision / unrelated artifact in the namespace) is an
+    integrity error — never return its digest, and never fetch its body."""
+
+    pool = _FakePool(_FakeClient())
+    fetched_body = False
+
+    async def hit_with_wrong_fingerprint(operation, args):
+        nonlocal fetched_body
+        if operation == "artifact_metadata":
+            # Metadata for a DIFFERENT source than the request.
+            return {"result": _hit_metadata({"other.md": "different content"})}
+        if operation == "artifact_get":
+            fetched_body = True
+            return {"result": {"text": "wrong digest"}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_with_wrong_fingerprint,
+    )
+    assert "error" in result
+    assert "fingerprint" in result["error"]
+    # Must fail fast before fetching the (mismatched) body.
+    assert fetched_body is False
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_store_create_error_surfaces():
+    """Store-side failure during artifact_create returns the error envelope verbatim."""
+
+    pool = _FakePool(_FakeClient())
+
+    async def failing_store(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"error": "not found"}}
+        if operation == "artifact_create":
+            return {"result": {"error": "disk full"}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule."}, pool=pool, store_request=failing_store,
+    )
+    assert result == {"error": "disk full"}
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_missing_body_field_errors():
+    """A cache-hit body lacking text/content/body entirely is a contract break —
+    refuse rather than return an empty digest as cache_hit=True."""
+
+    pool = _FakePool(_FakeClient())
+
+    async def hit_with_no_body_field(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": _hit_metadata({"x.md": "rule"})}
+        if operation == "artifact_get":
+            # No text/content/body key at all.
+            return {"result": {"truncated": False}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_with_no_body_field,
+    )
+    assert "error" in result
+    assert "partial digest" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_allows_present_empty_body():
+    """A body field that is present but an empty string is a legitimately empty
+    distillation — return it as a cache hit, not an error."""
+
+    pool = _FakePool(_FakeClient())
+
+    async def hit_with_empty_body(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": _hit_metadata({"x.md": "rule"})}
+        if operation == "artifact_get":
+            return {"result": {"text": ""}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_with_empty_body,
+    )
+    assert result["cache_hit"] is True
+    assert result["digest"] == ""
+    assert "error" not in result
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_create_without_id_errors():
+    """artifact_create that returns no id (and no error) must not be reported as
+    success by echoing the requested id back."""
+
+    pool = _FakePool(_FakeClient(response="- rule"))
+
+    async def create_returns_no_id(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"error": "not found"}}
+        if operation == "artifact_create":
+            return {"result": {"ok": True}}  # neither id nor artifact.id
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=create_returns_no_id,
+    )
+    assert result == {"error": "store created artifact without id"}
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_rejects_unsupported_prompt_version():
+    """An unknown prompt_version is rejected before any store/LLM work, so it
+    can't cache-key or label an artifact under a prompt that was never run."""
+
+    pool = _FakePool(_FakeClient(response="- rule"))
+
+    async def never_called(operation, args):
+        raise AssertionError(f"store must not be touched: {operation}")
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=never_called,
+        prompt_version="v2-does-not-exist",
+    )
+    assert "error" in result
+    assert "unsupported prompt_version" in result["error"]
+    # LLM must not have run either.
+    assert pool.client.last_kwargs is None
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_reflects_current_repo_name():
+    """repo_name is provenance, not part of the content-addressed cache key.
+    A cache hit from a different repo must report the *current* caller's
+    repo_name, not the one stored by the first caller."""
+
+    pool = _FakePool(_FakeClient(response="- rule"))
+    store = _FakeStore()
+    content = {"README.md": "All errors MUST return Result."}
+
+    first = await distill_repo_docs(
+        content=content, pool=pool, store_request=store, repo_name="repoA",
+    )
+    assert first["cache_hit"] is False
+    assert first["repo_name"] == "repoA"
+
+    # Same content, different repo -> hits the cache, but provenance is repoB.
+    second = await distill_repo_docs(
+        content=content, pool=pool, store_request=store, repo_name="repoB",
+    )
+    assert second["cache_hit"] is True
+    assert second["artifact_id"] == first["artifact_id"]
+    assert second["repo_name"] == "repoB"
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_handler_validates_args_and_dispatches():
+    """Agent-side handler: arg validation + store_request closure wiring."""
+    from researcher.agent import distill_repo_docs_handler
+
+    class _FakeAgent:
+        agent_id = "researcher-test"
+
+        def __init__(self, store):
+            self._store = store
+
+        async def request(self, *, agent_type, operation, args):
+            assert agent_type == "store"
+            return await self._store(operation, args)
+
+    class _FakePipeline:
+        def __init__(self, pool):
+            self.pool = pool
+
+    store = _FakeStore()
+    pool = _FakePool(_FakeClient(response="- [source:README.md] rule"))
+    agent = _FakeAgent(store)
+    pipeline = _FakePipeline(pool)
+
+    # Happy path
+    ok = await distill_repo_docs_handler(
+        agent, pipeline,
+        {"content": {"README.md": "Always do X."}, "repo_name": "alpha"},
+    )
+    assert ok["cache_hit"] is False
+    assert ok["repo_name"] == "alpha"
+    assert ok["artifact_id"].startswith("art_repodocs_")
+    # Verify the producer came from agent.agent_id
+    create_call = next(c for c in store.calls if c[0] == "artifact_create")
+    assert create_call[1]["producer"] == "researcher-test"
+
+    # Bad: non-dict content
+    bad = await distill_repo_docs_handler(agent, pipeline, {"content": "not a dict"})
+    assert "error" in bad and "object mapping" in bad["error"]
+
+    # Bad: empty content
+    bad = await distill_repo_docs_handler(agent, pipeline, {"content": {}})
+    assert "error" in bad and "required" in bad["error"]
+
+    # Bad: missing content
+    bad = await distill_repo_docs_handler(agent, pipeline, {})
+    assert "error" in bad
+
+    # Bad: non-string body
+    bad = await distill_repo_docs_handler(
+        agent, pipeline, {"content": {"a.md": 42}},
+    )
+    assert "error" in bad and "must be a string" in bad["error"]
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_records_metadata_fingerprint_on_create():
+    pool = _FakePool(_FakeClient(response="- [source:a.md] r"))
+    store = _FakeStore()
+    await distill_repo_docs(
+        content={"a.md": "rule"}, pool=pool, store_request=store,
+        repo_name="alpha", producer="researcher-test",
+    )
+    # Find the artifact_create call.
+    create_calls = [c for c in store.calls if c[0] == "artifact_create"]
+    assert len(create_calls) == 1
+    args = create_calls[0][1]
+    md = args["metadata"]
+    assert md["source_sha256"] == compute_corpus_hash({"a.md": "rule"})
+    assert md["model"] == "qwen2.5:7b"
+    assert md["prompt_version"] == NORMATIVE_CLAIM_PROMPT_VERSION
+    assert md["repo_name"] == "alpha"
+    assert md["file_count"] == 1
+    assert args["kind"] == "researcher_distillation"
+    assert args["producer"] == "researcher-test"
+    assert args["id"].startswith("art_repodocs_")
