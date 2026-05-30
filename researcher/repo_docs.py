@@ -271,6 +271,28 @@ async def distill_repo_docs(
         if not _is_not_found_error(cached_meta["error"]):
             return cached_meta
     else:
+        # ``artifact_id`` is a 24-hex (96-bit) truncation of the key hash, and
+        # the ``art_repodocs_`` namespace could in principle hold an artifact
+        # written for another reason or by a hash collision. Verify the stored
+        # metadata actually carries the requested (source_sha256, model,
+        # prompt_version) fingerprint before trusting its digest — a mismatch
+        # is an integrity error, not a silent wrong-content cache hit.
+        hit_meta = cached_meta.get("artifact") if isinstance(cached_meta.get("artifact"), dict) else cached_meta
+        if not fingerprint_matches(
+            hit_meta.get("metadata"),
+            cache_fingerprint(
+                source_sha256=source_sha256,
+                model=effective_model,
+                prompt_version=prompt_version,
+            ),
+        ):
+            return {
+                "error": (
+                    f"cached artifact {artifact_id} metadata does not match the "
+                    "requested (source_sha256, model, prompt_version) fingerprint; "
+                    "refusing to return a possibly-mismatched digest"
+                ),
+            }
         body_envelope = await store_request(
             "artifact_get",
             {"id": artifact_id, "offset": 0, "max_chars": _CACHE_GET_MAX_CHARS},

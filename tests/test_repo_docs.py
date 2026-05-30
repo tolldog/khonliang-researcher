@@ -108,6 +108,24 @@ class _FakePool:
         return self.client
 
 
+def _hit_metadata(content: dict[str, str], *, model: str = "qwen2.5:7b",
+                  prompt_version: str = "v1", **extra) -> dict:
+    """Stored-metadata payload that satisfies the cache-hit fingerprint check.
+
+    The cache-hit path verifies the artifact's metadata carries the requested
+    (source_sha256, model, prompt_version) fingerprint before trusting its
+    digest, so body-branch tests must return metadata that actually matches the
+    content/model they call with — otherwise they short-circuit on the
+    integrity error before reaching the branch under test.
+    """
+    fp = cache_fingerprint(
+        source_sha256=compute_corpus_hash(content),
+        model=model,
+        prompt_version=prompt_version,
+    )
+    return {"metadata": {**fp, **extra}}
+
+
 @pytest.mark.asyncio
 async def test_extract_normative_claims_calls_summarizer_with_corpus():
     client = _FakeClient(response="- [source:README.md] always use Result types\n")
@@ -378,9 +396,7 @@ async def test_distill_repo_docs_cache_hit_surfaces_get_error():
     # Sequence: metadata says it exists, but the body read returns an error.
     async def hit_then_get_error(operation, args):
         if operation == "artifact_metadata":
-            return {"result": {"id": args["id"], "metadata": {
-                "source_sha256": "x", "model": "qwen2.5:7b", "prompt_version": "v1",
-            }}}
+            return {"result": _hit_metadata({"x.md": "rule"})}
         if operation == "artifact_get":
             return {"result": {"error": "content missing"}}
         raise AssertionError(operation)
@@ -399,7 +415,7 @@ async def test_distill_repo_docs_cache_hit_rejects_truncated_body():
 
     async def hit_with_truncation(operation, args):
         if operation == "artifact_metadata":
-            return {"result": {"id": args["id"], "metadata": {}}}
+            return {"result": _hit_metadata({"x.md": "rule"})}
         if operation == "artifact_get":
             return {"result": {"text": "partial body", "truncated": True}}
         raise AssertionError(operation)
@@ -420,7 +436,7 @@ async def test_distill_repo_docs_cache_hit_get_passes_bounded_max_chars():
 
     async def capture(operation, args):
         if operation == "artifact_metadata":
-            return {"result": {"id": args["id"], "metadata": {}}}
+            return {"result": _hit_metadata({"x.md": "rule"})}
         if operation == "artifact_get":
             captured_get_args.update(args)
             return {"result": {"text": "cached digest"}}
@@ -432,6 +448,34 @@ async def test_distill_repo_docs_cache_hit_get_passes_bounded_max_chars():
     assert result["cache_hit"] is True
     assert captured_get_args["max_chars"] == 20_000
     assert captured_get_args.get("offset") == 0
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_fingerprint_mismatch_is_integrity_error():
+    """An artifact existing under the derived id but carrying a different
+    fingerprint (hash collision / unrelated artifact in the namespace) is an
+    integrity error — never return its digest, and never fetch its body."""
+
+    pool = _FakePool(_FakeClient())
+    fetched_body = False
+
+    async def hit_with_wrong_fingerprint(operation, args):
+        nonlocal fetched_body
+        if operation == "artifact_metadata":
+            # Metadata for a DIFFERENT source than the request.
+            return {"result": _hit_metadata({"other.md": "different content"})}
+        if operation == "artifact_get":
+            fetched_body = True
+            return {"result": {"text": "wrong digest"}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_with_wrong_fingerprint,
+    )
+    assert "error" in result
+    assert "fingerprint" in result["error"]
+    # Must fail fast before fetching the (mismatched) body.
+    assert fetched_body is False
 
 
 @pytest.mark.asyncio
@@ -462,7 +506,7 @@ async def test_distill_repo_docs_cache_hit_missing_body_field_errors():
 
     async def hit_with_no_body_field(operation, args):
         if operation == "artifact_metadata":
-            return {"result": {"id": args["id"], "metadata": {}}}
+            return {"result": _hit_metadata({"x.md": "rule"})}
         if operation == "artifact_get":
             # No text/content/body key at all.
             return {"result": {"truncated": False}}
@@ -484,7 +528,7 @@ async def test_distill_repo_docs_cache_hit_allows_present_empty_body():
 
     async def hit_with_empty_body(operation, args):
         if operation == "artifact_metadata":
-            return {"result": {"id": args["id"], "metadata": {}}}
+            return {"result": _hit_metadata({"x.md": "rule"})}
         if operation == "artifact_get":
             return {"result": {"text": ""}}
         raise AssertionError(operation)
