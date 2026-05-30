@@ -292,18 +292,15 @@ async def test_distill_repo_docs_model_change_invalidates_cache():
 
 
 @pytest.mark.asyncio
-async def test_distill_repo_docs_prompt_version_invalidates_cache():
-    pool = _FakePool(_FakeClient(response="- [source:r.md] rule"))
-    store = _FakeStore()
-    content = {"r.md": "Never block on I/O."}
-
-    a = await distill_repo_docs(
-        content=content, pool=pool, store_request=store, prompt_version="v1",
-    )
-    b = await distill_repo_docs(
-        content=content, pool=pool, store_request=store, prompt_version="v2-experimental",
-    )
-    assert a["artifact_id"] != b["artifact_id"]
+async def test_prompt_version_is_part_of_cache_key():
+    # prompt_version participates in the cache key, so once a real v2 prompt
+    # exists it won't collide with v1's artifact. Asserted at the pure
+    # ``cache_artifact_id`` level: ``distill_repo_docs`` now rejects unsupported
+    # versions outright (see test_distill_repo_docs_rejects_unsupported_prompt_version),
+    # so the runtime path can't exercise two distinct versions until v2 lands.
+    a = cache_artifact_id("sha", "qwen2.5:7b", "v1")
+    b = cache_artifact_id("sha", "qwen2.5:7b", "v2")
+    assert a != b
 
 
 @pytest.mark.asyncio
@@ -518,6 +515,51 @@ async def test_distill_repo_docs_create_without_id_errors():
         content={"x.md": "rule"}, pool=pool, store_request=create_returns_no_id,
     )
     assert result == {"error": "store created artifact without id"}
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_rejects_unsupported_prompt_version():
+    """An unknown prompt_version is rejected before any store/LLM work, so it
+    can't cache-key or label an artifact under a prompt that was never run."""
+
+    pool = _FakePool(_FakeClient(response="- rule"))
+
+    async def never_called(operation, args):
+        raise AssertionError(f"store must not be touched: {operation}")
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=never_called,
+        prompt_version="v2-does-not-exist",
+    )
+    assert "error" in result
+    assert "unsupported prompt_version" in result["error"]
+    # LLM must not have run either.
+    assert pool.client.last_kwargs is None
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_reflects_current_repo_name():
+    """repo_name is provenance, not part of the content-addressed cache key.
+    A cache hit from a different repo must report the *current* caller's
+    repo_name, not the one stored by the first caller."""
+
+    pool = _FakePool(_FakeClient(response="- rule"))
+    store = _FakeStore()
+    content = {"README.md": "All errors MUST return Result."}
+
+    first = await distill_repo_docs(
+        content=content, pool=pool, store_request=store, repo_name="repoA",
+    )
+    assert first["cache_hit"] is False
+    assert first["repo_name"] == "repoA"
+
+    # Same content, different repo -> hits the cache, but provenance is repoB.
+    second = await distill_repo_docs(
+        content=content, pool=pool, store_request=store, repo_name="repoB",
+    )
+    assert second["cache_hit"] is True
+    assert second["artifact_id"] == first["artifact_id"]
+    assert second["repo_name"] == "repoB"
 
 
 @pytest.mark.asyncio

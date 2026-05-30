@@ -28,6 +28,13 @@ from typing import Any
 
 NORMATIVE_CLAIM_PROMPT_VERSION = "v1"
 
+# Only prompt versions backed by a real prompt may be requested. ``v1`` maps
+# to NORMATIVE_CLAIM_PROMPT; there is no registry yet, so anything else would
+# cache-key and label an artifact under a prompt that was never run — and
+# poison the cache once that version name later gets a real prompt. Reject up
+# front. Grow this set (and add a prompt lookup) when a v2 prompt lands.
+SUPPORTED_PROMPT_VERSIONS = frozenset({NORMATIVE_CLAIM_PROMPT_VERSION})
+
 NORMATIVE_CLAIM_PROMPT = """\
 You are extracting normative content from a project's documentation. Your
 output will be used as context for code review.
@@ -233,6 +240,13 @@ async def distill_repo_docs(
     rather than surfaced; any other metadata error is a real failure and
     aborts the call.
     """
+    if prompt_version not in SUPPORTED_PROMPT_VERSIONS:
+        return {
+            "error": (
+                f"unsupported prompt_version {prompt_version!r}; "
+                f"supported: {sorted(SUPPORTED_PROMPT_VERSIONS)}"
+            ),
+        }
     source_sha256 = compute_corpus_hash(content)
     # Resolve the client exactly once: the effective model determines the
     # cache key, and the same client must run the LLM on miss so the stored
@@ -303,7 +317,12 @@ async def distill_repo_docs(
             "prompt_version": meta.get("metadata", {}).get("prompt_version", prompt_version),
             "source_sha256": source_sha256,
             "cache_hit": True,
-            "repo_name": meta.get("metadata", {}).get("repo_name", repo_name),
+            # Reflect the *current* caller's repo_name, not the first caller's.
+            # repo_name is provenance only — it's not in the cache key (the
+            # cache is content-addressed), so identical docs ingested under a
+            # different repo legitimately hit this artifact. Echoing the stored
+            # repo_name would hand the second caller misleading provenance.
+            "repo_name": repo_name,
         }
 
     # Cache miss: run the LLM against the SAME client we keyed by.
