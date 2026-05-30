@@ -271,6 +271,95 @@ async def test_stop_ingest_watcher_rejects_non_string_id():
 
 
 @pytest.mark.asyncio
+async def test_embedded_distill_worker_starts_and_stops(monkeypatch):
+    """Regression for bug_researcher_0cadd7ea: the agent must launch the
+    distillation drain loop as a background task so ingested entries get
+    distilled without a manual start_distillation call, and stop it on
+    teardown. Patches DistillWorker with a fake so no real distillation runs."""
+    import researcher.worker as worker_mod
+
+    class _FakeWorker:
+        def __init__(self, pipeline, **kwargs):
+            self.pipeline = pipeline
+            self.kwargs = kwargs
+            self.ran = asyncio.Event()
+            self.stopped = False
+
+        async def run(self):
+            self.ran.set()
+            await asyncio.sleep(3600)  # idle until cancelled
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr(worker_mod, "DistillWorker", _FakeWorker)
+
+    pipeline = _make_pipeline()
+    pipeline.config = {"distill_worker": {"pause_between": 0.5, "idle_poll": 5}}
+    agent = _build_fake_agent(pipeline)
+
+    agent._start_distill_worker()
+    assert agent._distill_worker is not None
+    # The run() loop actually got scheduled.
+    await asyncio.wait_for(agent._distill_worker.ran.wait(), timeout=1.0)
+    # Config tuning is forwarded to the worker.
+    assert agent._distill_worker.kwargs == {"pause_between": 0.5, "idle_poll": 5}
+
+    worker = agent._distill_worker
+    await agent._stop_distill_worker()
+    assert worker.stopped is True
+    assert agent._distill_worker is None
+    assert agent._distill_task is None
+
+
+@pytest.mark.asyncio
+async def test_embedded_distill_worker_is_idempotent_and_config_opt_out(monkeypatch):
+    """Starting twice does not spawn a second worker, and
+    distill_worker.embedded=false disables it entirely."""
+    import researcher.worker as worker_mod
+
+    created = []
+
+    class _FakeWorker:
+        def __init__(self, pipeline, **kwargs):
+            created.append(self)
+
+        async def run(self):
+            await asyncio.sleep(3600)
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(worker_mod, "DistillWorker", _FakeWorker)
+
+    # Opt-out: embedded=false → no worker created.
+    pipeline = _make_pipeline()
+    pipeline.config = {"distill_worker": {"embedded": False}}
+    agent = _build_fake_agent(pipeline)
+    agent._start_distill_worker()
+    assert getattr(agent, "_distill_worker", None) is None
+    assert created == []
+
+    # Default-on, idempotent: two starts → exactly one worker.
+    pipeline2 = _make_pipeline()
+    pipeline2.config = {}
+    agent2 = _build_fake_agent(pipeline2)
+    agent2._start_distill_worker()
+    agent2._start_distill_worker()
+    assert len(created) == 1
+    await agent2._stop_distill_worker()
+
+
+@pytest.mark.asyncio
+async def test_stop_distill_worker_is_noop_when_never_started():
+    """shutdown() calling _stop_distill_worker before/without a start must not
+    raise (e.g. agent torn down before start() ran)."""
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+    await agent._stop_distill_worker()  # must not raise
+
+
+@pytest.mark.asyncio
 async def test_status_strict_isinstance_validation():
     """``ingest_status({"job_id": None})`` previously coerced to
     the string ``"None"`` and returned ``{"error": "not found"}``,
