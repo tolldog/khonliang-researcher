@@ -308,6 +308,45 @@ async def test_run_ingest_job_cancel_during_done_publish_keeps_phase_done():
 
 
 @pytest.mark.asyncio
+async def test_run_ingest_job_cancel_during_done_publish_still_delivers_done_event():
+    """A cancel interrupting the FIRST ``done`` publish must not lose the
+    terminal event. ``progress("done")`` transitions to ``phase=done`` before
+    publishing, so the JobRecord already reads ``done`` when the cancel lands
+    mid-publish — but the event never went out. The recovery path must re-emit
+    it (rather than skip on a ``phase != "done"`` guard), or event-driven
+    subscribers wait forever. Here the fake cancels only the first ``done``
+    publish; the re-emit must succeed and deliver the event."""
+    store = IngestJobStore()
+    job = await store.create("ingest_idea", {})
+
+    delivered: list[str] = []
+    state = {"cancelled_first_done": False}
+
+    async def cancel_first_done(topic, payload):
+        if payload["phase"] == "done" and not state["cancelled_first_done"]:
+            # Cancel lands during the first done publish, AFTER
+            # store.transition(phase=done) already ran inside progress().
+            state["cancelled_first_done"] = True
+            raise asyncio.CancelledError()
+        delivered.append(payload["phase"])
+
+    async def work(progress):
+        return {"idea_id": "ok"}
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_ingest_job(store, cancel_first_done, job, work)
+
+    fresh = await store.get(job.job_id)
+    assert fresh.phase == "done"
+    # The terminal done event must have been re-emitted and delivered on the
+    # recovery path — not skipped because phase was already "done".
+    assert "done" in delivered, (
+        "done event was lost: recovery skipped the re-emit while phase was "
+        "already 'done', so subscribers never saw the terminal event"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_ingest_job_cancel_during_set_result_still_finalises_done():
     """Cancellation that lands at ``await store.set_result(...)``
     — between ``work()`` returning and the JobRecord recording the

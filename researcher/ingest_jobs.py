@@ -366,15 +366,24 @@ async def run_ingest_job(
                 )
             except asyncio.CancelledError:
                 pass
-            # Best-effort done event so event-driven subscribers
-            # see the terminal phase. Use ``_publish_progress``
-            # directly — calling ``progress`` would re-transition.
-            try:
-                fresh = await store.get(job.job_id)
-                if fresh is not None:
-                    await _publish_progress(
-                        publish, fresh, detail=done_detail,
-                    )
-            except asyncio.CancelledError:
-                pass
+        # Best-effort done event so event-driven subscribers see the
+        # terminal phase. This MUST run even when ``phase`` is already
+        # "done": ``progress("done")`` transitions BEFORE it publishes
+        # (see the ``progress`` closure), so a cancel landing during
+        # that publish leaves ``phase=="done"`` with the event never
+        # sent. Gating the re-emit on ``phase != "done"`` would skip
+        # exactly that window, and event-driven subscribers
+        # (``bus_wait_for_event`` on the done event) would hang forever
+        # even though ``ingest_status`` reports done. A duplicate
+        # ``done`` event is benign; a lost one is not. Use
+        # ``_publish_progress`` directly — ``progress`` would
+        # re-transition.
+        try:
+            fresh = await store.get(job.job_id)
+            if fresh is not None:
+                await _publish_progress(
+                    publish, fresh, detail=done_detail,
+                )
+        except asyncio.CancelledError:
+            pass
         raise
