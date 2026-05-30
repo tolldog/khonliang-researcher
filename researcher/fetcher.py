@@ -165,6 +165,14 @@ def _detect_format(url: str, content_type: str = "") -> ContentFormat:
 
     # URL extension is most reliable (servers often miscategorize)
     if url_path.endswith(".pdf"):
+        # ...but a .pdf URL the server *explicitly* serves as HTML is an
+        # error/challenge page, not a PDF. Trusting the extension here would
+        # feed HTML bytes to fitz.open(filetype="pdf") and raise an opaque
+        # error instead of a clean fetch. Only override on an explicit HTML
+        # Content-Type; ambiguous/empty/text-plain still resolves to PDF so
+        # the legitimate "server miscategorizes a real PDF" case is preserved.
+        if "html" in ct:
+            return ContentFormat.HTML
         return ContentFormat.PDF
     if url_path.endswith(".md"):
         return ContentFormat.MARKDOWN

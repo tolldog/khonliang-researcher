@@ -1219,7 +1219,12 @@ class Synthesizer:
                         arch = data.get("architecture", "")
                         if arch and arch not in all_architectures:
                             all_architectures.append(arch)
-                    except (json.JSONDecodeError, Exception) as e:
+                    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+                        # Narrowed from ``(json.JSONDecodeError, Exception)``:
+                        # Exception subsumed the rest and silently swallowed
+                        # genuine bugs as "chunk failed". These four cover the
+                        # malformed-LLM-output shapes (bad JSON, non-dict data,
+                        # wrong value types); anything else should propagate.
                         logger.warning("Scan chunk %d failed for %s: %s",
                                        i // chunk_size, project_name, e
                         )
