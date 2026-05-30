@@ -38,6 +38,17 @@ predicate_aliases:
 
 feeds_opml: feeds.opml
 
+# Embedded distillation worker. The agent runs a background loop that drains
+# the ingest queue (distills INGESTED entries) and idle-polls when empty, so
+# ingesting content does not require a manual start_distillation call.
+# Set embedded: false ONLY if you run the standalone
+# `python -m researcher.worker` against the same DB, to avoid two drainers
+# racing on the same entries.
+distill_worker:
+  embedded: true
+  pause_between: 2.0   # seconds between entries
+  idle_poll: 30        # seconds to sleep when the queue is empty
+
 db_path: data/researcher.db
 
 # Domain rules — optional. When set, these rules are appended to the

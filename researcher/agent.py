@@ -954,6 +954,10 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
 
         registry = await _get_ingest_registry(self)
         await registry.rehydrate()
+        # Drain the distillation queue continuously so ingested entries get
+        # distilled without a manual start_distillation call (the worker
+        # idle-polls when empty).
+        self._start_distill_worker()
 
         logger.info(
             "Agent %s started (%d skills, WebSocket)",
@@ -969,10 +973,14 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         try:
             await self._connector.run()
         finally:
+            await self._stop_distill_worker()
             await registry.shutdown()
             await self._http.aclose()
 
     async def shutdown(self):
+        # Stop the distillation drain loop first so it isn't mid-distill
+        # against stores that are about to tear down.
+        await self._stop_distill_worker()
         registry = getattr(self, "_ingest_watcher_registry", None)
         if registry is not None:
             await registry.shutdown()
@@ -1037,6 +1045,69 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 )
         await BaseAgent.shutdown(self)
 
+    def _start_distill_worker(self):
+        """Launch the continuous distillation drain loop as a retained
+        background task.
+
+        ``DistillWorker.run()`` processes pending ``INGESTED`` entries then
+        idle-polls when the queue is empty, so ingest paths need not kick it.
+        Without this, the bus-agent deployment never drained the queue —
+        ``worker_status`` showed ``running=False`` with items pending forever
+        (bug_researcher_0cadd7ea); the only drainer was the standalone
+        ``python -m researcher.worker`` process, which the agent path never
+        launches.
+
+        Embedded by default. A deployment that ALSO runs the standalone worker
+        against the same DB should set ``distill_worker.embedded: false`` in
+        config to avoid two drainers racing on the same ``INGESTED`` rows.
+        ``pause_between`` / ``idle_poll`` under that key tune the loop.
+        """
+        cfg = {}
+        config = getattr(pipeline, "config", None)
+        if isinstance(config, dict):
+            cfg = config.get("distill_worker") or {}
+        if not cfg.get("embedded", True):
+            logger.info("embedded distillation worker disabled by config")
+            return
+        if getattr(self, "_distill_worker", None) is not None:
+            return  # idempotent — already running
+        from researcher.worker import DistillWorker
+
+        worker_kwargs = {
+            k: cfg[k] for k in ("pause_between", "idle_poll") if k in cfg
+        }
+        self._distill_worker = DistillWorker(pipeline, **worker_kwargs)
+        self._distill_task = asyncio.create_task(
+            self._distill_worker.run(), name="distill-worker",
+        )
+        logger.info("embedded distillation worker started")
+
+    async def _stop_distill_worker(self):
+        """Stop the embedded distillation worker (no-op if not started).
+
+        Clears the handles first so a re-entrant ``shutdown()`` doesn't double
+        the cancel grace period, then asks ``run()`` to exit (``stop()``) and
+        cancels the task to interrupt an idle-poll sleep immediately.
+        """
+        worker = getattr(self, "_distill_worker", None)
+        task = getattr(self, "_distill_task", None)
+        self._distill_worker = None
+        self._distill_task = None
+        if worker is None:
+            return
+        worker.stop()
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception:  # pragma: no cover — best-effort teardown
+                logger.warning(
+                    "embedded distillation worker errored during shutdown",
+                    exc_info=True,
+                )
+
     import signal
 
     agent.register_skills = MethodType(register_skills, agent)
@@ -1053,6 +1124,8 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._get_job_store = MethodType(_get_job_store, agent)
     agent._get_ingest_semaphore = MethodType(_get_ingest_semaphore, agent)
     agent._spawn_ingest_job = MethodType(_spawn_ingest_job, agent)
+    agent._start_distill_worker = MethodType(_start_distill_worker, agent)
+    agent._stop_distill_worker = MethodType(_stop_distill_worker, agent)
     agent.start = MethodType(start, agent)
     agent.shutdown = MethodType(shutdown, agent)
 
