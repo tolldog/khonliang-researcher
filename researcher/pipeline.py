@@ -1305,7 +1305,14 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                     title=f"GitHub: {repo_key}",
                     content="\n".join(summary_parts),
                     source=repo_url,
-                    scope="external",
+                    # ``scope="research"`` — same scope every other ingest path
+                    # uses (papers/ideas/distill) and the one ``Pipeline.search``
+                    # queries. A previous ``scope="external"`` value left GitHub
+                    # entries in the knowledge table but unreachable via
+                    # find_relevant / brief_on, which filter to scope=research
+                    # (bug_researcher_0be22a09). The external-origin distinction
+                    # is preserved in ``tags`` and ``metadata`` below.
+                    scope="research",
                     tags=["github", "external", "concepts"],
                     status=EntryStatus.DISTILLED,
                     metadata={
