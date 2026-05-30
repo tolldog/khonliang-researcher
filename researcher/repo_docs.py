@@ -71,6 +71,11 @@ MAX_CORPUS_CHARS = 80_000
 # rather than something to silently work around.
 _CACHE_GET_MAX_CHARS = 20_000
 
+# Sentinel distinguishing an absent body field (store contract break) from a
+# field that is present but holds an empty string (a legitimately empty
+# distillation). ``dict.get`` can't tell these apart.
+_MISSING = object()
+
 
 def normalize_corpus(content: dict[str, str]) -> str:
     """Produce a deterministic ``# <path>\\n<body>\\n\\n`` concatenation.
@@ -273,16 +278,27 @@ async def distill_repo_docs(
                     "a partial digest"
                 ),
             }
-        digest = (
-            body_payload.get("text")
-            or body_payload.get("content")
-            or body_payload.get("body")
-            or ""
+        # Resolve the body field. The store may name it text/content/body, so
+        # tolerate all three. An entirely-absent set means the store contract
+        # changed — refuse rather than mask it with an empty-string digest. A
+        # field that is present but empty is a legitimately empty distillation
+        # and must still be returned.
+        body_field = next(
+            (body_payload[k] for k in ("text", "content", "body") if k in body_payload),
+            _MISSING,
         )
+        if body_field is _MISSING or not isinstance(body_field, str):
+            return {
+                "error": (
+                    f"cached distillation {artifact_id} body lacks a string "
+                    "text/content/body field; refusing to return a partial digest"
+                ),
+            }
+        digest = body_field.strip()
         meta = cached_meta.get("artifact") if isinstance(cached_meta.get("artifact"), dict) else cached_meta
         return {
             "artifact_id": artifact_id,
-            "digest": digest.strip() if isinstance(digest, str) else "",
+            "digest": digest,
             "model": meta.get("metadata", {}).get("model", effective_model),
             "prompt_version": meta.get("metadata", {}).get("prompt_version", prompt_version),
             "source_sha256": source_sha256,
@@ -341,11 +357,16 @@ async def distill_repo_docs(
         return {"error": "store returned unexpected response shape on artifact_create"}
     if "error" in create_payload:
         return create_payload
+    # Mirror stage_payload: a create response with neither a top-level ``id``
+    # nor a nested ``artifact.id`` (and no error) is a contract break — don't
+    # fabricate success by echoing the requested id back, since the create may
+    # not have landed.
     stored_id = (
         create_payload.get("id")
         or (create_payload.get("artifact") or {}).get("id")
-        or artifact_id
     )
+    if not stored_id:
+        return {"error": "store created artifact without id"}
     return {
         "artifact_id": stored_id,
         "digest": digest,

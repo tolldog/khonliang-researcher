@@ -457,6 +457,70 @@ async def test_distill_repo_docs_store_create_error_surfaces():
 
 
 @pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_missing_body_field_errors():
+    """A cache-hit body lacking text/content/body entirely is a contract break —
+    refuse rather than return an empty digest as cache_hit=True."""
+
+    pool = _FakePool(_FakeClient())
+
+    async def hit_with_no_body_field(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"id": args["id"], "metadata": {}}}
+        if operation == "artifact_get":
+            # No text/content/body key at all.
+            return {"result": {"truncated": False}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_with_no_body_field,
+    )
+    assert "error" in result
+    assert "partial digest" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_cache_hit_allows_present_empty_body():
+    """A body field that is present but an empty string is a legitimately empty
+    distillation — return it as a cache hit, not an error."""
+
+    pool = _FakePool(_FakeClient())
+
+    async def hit_with_empty_body(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"id": args["id"], "metadata": {}}}
+        if operation == "artifact_get":
+            return {"result": {"text": ""}}
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=hit_with_empty_body,
+    )
+    assert result["cache_hit"] is True
+    assert result["digest"] == ""
+    assert "error" not in result
+
+
+@pytest.mark.asyncio
+async def test_distill_repo_docs_create_without_id_errors():
+    """artifact_create that returns no id (and no error) must not be reported as
+    success by echoing the requested id back."""
+
+    pool = _FakePool(_FakeClient(response="- rule"))
+
+    async def create_returns_no_id(operation, args):
+        if operation == "artifact_metadata":
+            return {"result": {"error": "not found"}}
+        if operation == "artifact_create":
+            return {"result": {"ok": True}}  # neither id nor artifact.id
+        raise AssertionError(operation)
+
+    result = await distill_repo_docs(
+        content={"x.md": "rule"}, pool=pool, store_request=create_returns_no_id,
+    )
+    assert result == {"error": "store created artifact without id"}
+
+
+@pytest.mark.asyncio
 async def test_distill_repo_docs_handler_validates_args_and_dispatches():
     """Agent-side handler: arg validation + store_request closure wiring."""
     from researcher.agent import distill_repo_docs_handler
