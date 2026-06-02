@@ -549,3 +549,101 @@ def test_is_known_blocked_host_matches_subdomain():
     assert fetcher._is_known_blocked_host("author.substack.com")
     assert not fetcher._is_known_blocked_host("example.com")
     assert not fetcher._is_known_blocked_host("substacky.example.com")
+
+
+# ---------------------------------------------------------------------------
+# Readability-proxy fallback (fr_researcher_22486af4)
+# ---------------------------------------------------------------------------
+
+
+def test_readability_proxy_url_gating():
+    f = fetcher._readability_proxy_url
+    # Disabled / malformed config -> None (fail closed, no external call).
+    assert f(None, "https://x.substack.com/a") is None
+    assert f({}, "https://x.substack.com/a") is None
+    assert f({"proxy": "no-placeholder"}, "https://x.substack.com/a") is None
+    # Host allowlist gates which URLs reach the proxy.
+    cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com"]}
+    assert (
+        f(cfg, "https://x.substack.com/a")
+        == "https://r.jina.ai/https://x.substack.com/a"
+    )
+    assert f(cfg, "https://other.com/a") is None
+    # Absent/empty hosts -> applies to any blocked host.
+    cfg2 = {"proxy": "https://r.jina.ai/{url}"}
+    assert (
+        f(cfg2, "https://anything.com/a")
+        == "https://r.jina.ai/https://anything.com/a"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_falls_back_to_readability_on_block(monkeypatch):
+    calls = []
+
+    async def fake_direct(u, timeout=60):
+        calls.append(u)
+        if u.startswith("https://r.jina.ai/"):
+            return fetcher.FetchResult(
+                url=u, title="T", content="proxied body",
+                format=ContentFormat.MARKDOWN, metadata={"source": "web"},
+            )
+        raise fetcher.FetchBlockedError("blocked 403")
+
+    monkeypatch.setattr(fetcher, "_fetch_url_direct", fake_direct)
+    cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com"]}
+
+    result = await fetcher.fetch_url(
+        "https://x.substack.com/p/a", readability_fallback=cfg,
+    )
+    assert result.content == "proxied body"
+    # restamped to the ORIGINAL url, with the fallback path recorded.
+    assert result.url == "https://x.substack.com/p/a"
+    assert result.metadata["fetched_via"] == "readability_fallback"
+    assert result.metadata["readability_proxy"] == "https://r.jina.ai/https://x.substack.com/p/a"
+    assert calls == [
+        "https://x.substack.com/p/a",
+        "https://r.jina.ai/https://x.substack.com/p/a",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_no_proxy_call_when_fallback_disabled(monkeypatch):
+    calls = []
+
+    async def fake_direct(u, timeout=60):
+        calls.append(u)
+        raise fetcher.FetchBlockedError("blocked 403")
+
+    monkeypatch.setattr(fetcher, "_fetch_url_direct", fake_direct)
+    with pytest.raises(fetcher.FetchBlockedError):
+        await fetcher.fetch_url("https://x.substack.com/p/a", readability_fallback=None)
+    assert calls == ["https://x.substack.com/p/a"]  # no external proxy call
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_no_proxy_call_when_host_not_allowlisted(monkeypatch):
+    calls = []
+
+    async def fake_direct(u, timeout=60):
+        calls.append(u)
+        raise fetcher.FetchBlockedError("blocked 403")
+
+    monkeypatch.setattr(fetcher, "_fetch_url_direct", fake_direct)
+    cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com"]}
+    with pytest.raises(fetcher.FetchBlockedError):
+        await fetcher.fetch_url("https://other.com/p/a", readability_fallback=cfg)
+    assert calls == ["https://other.com/p/a"]  # host not allowlisted -> no proxy
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_surfaces_both_failures_when_proxy_also_fails(monkeypatch):
+    async def fake_direct(u, timeout=60):
+        if u.startswith("https://r.jina.ai/"):
+            raise RuntimeError("proxy 500")
+        raise fetcher.FetchBlockedError("blocked 403")
+
+    monkeypatch.setattr(fetcher, "_fetch_url_direct", fake_direct)
+    cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com"]}
+    with pytest.raises(fetcher.FetchBlockedError, match="also failed"):
+        await fetcher.fetch_url("https://x.substack.com/p/a", readability_fallback=cfg)

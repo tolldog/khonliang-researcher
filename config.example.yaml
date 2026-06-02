@@ -38,6 +38,17 @@ predicate_aliases:
 
 feeds_opml: feeds.opml
 
+# Resilient URL ingestion. When a direct fetch is blocked (403/429/503, or any
+# 4xx/5xx from a known anti-bot host like Substack), fetch_url can retry through
+# a readability/reader proxy. OFF by default (fail-closed: no external calls
+# unless configured). `proxy` must contain the `{url}` placeholder; `hosts` is
+# an optional allowlist (suffix match) so arbitrary URLs aren't shipped to the
+# proxy — omit/empty to apply to any blocked host.
+# fetcher:
+#   readability_fallback:
+#     proxy: "https://r.jina.ai/{url}"
+#     hosts: ["substack.com", "medium.com"]
+
 # Embedded distillation worker. The agent runs a background loop that drains
 # the ingest queue (distills INGESTED entries) and idle-polls when empty, so
 # ingesting content does not require a manual start_distillation call.

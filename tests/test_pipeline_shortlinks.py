@@ -33,7 +33,7 @@ def test_ingest_paper_dedupes_resolved_arxiv_shortlink(monkeypatch):
     existing_id = "existing-entry"
     pipe = _pipeline_with_index({"https://arxiv.org/abs/2511.19699": existing_id})
 
-    async def fake_fetch_url(url):
+    async def fake_fetch_url(url, readability_fallback=None):
         return FetchResult(
             url="https://arxiv.org/pdf/2511.19699",
             title="A Layered Protocol Architecture for the Internet of Agents",
@@ -54,7 +54,7 @@ def test_ingest_paper_dedupes_resolved_arxiv_shortlink(monkeypatch):
 def test_ingest_paper_stores_resolved_source_and_provenance(monkeypatch):
     pipe = _pipeline_with_index()
 
-    async def fake_fetch_url(url):
+    async def fake_fetch_url(url, readability_fallback=None):
         return FetchResult(
             url="https://example.com/paper.txt",
             title="Example Paper",

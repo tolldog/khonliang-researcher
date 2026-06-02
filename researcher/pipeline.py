@@ -248,7 +248,11 @@ class ResearchPipeline:
                 return self._url_index[canonical_url]
             result = await fetch_arxiv(url)
         else:
-            result = await fetch_url(url)
+            cfg = getattr(self, "config", None) or {}
+            result = await fetch_url(
+                url,
+                readability_fallback=cfg.get("fetcher", {}).get("readability_fallback"),
+            )
             resolved_url = result.url
             resolved_arxiv_id = extract_arxiv_id(resolved_url)
             if resolved_arxiv_id:
