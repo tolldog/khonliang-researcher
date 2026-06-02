@@ -527,7 +527,6 @@ class ResearchPipeline:
             return {"error": f"Entry {entry_id} not found", **removed}
 
         title = entry.title
-        url = entry.metadata.get("url", "")
 
         # Remove summary (Tier 3)
         summary_id = f"{entry_id}_summary"
@@ -546,9 +545,13 @@ class ResearchPipeline:
         self.knowledge.remove(entry_id)
         removed["paper"] = True
 
-        # Remove from URL index
-        if url in self._url_index:
-            del self._url_index[url]
+        # Remove EVERY URL-index alias pointing at this entry, not just the
+        # canonical metadata url. ingest_paper indexes an entry under several
+        # keys (canonical url, raw url, original_url, arxiv-abs); deleting only
+        # one left the others dangling at the now-removed id, so a re-import via
+        # an alias short-circuited to the stale id (bug_researcher_73b28040).
+        for key in [k for k, v in self._url_index.items() if v == entry_id]:
+            del self._url_index[key]
 
         self.digest.record(
             summary=f"Struck paper: {title} ({removed['triples']} triples removed)",
@@ -633,8 +636,12 @@ class ResearchPipeline:
         seen_urls: set = set()
         new_entry_ids: list = []
 
-        # Search all queries in parallel
-        search_tasks = [search_papers(q, max_results=max_papers // max(len(queries), 1)) for q in queries]
+        # Search all queries in parallel. Floor the per-query budget at 1:
+        # integer division yields 0 when the queries outnumber max_papers,
+        # which would search every query for zero papers and find nothing
+        # (bug_researcher_b5597e90).
+        per_query = max(1, max_papers // max(len(queries), 1))
+        search_tasks = [search_papers(q, max_results=per_query) for q in queries]
         search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
 
         for i, results in enumerate(search_results):
@@ -1613,6 +1620,11 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
             try:
                 fr_data = json.loads(entry.content)
             except json.JSONDecodeError:
+                fr_data = {"title": entry.title}
+            # Valid JSON that isn't an object (a list or scalar) would blow up
+            # the ``**fr_data`` spread below with TypeError and abort the whole
+            # listing; degrade this one row instead (bug_researcher_571dad81).
+            if not isinstance(fr_data, dict):
                 fr_data = {"title": entry.title}
             frs.append({
                 "id": entry.id,
