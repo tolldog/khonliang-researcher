@@ -41,6 +41,11 @@ VENV="${VENV:-/opt/khonliang/agents/researcher/.venv}"
 BUS="${BUS:-http://localhost:8788}"
 REF="${REF:-main}"
 DEPLOY_USER="${DEPLOY_USER:-khonliang}"
+# Private key injected into an ephemeral, service-user-owned ssh-agent when this
+# script is run by a DIFFERENT user than $DEPLOY_USER (the service user has no
+# GitHub key of its own). Only used on the cross-user/sudo path; ignored when
+# the script is already running as $DEPLOY_USER (its own agent/keys apply).
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 # An import that succeeds only when the freshly-installed code is present. Acts
 # as a post-install smoke so a half-built install can't silently ship. Imports
 # both agent entrypoints' packages plus the worker (embedded distill loop).
@@ -70,7 +75,10 @@ run_as_owner() {
   if [ "$(id -un)" = "$DEPLOY_USER" ]; then
     "$@"
   else
-    sudo -n -u "$DEPLOY_USER" "$@"
+    # -H so $HOME is the service user's (ssh reads its own ~/.ssh/known_hosts);
+    # preserve SSH_AUTH_SOCK so the ephemeral deploy agent (set up below) is
+    # reachable by the sudo'd git operations.
+    sudo -n -H --preserve-env=SSH_AUTH_SOCK -u "$DEPLOY_USER" "$@"
   fi
 }
 
@@ -91,6 +99,33 @@ fi
 curl -sS -o /dev/null --max-time 5 "$BUS/" 2>/dev/null || die "bus not reachable at $BUS"
 
 log "agents='$AGENTS' ref=$REF src=$SRC user=$DEPLOY_USER dry_run=$DRY_RUN"
+
+# ---- ephemeral ssh-agent for cross-user git auth ---------------------------
+# The service user has no GitHub key. When this script is run by a different
+# user that does (via passwordless sudo), start an ssh-agent OWNED BY the
+# service user -- so there are no socket-permission games -- and inject the
+# invoker's key into it over stdin. The agent is destroyed on any exit.
+DEPLOY_AGENT_PID=""
+cleanup_agent() {
+  if [ -n "$DEPLOY_AGENT_PID" ]; then
+    run_as_owner kill "$DEPLOY_AGENT_PID" 2>/dev/null || true
+    log "ssh-agent $DEPLOY_AGENT_PID destroyed"
+    DEPLOY_AGENT_PID=""
+  fi
+}
+trap cleanup_agent EXIT INT TERM
+
+if [ "$(id -un)" != "$DEPLOY_USER" ]; then
+  [ -r "$SSH_KEY" ] || die "ssh key not readable: $SSH_KEY (set SSH_KEY=/path/to/key)"
+  AGENT_ENV="$(sudo -n -H -u "$DEPLOY_USER" ssh-agent -s)" \
+    || die "could not start ssh-agent as $DEPLOY_USER"
+  eval "$AGENT_ENV" >/dev/null
+  export SSH_AUTH_SOCK SSH_AGENT_PID
+  DEPLOY_AGENT_PID="${SSH_AGENT_PID:-}"
+  cat "$SSH_KEY" | run_as_owner ssh-add - 2>/dev/null \
+    || die "could not load $SSH_KEY into the deploy ssh-agent"
+  log "ssh-agent $DEPLOY_AGENT_PID started ($SSH_KEY injected for $DEPLOY_USER)"
+fi
 
 # ---- pull ------------------------------------------------------------------
 OLD_SHA="$(run_as_owner git -C "$SRC" rev-parse HEAD)"
