@@ -148,8 +148,15 @@ async def async_repo_tree(
         try:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            # The clone overran; kill it. The process may have exited between
+            # the timeout firing and the kill (ProcessLookupError) — that's
+            # fine; we still surface a clean RepoTreeError rather than leak an
+            # unexpected exception type to callers that only handle it.
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
             raise RepoTreeError("Clone timed out after 120s")
         if proc.returncode != 0:
             raise RepoTreeError(
