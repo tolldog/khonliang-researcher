@@ -67,13 +67,13 @@ async def test_ingest_github_repo_invokes_progress_callback_with_keyword_args():
     pipe = ResearchPipeline.__new__(ResearchPipeline)
 
     class _FakeCtx:
-        def __enter__(self):
+        async def __aenter__(self):
             raise RepoTreeError("simulated clone abort for test")
-        def __exit__(self, *exc):
+        async def __aexit__(self, *exc):
             return False
 
     with patch("researcher.util.github_repo_key", return_value="o/r"):
-        with patch("researcher.util.repo_tree", return_value=_FakeCtx()):
+        with patch("researcher.util.async_repo_tree", return_value=_FakeCtx()):
             try:
                 await ResearchPipeline.ingest_github_repo(
                     pipe,
@@ -104,7 +104,7 @@ async def test_ingest_github_repo_stores_research_scope(tmp_path):
     empty repo dir (no README, no AST scan → no LLM calls), stubbing only the
     store/triple/digest/score collaborators, and asserts the entry handed to
     ``knowledge.add`` carries scope='research'."""
-    from contextlib import contextmanager
+    from contextlib import asynccontextmanager
 
     from researcher.pipeline import ResearchPipeline
 
@@ -134,12 +134,12 @@ async def test_ingest_github_repo_stores_research_scope(tmp_path):
         "description": "", "dependencies": [], "entry_points": [], "mcp_tools": [],
     }
 
-    @contextmanager
-    def _fake_repo_tree(url, prefix=""):
+    @asynccontextmanager
+    async def _fake_repo_tree(url, prefix=""):
         yield tmp_path  # empty dir → no README, no LLM calls on the readme path
 
     with patch("researcher.util.github_repo_key", return_value="o/r"), \
-         patch("researcher.util.repo_tree", _fake_repo_tree):
+         patch("researcher.util.async_repo_tree", _fake_repo_tree):
         result = await ResearchPipeline.ingest_github_repo(
             pipe, repo_url="https://github.com/o/r", depth="readme",
         )

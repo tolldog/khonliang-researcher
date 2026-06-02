@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import asyncio
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Iterator, TypedDict
+from typing import AsyncIterator, Iterator, TypedDict
 
 
 class RepoTreeError(RuntimeError):
@@ -116,3 +117,52 @@ def repo_tree(source: str, *, prefix: str = "researcher_repo_") -> Iterator[Path
         yield Path(tmp_dir)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@asynccontextmanager
+async def async_repo_tree(
+    source: str, *, prefix: str = "researcher_repo_",
+) -> AsyncIterator[Path]:
+    """Async variant of :func:`repo_tree` that clones via an asyncio subprocess
+    so the (up to 120s) ``git clone`` does not block the shared event loop
+    (fr_researcher_0539b91f). Local sources are yielded unchanged. Use this from
+    async callers (``ingest_github_repo``, ``scan_codebase``); the sync
+    :func:`repo_tree` remains for synchronous contexts.
+    """
+    parsed = _github_repo(source)
+    if parsed is None:
+        path = Path(source)
+        if not path.is_dir():
+            raise FileNotFoundError(f"Directory not found: {source}")
+        yield path
+        return
+
+    _, clone_url = parsed
+    tmp_dir = tempfile.mkdtemp(prefix=prefix)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "clone", "--depth=1", clone_url, tmp_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            # The clone overran; kill it. The process may have exited between
+            # the timeout firing and the kill (ProcessLookupError) — that's
+            # fine; we still surface a clean RepoTreeError rather than leak an
+            # unexpected exception type to callers that only handle it.
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            raise RepoTreeError("Clone timed out after 120s")
+        if proc.returncode != 0:
+            raise RepoTreeError(
+                f"Clone failed: {stderr.decode(errors='replace')[:200]}"
+            )
+        yield Path(tmp_dir)
+    finally:
+        # rmtree is blocking I/O too — keep it off the loop.
+        await asyncio.to_thread(shutil.rmtree, tmp_dir, ignore_errors=True)

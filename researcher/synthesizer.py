@@ -1098,10 +1098,10 @@ class Synthesizer:
         import ast
         import os
         from pathlib import Path
-        from researcher.util import RepoTreeError, repo_tree
+        from researcher.util import RepoTreeError, async_repo_tree
 
         try:
-            with repo_tree(repo_path, prefix="researcher_scan_") as repo:
+            async with async_repo_tree(repo_path, prefix="researcher_scan_") as repo:
                 repo = Path(repo)
                 # ---- Phase 1: AST extraction ----
                 skip_dirs = {"__pycache__", ".venv", "venv", "node_modules", ".git",

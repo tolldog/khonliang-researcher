@@ -19,6 +19,24 @@ LINKEDIN_INTERSTITIAL = """
 """
 
 
+@pytest.mark.asyncio
+async def test_fetch_file_reads_local_file_off_the_loop(tmp_path):
+    # fetch_file now runs the blocking read+convert via asyncio.to_thread
+    # (fr_researcher_e32d9bb7); the end-to-end result must be unchanged.
+    f = tmp_path / "note.md"
+    f.write_text("# Title\n\nthe body text")
+    result = await fetcher.fetch_file(str(f))
+    assert result.format == ContentFormat.MARKDOWN
+    assert "the body text" in result.content
+    assert result.url.startswith("file://")
+
+
+@pytest.mark.asyncio
+async def test_fetch_file_missing_raises_filenotfound(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        await fetcher.fetch_file(str(tmp_path / "nope.md"))
+
+
 def test_detect_format_pdf_url_served_as_html_is_html():
     # A .pdf URL that the server explicitly serves as HTML is an error/
     # challenge page, not a PDF — must not be routed to the PDF parser.
