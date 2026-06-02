@@ -394,9 +394,23 @@ def _readability_proxy_url(cfg, url: str) -> "str | None":
     proxy = cfg.get("proxy")
     if not isinstance(proxy, str) or "{url}" not in proxy:
         return None
-    hosts = cfg.get("hosts") or []
+    parsed = urlparse(url)
+    # Never hand a URL with embedded credentials (user:pass@host) to a
+    # third-party proxy — fail closed rather than leak basic-auth.
+    if parsed.username or parsed.password:
+        return None
+    # Normalize the optional host allowlist defensively: malformed YAML might
+    # give a bare string, non-strings, uppercase, or leading-dot entries.
+    raw_hosts = cfg.get("hosts")
+    if isinstance(raw_hosts, str):
+        raw_hosts = [raw_hosts]
+    hosts = [
+        h.lower().lstrip(".")
+        for h in (raw_hosts or [])
+        if isinstance(h, str) and h.strip()
+    ]
     if hosts:
-        host = (urlparse(url).hostname or "").lower()
+        host = (parsed.hostname or "").lower()
         if not any(host == h or host.endswith("." + h) for h in hosts):
             return None
     return proxy.replace("{url}", url)
@@ -422,21 +436,31 @@ async def fetch_url(
     except FetchBlockedError as blocked:
         proxy_url = _readability_proxy_url(readability_fallback, url)
         if proxy_url is None:
-            raise  # fallback disabled or host not allowlisted
-        logger.info("Direct fetch blocked; retrying via readability proxy: %s", url)
+            raise  # fallback disabled, host not allowlisted, or url has creds
+        # Sanitized references only — never log/persist the full url or the
+        # proxy URL (which embeds the original url + any query params/tokens).
+        parsed = urlparse(url)
+        safe_ref = f"{parsed.scheme}://{(parsed.hostname or '').lower()}{parsed.path or ''}"
+        proxy_host = urlparse(proxy_url).hostname or ""
+        logger.info("Direct fetch blocked; retrying %s via readability proxy %s", safe_ref, proxy_host)
         try:
             result = await _fetch_url_direct(proxy_url, timeout)
         except Exception as proxy_err:
+            # The proxy error string can embed URLs/tokens — log it, but keep
+            # the raised message sanitized so it can't leak via user surfaces.
+            logger.warning("readability proxy %s failed for %s: %s", proxy_host, safe_ref, proxy_err)
             raise FetchBlockedError(
-                f"{blocked} Readability-proxy fallback also failed: {proxy_err}"
+                f"{safe_ref} was blocked and the readability-proxy fallback "
+                f"({proxy_host}) also failed."
             ) from proxy_err
         # Stamp the result back to the ORIGINAL url so dedupe/backlinks key on
-        # it (not the proxy URL), and record the path taken.
+        # it (not the proxy URL), and record the path taken. Store only the
+        # proxy host, not the full templated proxy URL (which embeds the url).
         result.url = url
         result.metadata = {
             **result.metadata,
             "fetched_via": "readability_fallback",
-            "readability_proxy": proxy_url,
+            "readability_proxy": proxy_host,
         }
         return result
 

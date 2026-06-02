@@ -575,6 +575,20 @@ def test_readability_proxy_url_gating():
         f(cfg2, "https://anything.com/a")
         == "https://r.jina.ai/https://anything.com/a"
     )
+    # Embedded credentials -> fail closed (never ship basic-auth to the proxy).
+    assert f(cfg, "https://user:pass@x.substack.com/a") is None
+    # Malformed hosts (bare string / mixed-case / non-strings) are normalized,
+    # not crashed on.
+    messy = {"proxy": "https://r.jina.ai/{url}", "hosts": "SubStack.com"}
+    assert (
+        f(messy, "https://x.substack.com/a")
+        == "https://r.jina.ai/https://x.substack.com/a"
+    )
+    messy2 = {"proxy": "https://r.jina.ai/{url}", "hosts": [".SubStack.com", None, 123]}
+    assert (
+        f(messy2, "https://x.substack.com/a")
+        == "https://r.jina.ai/https://x.substack.com/a"
+    )
 
 
 @pytest.mark.asyncio
@@ -600,7 +614,9 @@ async def test_fetch_url_falls_back_to_readability_on_block(monkeypatch):
     # restamped to the ORIGINAL url, with the fallback path recorded.
     assert result.url == "https://x.substack.com/p/a"
     assert result.metadata["fetched_via"] == "readability_fallback"
-    assert result.metadata["readability_proxy"] == "https://r.jina.ai/https://x.substack.com/p/a"
+    # Only the proxy HOST is persisted — not the full templated URL (which
+    # embeds the original url + any query params/tokens).
+    assert result.metadata["readability_proxy"] == "r.jina.ai"
     assert calls == [
         "https://x.substack.com/p/a",
         "https://r.jina.ai/https://x.substack.com/p/a",

@@ -248,11 +248,16 @@ class ResearchPipeline:
                 return self._url_index[canonical_url]
             result = await fetch_arxiv(url)
         else:
-            cfg = getattr(self, "config", None) or {}
-            result = await fetch_url(
-                url,
-                readability_fallback=cfg.get("fetcher", {}).get("readability_fallback"),
+            # Defensive: config and the fetcher block may be absent (__new__
+            # test pipes) or malformed (`fetcher: null` / a string in user
+            # YAML). _readability_proxy_url itself fail-closes on a non-dict.
+            cfg = getattr(self, "config", None)
+            fetcher_cfg = cfg.get("fetcher") if isinstance(cfg, dict) else None
+            readability = (
+                fetcher_cfg.get("readability_fallback")
+                if isinstance(fetcher_cfg, dict) else None
             )
+            result = await fetch_url(url, readability_fallback=readability)
             resolved_url = result.url
             resolved_arxiv_id = extract_arxiv_id(resolved_url)
             if resolved_arxiv_id:
