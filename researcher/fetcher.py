@@ -9,6 +9,7 @@ Supported formats:
 Format is auto-detected from Content-Type header and URL extension.
 """
 
+import asyncio
 import io
 import logging
 import re
@@ -435,8 +436,11 @@ async def fetch_raw(url: str, timeout: int = 30) -> str:
             return await resp.text()
 
 
-async def fetch_file(path: str) -> FetchResult:
-    """Read a local file (PDF, markdown, text, HTML)."""
+def _read_file_sync(path: str) -> FetchResult:
+    """Blocking local-file read + convert. Split out of ``fetch_file`` so it can
+    run via ``asyncio.to_thread`` — the file I/O (and, for PDFs, the CPU-bound
+    fitz parse in ``_convert``) would otherwise stall the shared event loop
+    (fr_researcher_e32d9bb7)."""
     from pathlib import Path
 
     p = Path(path)
@@ -461,6 +465,11 @@ async def fetch_file(path: str) -> FetchResult:
         format=fmt,
         metadata={"source": "file", "path": str(p.resolve())},
     )
+
+
+async def fetch_file(path: str) -> FetchResult:
+    """Read a local file (PDF, markdown, text, HTML) off the event loop."""
+    return await asyncio.to_thread(_read_file_sync, path)
 
 
 # ---------------------------------------------------------------------------

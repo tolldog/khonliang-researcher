@@ -1175,7 +1175,7 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         """
         import hashlib
         from researcher.synthesizer import Synthesizer
-        from researcher.util import RepoTreeError, github_repo_key, repo_tree
+        from researcher.util import RepoTreeError, async_repo_tree, github_repo_key
 
         async def _emit(phase: str, progress_pct: int) -> None:
             if progress_callback is None:
@@ -1205,7 +1205,7 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
 
         await _emit("cloning", 10)
         try:
-            with repo_tree(repo_url, prefix="researcher_gh_") as repo_path:
+            async with async_repo_tree(repo_url, prefix="researcher_gh_") as repo_path:
                 # Extract package metadata
                 pkg_meta = self._extract_package_metadata(repo_path)
                 if not label and pkg_meta["description"]:
