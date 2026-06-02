@@ -191,8 +191,10 @@ def distill(ctx, entry_id, distill_all):
                             click.echo(f"  {proj}: {assess.get('score', 0):.0%}")
             else:
                 click.echo(f"Distillation failed: {result.title}", err=True)
+                sys.exit(1)
         else:
             click.echo("Provide an ENTRY_ID or use --all", err=True)
+            sys.exit(1)
 
     _run(_distill())
 
@@ -831,6 +833,9 @@ def idea_ingest(ctx, text, source):
     async def _ingest():
         idea_id = await pipeline.ingest_idea(text, source)
         entry = pipeline.knowledge.get(idea_id)
+        if not entry:
+            click.echo(f"Idea stored ({idea_id}) but could not be reloaded", err=True)
+            sys.exit(1)
         click.echo(f"Idea: {entry.title}")
         click.echo(f"ID: {idea_id}")
         claims = entry.metadata.get("claims", [])
@@ -894,6 +899,9 @@ def idea_full(ctx, text, source, max_papers):
         click.echo("Parsing idea...")
         idea_id = await pipeline.ingest_idea(text, source)
         entry = pipeline.knowledge.get(idea_id)
+        if not entry:
+            click.echo(f"Idea stored ({idea_id}) but could not be reloaded", err=True)
+            sys.exit(1)
         click.echo(f"Idea: {entry.title} ({idea_id})")
 
         claims = entry.metadata.get("claims", [])
@@ -903,6 +911,9 @@ def idea_full(ctx, text, source, max_papers):
 
         click.echo("\nSearching for papers...")
         stats = await pipeline.research_idea(idea_id, max_papers)
+        if "error" in stats:
+            click.echo(f"Error: {stats['error']}", err=True)
+            sys.exit(1)
         click.echo(f"Found {stats['papers_new']} new papers, distilled {stats['papers_distilled']}")
 
         if stats["papers_new"] > 0:
