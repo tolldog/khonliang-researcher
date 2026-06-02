@@ -663,3 +663,36 @@ async def test_fetch_url_surfaces_both_failures_when_proxy_also_fails(monkeypatc
     cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com"]}
     with pytest.raises(fetcher.FetchBlockedError, match="also failed"):
         await fetcher.fetch_url("https://x.substack.com/p/a", readability_fallback=cfg)
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_fallback_keys_on_resolved_blocked_target(monkeypatch):
+    """A shortlink that resolves to a blocked target: the fallback must key on
+    the TARGET host (allowlisted), not the original shortlink, and proxy the
+    target. FetchBlockedError.url carries the actually-blocked URL."""
+    calls = []
+
+    async def fake_direct(u, timeout=60):
+        calls.append(u)
+        if u.startswith("https://r.jina.ai/"):
+            return fetcher.FetchResult(
+                url=u, title="T", content="proxied",
+                format=ContentFormat.MARKDOWN, metadata={"source": "web"},
+            )
+        # The original shortlink resolved (inside _fetch_url_direct) to a
+        # blocked substack target; the error names that target.
+        raise fetcher.FetchBlockedError("blocked 403", url="https://x.substack.com/p/a")
+
+    monkeypatch.setattr(fetcher, "_fetch_url_direct", fake_direct)
+    # Only substack is allowlisted — lnkd.in is NOT, so a fix that keyed on the
+    # original would not fall back at all.
+    cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com"]}
+
+    result = await fetcher.fetch_url("https://lnkd.in/abc", readability_fallback=cfg)
+    assert result.content == "proxied"
+    assert calls == [
+        "https://lnkd.in/abc",
+        "https://r.jina.ai/https://x.substack.com/p/a",  # proxied the TARGET
+    ]
+    # restamped to the resolved target (dedupe keys on the real resource)
+    assert result.url == "https://x.substack.com/p/a"

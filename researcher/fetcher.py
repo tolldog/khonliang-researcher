@@ -100,7 +100,16 @@ class FetchBlockedError(RuntimeError):
     callers distinguish "site refuses scripted access" from generic
     transport failures and fall back to a browser-driven fetcher
     (WebFetch, etc.) piped into ``ingest_file``.
+
+    ``url`` is the URL that was actually blocked — which, for a resolved
+    shortlink, is the final target, not the original shortlink. The
+    ``fetch_url`` readability fallback keys its host-allowlist check and proxy
+    on this so a shortlink that lands on a blocked host still triggers it.
     """
+
+    def __init__(self, message: str, *, url: "str | None" = None):
+        super().__init__(message)
+        self.url = url
 
 
 _LINKEDIN_REDIRECT_PAGE_KEY = "d_shortlink_frontend_external_link_redirect_interstitial"
@@ -339,7 +348,8 @@ async def _fetch_url_direct(
                     f"{safe_ref} returned {resp.status} despite browser "
                     f"headers. {detail} Fall back to WebFetch (or a "
                     "browser-driven fetcher) and pipe the result via "
-                    "ingest_file."
+                    "ingest_file.",
+                    url=url,
                 )
             resp.raise_for_status()
             content_type = resp.headers.get("Content-Type", "")
@@ -434,29 +444,38 @@ async def fetch_url(
     try:
         return await _fetch_url_direct(url, timeout)
     except FetchBlockedError as blocked:
-        proxy_url = _readability_proxy_url(readability_fallback, url)
+        # Key the fallback on the URL that was actually blocked: for a resolved
+        # shortlink the block happens on the final target (recursively inside
+        # _fetch_url_direct), not the original shortlink, so the allowlist check
+        # and proxy must use the target host.
+        blocked_url = getattr(blocked, "url", None) or url
+        proxy_url = _readability_proxy_url(readability_fallback, blocked_url)
         if proxy_url is None:
             raise  # fallback disabled, host not allowlisted, or url has creds
         # Sanitized references only — never log/persist the full url or the
         # proxy URL (which embeds the original url + any query params/tokens).
-        parsed = urlparse(url)
+        parsed = urlparse(blocked_url)
         safe_ref = f"{parsed.scheme}://{(parsed.hostname or '').lower()}{parsed.path or ''}"
         proxy_host = urlparse(proxy_url).hostname or ""
         logger.info("Direct fetch blocked; retrying %s via readability proxy %s", safe_ref, proxy_host)
         try:
             result = await _fetch_url_direct(proxy_url, timeout)
         except Exception as proxy_err:
-            # The proxy error string can embed URLs/tokens — log it, but keep
-            # the raised message sanitized so it can't leak via user surfaces.
-            logger.warning("readability proxy %s failed for %s: %s", proxy_host, safe_ref, proxy_err)
+            # Log only the exception TYPE — its str can embed the proxied URL
+            # (original url + query params/tokens). Keep the raised message
+            # sanitized too so nothing leaks via user surfaces.
+            logger.warning(
+                "readability proxy %s failed for %s: %s",
+                proxy_host, safe_ref, type(proxy_err).__name__,
+            )
             raise FetchBlockedError(
                 f"{safe_ref} was blocked and the readability-proxy fallback "
                 f"({proxy_host}) also failed."
             ) from proxy_err
-        # Stamp the result back to the ORIGINAL url so dedupe/backlinks key on
-        # it (not the proxy URL), and record the path taken. Store only the
-        # proxy host, not the full templated proxy URL (which embeds the url).
-        result.url = url
+        # Stamp the result to the actually-blocked url (the resolved target for
+        # a shortlink) so dedupe/backlinks key on the real resource, not the
+        # proxy URL. Store only the proxy host, not the full templated URL.
+        result.url = blocked_url
         result.metadata = {
             **result.metadata,
             "fetched_via": "readability_fallback",
