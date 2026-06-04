@@ -426,7 +426,15 @@ def _readability_proxy_url(cfg, url: str) -> "str | None":
         host = (parsed.hostname or "").lower()
         if not any(host == h or host.endswith("." + h) for h in hosts):
             return None
-    return proxy.replace("{url}", url)
+    candidate = proxy.replace("{url}", url)
+    # Fail closed if the expanded template isn't an absolute http(s) URL (e.g. a
+    # scheme-less "r.jina.ai/{url}"): a malformed proxy must cleanly disable the
+    # fallback, not trigger a broken proxy fetch that fails with a secondary
+    # error.
+    parsed_proxy = urlparse(candidate)
+    if parsed_proxy.scheme not in ("http", "https") or not parsed_proxy.hostname:
+        return None
+    return candidate
 
 
 async def fetch_url(

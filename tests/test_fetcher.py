@@ -562,6 +562,10 @@ def test_readability_proxy_url_gating():
     assert f(None, "https://x.substack.com/a") is None
     assert f({}, "https://x.substack.com/a") is None
     assert f({"proxy": "no-placeholder"}, "https://x.substack.com/a") is None
+    # Expanded template must be an absolute http(s) URL — a scheme-less or
+    # non-http template fails closed rather than triggering a broken fetch.
+    assert f({"proxy": "r.jina.ai/{url}"}, "https://x.substack.com/a") is None
+    assert f({"proxy": "ftp://r.jina.ai/{url}"}, "https://x.substack.com/a") is None
     # Host allowlist gates which URLs reach the proxy.
     cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com"]}
     assert (
