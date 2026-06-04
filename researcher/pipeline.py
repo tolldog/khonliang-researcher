@@ -119,6 +119,20 @@ def update_capability_status(
         knowledge.add(entry)
 
 
+def _readability_fallback_cfg(config) -> "Dict[str, Any] | None":
+    """Pull ``fetcher.readability_fallback`` from a possibly-absent/malformed
+    config. Returns ``None`` (fail-closed) for a missing config, a missing or
+    non-dict ``fetcher`` block (e.g. ``fetcher: null`` or a bare string in user
+    YAML), so neither pipeline init nor ingest_paper raises on bad config.
+    """
+    if not isinstance(config, dict):
+        return None
+    fetcher_cfg = config.get("fetcher")
+    if not isinstance(fetcher_cfg, dict):
+        return None
+    return fetcher_cfg.get("readability_fallback")
+
+
 class ResearchPipeline:
     """Main orchestrator for the research paper pipeline."""
 
@@ -180,11 +194,7 @@ class ResearchPipeline:
         # config through so worker-mode URL ingestion matches ingest_paper.
         self.research_pool = ResearchPool()
         self.research_pool.register(
-            PaperFetcher(
-                readability_fallback=self.config.get("fetcher", {}).get(
-                    "readability_fallback"
-                ),
-            )
+            PaperFetcher(readability_fallback=_readability_fallback_cfg(self.config))
         )
 
         parser_client = pool.get_client("extractor")
@@ -255,15 +265,9 @@ class ResearchPipeline:
                 return self._url_index[canonical_url]
             result = await fetch_arxiv(url)
         else:
-            # Defensive: config and the fetcher block may be absent (__new__
-            # test pipes) or malformed (`fetcher: null` / a string in user
-            # YAML). _readability_proxy_url itself fail-closes on a non-dict.
-            cfg = getattr(self, "config", None)
-            fetcher_cfg = cfg.get("fetcher") if isinstance(cfg, dict) else None
-            readability = (
-                fetcher_cfg.get("readability_fallback")
-                if isinstance(fetcher_cfg, dict) else None
-            )
+            # config / fetcher block may be absent (__new__ test pipes) or
+            # malformed (`fetcher: null`, a bare string); the helper fail-closes.
+            readability = _readability_fallback_cfg(getattr(self, "config", None))
             result = await fetch_url(url, readability_fallback=readability)
             resolved_url = result.url
             resolved_arxiv_id = extract_arxiv_id(resolved_url)
