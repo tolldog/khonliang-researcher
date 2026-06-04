@@ -349,7 +349,10 @@ async def _fetch_url_direct(
                     f"headers. {detail} Fall back to WebFetch (or a "
                     "browser-driven fetcher) and pipe the result via "
                     "ingest_file.",
-                    url=url,
+                    # Only carry the url when it has no embedded credentials —
+                    # a consumer that logs/serializes exc.url must not leak
+                    # user:pass@ basic-auth.
+                    url=url if not (parsed.username or parsed.password) else None,
                 )
             resp.raise_for_status()
             content_type = resp.headers.get("Content-Type", "")
@@ -460,6 +463,10 @@ async def fetch_url(
         logger.info("Direct fetch blocked; retrying %s via readability proxy %s", safe_ref, proxy_host)
         try:
             result = await _fetch_url_direct(proxy_url, timeout)
+        except asyncio.CancelledError:
+            # Never turn cooperative cancellation into a FetchBlockedError —
+            # let it propagate so shutdown/cancel paths finalise cleanly.
+            raise
         except Exception as proxy_err:
             # Log only the exception TYPE — its str can embed the proxied URL
             # (original url + query params/tokens). Keep the raised message

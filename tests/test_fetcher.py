@@ -701,3 +701,93 @@ async def test_fetch_url_fallback_keys_on_resolved_blocked_target(monkeypatch):
     ]
     # restamped to the resolved target (dedupe keys on the real resource)
     assert result.url == "https://x.substack.com/p/a"
+
+
+def _fake_403_session(monkeypatch):
+    class FakeResponse:
+        def __init__(self, url):
+            self.status = 403
+            self.headers = {"Content-Type": "text/html"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def raise_for_status(self):  # pragma: no cover
+            raise AssertionError("FetchBlockedError must fire first")
+
+        async def text(self):  # pragma: no cover
+            return ""
+
+        async def read(self):  # pragma: no cover
+            return b""
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse(url)
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+
+
+def test_fetch_blocked_error_url_omits_embedded_credentials(monkeypatch):
+    _fake_403_session(monkeypatch)
+    # creds-free URL -> exc.url carries it (so a fallback can key on it)
+    with pytest.raises(fetcher.FetchBlockedError) as ei:
+        asyncio.run(fetcher.fetch_url("https://example.com/x"))
+    assert ei.value.url == "https://example.com/x"
+    # basic-auth in the URL -> exc.url is None so a consumer logging it can't
+    # leak user:pass@ credentials.
+    with pytest.raises(fetcher.FetchBlockedError) as ei2:
+        asyncio.run(fetcher.fetch_url("https://user:pass@example.com/x"))
+    assert ei2.value.url is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_propagates_cancellation_from_proxy(monkeypatch):
+    async def fake_direct(u, timeout=60):
+        if u.startswith("https://r.jina.ai/"):
+            raise asyncio.CancelledError()
+        raise fetcher.FetchBlockedError("blocked 403")
+
+    monkeypatch.setattr(fetcher, "_fetch_url_direct", fake_direct)
+    cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com"]}
+    # Cancellation during the proxy attempt must propagate, not become a
+    # FetchBlockedError.
+    with pytest.raises(asyncio.CancelledError):
+        await fetcher.fetch_url("https://x.substack.com/p/a", readability_fallback=cfg)
+
+
+@pytest.mark.asyncio
+async def test_paper_fetcher_threads_readability_fallback(monkeypatch):
+    import researcher.queue as q
+    from types import SimpleNamespace
+
+    captured = {}
+
+    async def fake_fetch_url(url, readability_fallback=None):
+        captured["rf"] = readability_fallback
+        return fetcher.FetchResult(
+            url=url, title="t", content="c",
+            format=ContentFormat.HTML, metadata={},
+        )
+
+    monkeypatch.setattr(q, "fetch_url", fake_fetch_url)
+    cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["example.com"]}
+    pf = q.PaperFetcher(readability_fallback=cfg)
+    task = SimpleNamespace(
+        query="https://example.com/a", task_id="t1",
+        task_type="fetch", scope="research",
+    )
+    await pf.research(task)
+    assert captured["rf"] == cfg

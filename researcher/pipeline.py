@@ -176,9 +176,16 @@ class ResearchPipeline:
             blackboard=self.blackboard,
         )
 
-        # Research pool for threaded fetching
+        # Research pool for threaded fetching. Thread the readability-fallback
+        # config through so worker-mode URL ingestion matches ingest_paper.
         self.research_pool = ResearchPool()
-        self.research_pool.register(PaperFetcher())
+        self.research_pool.register(
+            PaperFetcher(
+                readability_fallback=self.config.get("fetcher", {}).get(
+                    "readability_fallback"
+                ),
+            )
+        )
 
         parser_client = pool.get_client("extractor")
         self.research_pool.register(ListParser(llm_client=parser_client))
