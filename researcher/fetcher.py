@@ -468,10 +468,16 @@ async def fetch_url(
                 "readability proxy %s failed for %s: %s",
                 proxy_host, safe_ref, type(proxy_err).__name__,
             )
+            # ``from None`` so the chained proxy_err (whose str can embed the
+            # proxied URL + tokens) can't be re-emitted via an upstream
+            # ``logger.exception(...)`` traceback; the cause is already logged
+            # above (type only). Carry the blocked url so callers can still tell
+            # which URL failed.
             raise FetchBlockedError(
                 f"{safe_ref} was blocked and the readability-proxy fallback "
-                f"({proxy_host}) also failed."
-            ) from proxy_err
+                f"({proxy_host}) also failed.",
+                url=blocked_url,
+            ) from None
         # Stamp the result to the actually-blocked url (the resolved target for
         # a shortlink) so dedupe/backlinks key on the real resource, not the
         # proxy URL. Store only the proxy host, not the full templated URL.

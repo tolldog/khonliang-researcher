@@ -661,8 +661,13 @@ async def test_fetch_url_surfaces_both_failures_when_proxy_also_fails(monkeypatc
 
     monkeypatch.setattr(fetcher, "_fetch_url_direct", fake_direct)
     cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com"]}
-    with pytest.raises(fetcher.FetchBlockedError, match="also failed"):
+    with pytest.raises(fetcher.FetchBlockedError, match="also failed") as exc:
         await fetcher.fetch_url("https://x.substack.com/p/a", readability_fallback=cfg)
+    # Carries the blocked url so callers know which URL failed...
+    assert exc.value.url == "https://x.substack.com/p/a"
+    # ...and the proxy cause is NOT chained (its str can embed the proxied URL;
+    # `from None` keeps it out of any upstream logger.exception traceback).
+    assert exc.value.__cause__ is None
 
 
 @pytest.mark.asyncio
