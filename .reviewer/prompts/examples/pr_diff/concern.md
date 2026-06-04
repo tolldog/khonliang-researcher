@@ -2,7 +2,7 @@
 
 Repo-specific invariants distilled from real cross-vendor review findings
 (see PR #29, librarian agent). A local hot-tier model tends to catch
-type/docstring/dead-code issues but miss these cross-cutting correctness
+type/docstring/dead-code issues but misses these cross-cutting correctness
 invariants. Flag a diff at **concern** severity when it violates one of the
 patterns below. Each entry is a *canonical* bad/good pair — match by shape,
 not by exact identifier.
