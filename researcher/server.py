@@ -398,8 +398,9 @@ Most tools accept detail="compact|brief|full":
         The recovery path when fetch_paper is blocked (403) and the service
         can't retrieve the page itself: an agent with a working fetcher (browser
         WebFetch, Playwright, an external distiller) hands the already-retrieved
-        body here. Stores an entry in the same shape as fetch_paper success,
-        source = the original URL. Returns the entry ID for later distillation.
+        body here. Stores an entry in the same shape as fetch_paper success;
+        the stored entry's source is the URL (arxiv-canonicalized for dedupe).
+        Returns the entry ID for later distillation.
         """
         if not url or not url.strip():
             return "Error: url is required"

@@ -331,9 +331,12 @@ class ResearchPipeline:
         ``fetch_paper`` 403s where the service itself can't retrieve the page.
 
         Stores an entry in the same Tier.IMPORTED / ``["paper"]`` / INGESTED
-        shape as ``ingest_paper`` success, ``source`` = the original URL (so
-        dedupe + backlinks work), without the fetch or /tmp round-trip. Returns
-        the entry_id, the existing id on a duplicate, or None on empty body.
+        shape as ``ingest_paper`` success. ``source`` is the URL,
+        arxiv-canonicalized (``https://arxiv.org/abs/<id>``) the same way
+        ``ingest_paper`` does so the two ingest paths dedupe + backlink to one
+        entry; the caller-supplied URL is preserved in ``metadata.original_url``
+        when it differs. No fetch or /tmp round-trip. Returns the entry_id, the
+        existing id on a duplicate, or None on empty body.
         """
         import hashlib
         import time
@@ -378,6 +381,9 @@ class ResearchPipeline:
             metadata={
                 "url": canonical_url,
                 "original_url": url if url != canonical_url else "",
+                # No separate fetched URL (caller supplied the body); kept for
+                # metadata-schema parity with ingest_paper.
+                "fetched_url": "",
                 "fetched_at": time.time(),
                 "source": "url_with_body",
                 "content_type": content_type,

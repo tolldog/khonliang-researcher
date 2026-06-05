@@ -520,9 +520,9 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "the recovery path when fetch_paper is blocked (403) and the "
                 "service can't retrieve the page itself. Stores an entry in the "
                 "same Tier.IMPORTED / paper / INGESTED shape as fetch_paper "
-                "success, with source = the original URL (so dedupe + backlinks "
-                "work), then the distillation worker picks it up. Returns "
-                "{entry_id, url}.",
+                "success; the stored entry's source is the URL "
+                "(arxiv-canonicalized for dedupe), then the distillation worker "
+                "picks it up. Returns {entry_id, url}.",
                 {
                     "url": {"type": "string", "required": True},
                     "body": {"type": "string", "required": True},
@@ -694,7 +694,10 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             return {"error": f"ingest failed: {e}"}
         if not entry_id:
             return {"error": "no extractable content in body"}
-        return {"entry_id": entry_id, "url": url, "source": url}
+        # Return the caller's url only — the stored entry's `source` is
+        # arxiv-canonicalized, so we don't echo a `source` that could disagree
+        # with what was persisted.
+        return {"entry_id": entry_id, "url": url}
 
     async def handle_distill_repo_docs(self, args):
         return await distill_repo_docs_handler(self, pipeline, args)

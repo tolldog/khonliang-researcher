@@ -791,4 +791,4 @@ async def test_ingest_url_with_body_handler_validates_and_dispatches():
     assert "body must be a string" in (await h({"url": "https://x/a", "body": 5}))["error"]
 
     out = await h({"url": "https://x/a", "body": "# T\n\nbody"})
-    assert out == {"entry_id": "entry_xyz", "url": "https://x/a", "source": "https://x/a"}
+    assert out == {"entry_id": "entry_xyz", "url": "https://x/a"}
