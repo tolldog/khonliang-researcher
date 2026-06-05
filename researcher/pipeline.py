@@ -606,6 +606,23 @@ class ResearchPipeline:
         if source_label:
             title = f"{title} ({source_label})"
 
+        claims = parsed.get("claims", []) or []
+        # research_idea reads metadata.search_queries to drive the search. Some
+        # idea-parser outputs put the query per-claim (claim.search_query) and
+        # leave the top-level search_queries list empty, which silently broke
+        # the ingest_idea -> research_idea handoff (bug_developer_609eecb0 /
+        # dog_912b9f0d). Union both shapes, order-preserving + deduped, so the
+        # queries are never lost regardless of where the parser placed them.
+        search_queries: list = []
+        for q in parsed.get("search_queries", []) or []:
+            if isinstance(q, str) and q.strip() and q.strip() not in search_queries:
+                search_queries.append(q.strip())
+        for claim in claims:
+            if isinstance(claim, dict):
+                q = claim.get("search_query")
+                if isinstance(q, str) and q.strip() and q.strip() not in search_queries:
+                    search_queries.append(q.strip())
+
         entry = KnowledgeEntry(
             id=entry_id,
             tier=Tier.IMPORTED,
@@ -617,15 +634,15 @@ class ResearchPipeline:
             status=EntryStatus.INGESTED,
             metadata={
                 "source_type": parsed.get("source_type", "freeform"),
-                "claims": parsed.get("claims", []),
-                "search_queries": parsed.get("search_queries", []),
+                "claims": claims,
+                "search_queries": search_queries,
                 "keywords": parsed.get("keywords", []),
             },
         )
         self.knowledge.add(entry)
 
         self.digest.record(
-            summary=f"Ingested idea: {title} — {len(parsed.get('claims', []))} claims, {len(parsed.get('search_queries', []))} queries",
+            summary=f"Ingested idea: {title} — {len(claims)} claims, {len(search_queries)} queries",
             source="pipeline",
             audience="research",
             tags=["idea", "ingested"],
