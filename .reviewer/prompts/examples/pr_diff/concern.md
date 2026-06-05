@@ -55,7 +55,7 @@ without a guard the handler enters an error loop that spams the bus — the
 transport enforces no payload shape, so every subscriber is the last defense.
 
 - Bad: `payload = event.get("payload", {}); user_id = payload.get("user_id")`  *(AttributeError if payload is a string)*
-- Good: `raw = event.get("payload"); payload = raw if isinstance(raw, dict) else {}` (warn on non-dict; mirrors `librarian_agent._handle_bus_event`; use `%`-style logging — keyword `log.warning("m", k=v)` raises here). (PR #29)
+- Good: `raw = event.get("payload"); payload = raw if isinstance(raw, dict) else {}` (warn on non-dict; mirrors `researcher/librarian_agent.py::_handle_bus_event`; use `%`-style logging — keyword `log.warning("m", k=v)` raises here). (PR #29)
 
 ## snapshot_id_race_prevention
 
@@ -66,7 +66,7 @@ stored reference disagree with the taxonomy actually used. (The attribute is
 `.snapshot_id`, not `.id`.)
 
 - Bad: `self._save(result, snapshot_id=self.taxonomy.latest_snapshot().snapshot_id)`  *(second lookup)*
-- Good: `content, snapshot_id = self._ensure_snapshot()` then `compute(content, …)` then `self._save(result, snapshot_id=snapshot_id)` (canonical `librarian_agent::_ensure_snapshot`). (PR #29)
+- Good: `content, snapshot_id = self._ensure_snapshot()` then `compute(content, …)` then `self._save(result, snapshot_id=snapshot_id)` (canonical `researcher/librarian_agent.py::_ensure_snapshot`). (PR #29)
 
 ## batch_per_item_error_isolation
 
