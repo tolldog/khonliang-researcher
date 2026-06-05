@@ -100,7 +100,16 @@ class FetchBlockedError(RuntimeError):
     callers distinguish "site refuses scripted access" from generic
     transport failures and fall back to a browser-driven fetcher
     (WebFetch, etc.) piped into ``ingest_file``.
+
+    ``url`` is the URL that was actually blocked — which, for a resolved
+    shortlink, is the final target, not the original shortlink. The
+    ``fetch_url`` readability fallback keys its host-allowlist check and proxy
+    on this so a shortlink that lands on a blocked host still triggers it.
     """
+
+    def __init__(self, message: str, *, url: "str | None" = None):
+        super().__init__(message)
+        self.url = url
 
 
 _LINKEDIN_REDIRECT_PAGE_KEY = "d_shortlink_frontend_external_link_redirect_interstitial"
@@ -301,25 +310,25 @@ def _convert(raw: bytes, text: str, fmt: ContentFormat) -> tuple[str, str]:
 # Public fetch functions
 # ---------------------------------------------------------------------------
 
-async def fetch_url(
+async def _fetch_url_direct(
     url: str,
     timeout: int = 60,
     *,
     _shortlink_depth: int = 0,
 ) -> FetchResult:
-    """Fetch any URL, auto-detect format, return clean text.
+    """Single-attempt fetch: HTTP GET, format detect, shortlink resolve, convert.
 
     Handles HTML, PDF, Markdown, and plain text automatically. Raises
-    :class:`FetchBlockedError` on 403 (and on any 4xx/5xx from
-    known-blocked hosts) so callers can fall back to a browser-driven
-    fetcher rather than retrying the same request.
+    :class:`FetchBlockedError` on 403/429/503 (and on any 4xx/5xx from
+    known-blocked hosts) so the :func:`fetch_url` orchestrator can try the
+    readability-proxy fallback rather than retrying the same request.
     """
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     known_blocked = _is_known_blocked_host(host)
     async with aiohttp.ClientSession(headers=_HEADERS) as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            if resp.status == 403 or (known_blocked and resp.status >= 400):
+            if resp.status in (403, 429, 503) or (known_blocked and resp.status >= 400):
                 if known_blocked:
                     detail = (
                         f"{host} is on the known-anti-bot list; "
@@ -327,8 +336,8 @@ async def fetch_url(
                     )
                 else:
                     detail = (
-                        "403 may be a bot challenge or a real ACL deny; "
-                        "if scripted access shouldn't apply, try the "
+                        f"{resp.status} may be a bot challenge / rate-limit "
+                        "rather than a real ACL deny; try the readability "
                         "fallback before assuming an authorization issue."
                     )
                 # Don't echo the full url — it may carry userinfo or
@@ -339,7 +348,11 @@ async def fetch_url(
                     f"{safe_ref} returned {resp.status} despite browser "
                     f"headers. {detail} Fall back to WebFetch (or a "
                     "browser-driven fetcher) and pipe the result via "
-                    "ingest_file."
+                    "ingest_file.",
+                    # Only carry the url when it has no embedded credentials —
+                    # a consumer that logs/serializes exc.url must not leak
+                    # user:pass@ basic-auth.
+                    url=url if not (parsed.username or parsed.password) else None,
                 )
             resp.raise_for_status()
             content_type = resp.headers.get("Content-Type", "")
@@ -356,7 +369,7 @@ async def fetch_url(
         target_url = _extract_linkedin_external_url(text_content, source_url=url)
         if target_url and target_url != url:
             logger.info("Resolved LinkedIn shortlink %s -> %s", url, target_url)
-            result = await fetch_url(
+            result = await _fetch_url_direct(
                 target_url,
                 timeout=timeout,
                 _shortlink_depth=_shortlink_depth + 1,
@@ -373,6 +386,123 @@ async def fetch_url(
         format=fmt,
         metadata={"source": "web", "content_type": content_type},
     )
+
+
+def _readability_proxy_url(cfg, url: str) -> "str | None":
+    """Build the readability-proxy URL for ``url`` from the fetcher config, or
+    ``None`` if the fallback is disabled or ``url``'s host isn't allowlisted.
+
+    ``cfg`` is the ``fetcher.readability_fallback`` config block::
+
+        {"proxy": "https://r.jina.ai/{url}", "hosts": ["substack.com", ...]}
+
+    Fail-closed: a missing/non-string ``proxy`` (or one without the ``{url}``
+    placeholder) returns ``None`` — no external call unless explicitly
+    configured. An empty/absent ``hosts`` list means "any host that got
+    blocked"; a non-empty list restricts the fallback to those hosts (suffix
+    match), so arbitrary URLs aren't silently shipped to an external proxy.
+    """
+    if not isinstance(cfg, dict):
+        return None
+    proxy = cfg.get("proxy")
+    if not isinstance(proxy, str) or "{url}" not in proxy:
+        return None
+    parsed = urlparse(url)
+    # Never hand a URL with embedded credentials (user:pass@host) to a
+    # third-party proxy — fail closed rather than leak basic-auth.
+    if parsed.username or parsed.password:
+        return None
+    # Normalize the optional host allowlist defensively: malformed YAML might
+    # give a bare string, non-strings, uppercase, or leading-dot entries.
+    raw_hosts = cfg.get("hosts")
+    if isinstance(raw_hosts, str):
+        raw_hosts = [raw_hosts]
+    hosts = [
+        h.lower().lstrip(".")
+        for h in (raw_hosts or [])
+        if isinstance(h, str) and h.strip()
+    ]
+    if hosts:
+        host = (parsed.hostname or "").lower()
+        if not any(host == h or host.endswith("." + h) for h in hosts):
+            return None
+    candidate = proxy.replace("{url}", url)
+    # Fail closed if the expanded template isn't an absolute http(s) URL (e.g. a
+    # scheme-less "r.jina.ai/{url}"): a malformed proxy must cleanly disable the
+    # fallback, not trigger a broken proxy fetch that fails with a secondary
+    # error.
+    parsed_proxy = urlparse(candidate)
+    if parsed_proxy.scheme not in ("http", "https") or not parsed_proxy.hostname:
+        return None
+    return candidate
+
+
+async def fetch_url(
+    url: str,
+    timeout: int = 60,
+    *,
+    readability_fallback=None,
+) -> FetchResult:
+    """Fetch any URL, auto-detect format, return clean text.
+
+    On a blocked direct fetch (403/429/503, or any 4xx/5xx from a known
+    anti-bot host) this retries through a configured readability proxy when
+    ``readability_fallback`` is set and the host is allowlisted; otherwise the
+    original :class:`FetchBlockedError` propagates. Fail-closed: no proxy call
+    happens unless the fallback is explicitly configured (see
+    :func:`_readability_proxy_url`).
+    """
+    try:
+        return await _fetch_url_direct(url, timeout)
+    except FetchBlockedError as blocked:
+        # Key the fallback on the URL that was actually blocked: for a resolved
+        # shortlink the block happens on the final target (recursively inside
+        # _fetch_url_direct), not the original shortlink, so the allowlist check
+        # and proxy must use the target host.
+        blocked_url = getattr(blocked, "url", None) or url
+        proxy_url = _readability_proxy_url(readability_fallback, blocked_url)
+        if proxy_url is None:
+            raise  # fallback disabled, host not allowlisted, or url has creds
+        # Sanitized references only — never log/persist the full url or the
+        # proxy URL (which embeds the original url + any query params/tokens).
+        parsed = urlparse(blocked_url)
+        safe_ref = f"{parsed.scheme}://{(parsed.hostname or '').lower()}{parsed.path or ''}"
+        proxy_host = urlparse(proxy_url).hostname or ""
+        logger.info("Direct fetch blocked; retrying %s via readability proxy %s", safe_ref, proxy_host)
+        try:
+            result = await _fetch_url_direct(proxy_url, timeout)
+        except asyncio.CancelledError:
+            # Never turn cooperative cancellation into a FetchBlockedError —
+            # let it propagate so shutdown/cancel paths finalise cleanly.
+            raise
+        except Exception as proxy_err:
+            # Log only the exception TYPE — its str can embed the proxied URL
+            # (original url + query params/tokens). Keep the raised message
+            # sanitized too so nothing leaks via user surfaces.
+            logger.warning(
+                "readability proxy %s failed for %s: %s",
+                proxy_host, safe_ref, type(proxy_err).__name__,
+            )
+            # ``from None`` so the chained proxy_err (whose str can embed the
+            # proxied URL + tokens) can't be re-emitted via an upstream
+            # ``logger.exception(...)`` traceback; the cause is already logged
+            # above (type only). Carry the blocked url so callers can still tell
+            # which URL failed.
+            raise FetchBlockedError(
+                f"{safe_ref} was blocked and the readability-proxy fallback "
+                f"({proxy_host}) also failed.",
+                url=blocked_url,
+            ) from None
+        # Stamp the result to the actually-blocked url (the resolved target for
+        # a shortlink) so dedupe/backlinks key on the real resource, not the
+        # proxy URL. Store only the proxy host, not the full templated URL.
+        result.url = blocked_url
+        result.metadata = {
+            **result.metadata,
+            "fetched_via": "readability_fallback",
+            "readability_proxy": proxy_host,
+        }
+        return result
 
 
 async def fetch_arxiv(arxiv_id_or_url: str) -> FetchResult:

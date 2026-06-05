@@ -119,6 +119,20 @@ def update_capability_status(
         knowledge.add(entry)
 
 
+def _readability_fallback_cfg(config) -> "Dict[str, Any] | None":
+    """Pull ``fetcher.readability_fallback`` from a possibly-absent/malformed
+    config. Returns ``None`` (fail-closed) for a missing config, a missing or
+    non-dict ``fetcher`` block (e.g. ``fetcher: null`` or a bare string in user
+    YAML), so neither pipeline init nor ingest_paper raises on bad config.
+    """
+    if not isinstance(config, dict):
+        return None
+    fetcher_cfg = config.get("fetcher")
+    if not isinstance(fetcher_cfg, dict):
+        return None
+    return fetcher_cfg.get("readability_fallback")
+
+
 class ResearchPipeline:
     """Main orchestrator for the research paper pipeline."""
 
@@ -176,9 +190,12 @@ class ResearchPipeline:
             blackboard=self.blackboard,
         )
 
-        # Research pool for threaded fetching
+        # Research pool for threaded fetching. Thread the readability-fallback
+        # config through so worker-mode URL ingestion matches ingest_paper.
         self.research_pool = ResearchPool()
-        self.research_pool.register(PaperFetcher())
+        self.research_pool.register(
+            PaperFetcher(readability_fallback=_readability_fallback_cfg(self.config))
+        )
 
         parser_client = pool.get_client("extractor")
         self.research_pool.register(ListParser(llm_client=parser_client))
@@ -248,7 +265,10 @@ class ResearchPipeline:
                 return self._url_index[canonical_url]
             result = await fetch_arxiv(url)
         else:
-            result = await fetch_url(url)
+            # config / fetcher block may be absent (__new__ test pipes) or
+            # malformed (`fetcher: null`, a bare string); the helper fail-closes.
+            readability = _readability_fallback_cfg(getattr(self, "config", None))
+            result = await fetch_url(url, readability_fallback=readability)
             resolved_url = result.url
             resolved_arxiv_id = extract_arxiv_id(resolved_url)
             if resolved_arxiv_id:

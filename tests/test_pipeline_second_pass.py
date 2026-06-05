@@ -127,3 +127,18 @@ def test_get_historical_feature_requests_tolerates_non_dict_json():
     by_id = {f["id"]: f for f in frs}
     assert by_id["fr_bad"]["title"] == "Legacy FR"  # fell back to entry.title
     assert by_id["fr_good"]["extra"] == 1  # dict content still spread in
+
+
+def test_readability_fallback_cfg_handles_malformed_config():
+    """fetcher.readability_fallback extraction must fail-closed (None), never
+    raise, on absent/malformed config — `fetcher: null` is the case that broke
+    pipeline init (PR #47)."""
+    from researcher.pipeline import _readability_fallback_cfg
+
+    assert _readability_fallback_cfg(None) is None
+    assert _readability_fallback_cfg("not-a-dict") is None
+    assert _readability_fallback_cfg({}) is None
+    assert _readability_fallback_cfg({"fetcher": None}) is None  # fetcher: null
+    assert _readability_fallback_cfg({"fetcher": "str"}) is None
+    cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["x.com"]}
+    assert _readability_fallback_cfg({"fetcher": {"readability_fallback": cfg}}) == cfg

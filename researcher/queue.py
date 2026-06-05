@@ -27,6 +27,12 @@ class PaperFetcher(BaseResearcher):
     capabilities = ["fetch_paper"]
     max_concurrent = 5
 
+    def __init__(self, readability_fallback=None):
+        super().__init__()
+        # Same opt-in readability-proxy fallback as pipeline.ingest_paper, so
+        # worker-mode URL ingestion behaves consistently with server/CLI ingest.
+        self._readability_fallback = readability_fallback
+
     async def research(self, task: ResearchTask) -> ResearchResult:
         url = task.query
 
@@ -35,7 +41,9 @@ class PaperFetcher(BaseResearcher):
         if arxiv_id:
             result = await fetch_arxiv(url)
         else:
-            result = await fetch_url(url)
+            result = await fetch_url(
+                url, readability_fallback=self._readability_fallback,
+            )
 
         return ResearchResult(
             task_id=task.task_id,
