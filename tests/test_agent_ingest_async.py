@@ -771,3 +771,24 @@ async def test_progress_events_published_on_research_ingest_progress_topic():
     for _, p in agent.events:
         assert p["job_id"] == job_id
         assert p["skill"] == "ingest_idea"
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_handler_validates_and_dispatches():
+    """The ingest_url_with_body bus handler: strict isinstance validation, then
+    dispatch to pipeline.ingest_url_with_body, returning {entry_id, url, source}."""
+    async def fake_ingest_url_with_body(url, body, *, title="", content_type="text/markdown"):
+        return "entry_xyz"
+
+    pipeline = _make_pipeline()
+    pipeline.ingest_url_with_body = fake_ingest_url_with_body
+    agent = _build_fake_agent(pipeline)
+    h = agent._handlers["ingest_url_with_body"]
+
+    assert "url is required" in (await h({}))["error"]
+    assert "url must be a string" in (await h({"url": 123, "body": "b"}))["error"]
+    assert "body is required" in (await h({"url": "https://x/a"}))["error"]
+    assert "body must be a string" in (await h({"url": "https://x/a", "body": 5}))["error"]
+
+    out = await h({"url": "https://x/a", "body": "# T\n\nbody"})
+    assert out == {"entry_id": "entry_xyz", "url": "https://x/a", "source": "https://x/a"}

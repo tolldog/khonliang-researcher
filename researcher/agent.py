@@ -514,6 +514,24 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 since="0.3.0",
             ),
             Skill(
+                "ingest_url_with_body",
+                "Ingest a URL whose page body was fetched OUTSIDE the service "
+                "(browser-grade WebFetch, Playwright, an external distiller) — "
+                "the recovery path when fetch_paper is blocked (403) and the "
+                "service can't retrieve the page itself. Stores an entry in the "
+                "same Tier.IMPORTED / paper / INGESTED shape as fetch_paper "
+                "success, with source = the original URL (so dedupe + backlinks "
+                "work), then the distillation worker picks it up. Returns "
+                "{entry_id, url}.",
+                {
+                    "url": {"type": "string", "required": True},
+                    "body": {"type": "string", "required": True},
+                    "title": {"type": "string", "default": ""},
+                    "content_type": {"type": "string", "default": "text/markdown"},
+                },
+                since="0.3.0",
+            ),
+            Skill(
                 "ingest_github_async",
                 "Schedule a GitHub-repo ingest as a background job. "
                 "Returns {job_id, accepted_at} immediately; progress "
@@ -642,6 +660,41 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
 
     async def handle_ingest_from_artifact(self, args):
         return await ingest_from_artifact(self, pipeline, args)
+
+    async def handle_ingest_url_with_body(self, args):
+        # Strict isinstance validation like the sibling handlers — never
+        # str()-coerce, so caller type bugs surface as a clean error.
+        url_raw = args.get("url", "")
+        if not isinstance(url_raw, str):
+            return {"error": "url must be a string"}
+        url = url_raw.strip()
+        if not url:
+            return {"error": "url is required"}
+        # Distinguish missing (required-field error) from wrong type, like
+        # stage_payload does for `content`.
+        if "body" not in args:
+            return {"error": "body is required"}
+        body = args.get("body")
+        if not isinstance(body, str):
+            return {"error": "body must be a string"}
+        if not body.strip():
+            return {"error": "body is required"}
+        title_raw = args.get("title", "")
+        if not isinstance(title_raw, str):
+            return {"error": "title must be a string"}
+        content_type_raw = args.get("content_type", "text/markdown")
+        if not isinstance(content_type_raw, str):
+            return {"error": "content_type must be a string"}
+        content_type = content_type_raw.strip() or "text/markdown"
+        try:
+            entry_id = await pipeline.ingest_url_with_body(
+                url, body, title=title_raw.strip(), content_type=content_type,
+            )
+        except Exception as e:  # noqa: BLE001 — surface as a clean error envelope
+            return {"error": f"ingest failed: {e}"}
+        if not entry_id:
+            return {"error": "no extractable content in body"}
+        return {"entry_id": entry_id, "url": url, "source": url}
 
     async def handle_distill_repo_docs(self, args):
         return await distill_repo_docs_handler(self, pipeline, args)
@@ -1116,6 +1169,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["stop_ingest_watcher"] = MethodType(handle_stop_ingest_watcher, agent)
     agent._handlers["stage_payload"] = MethodType(handle_stage_payload, agent)
     agent._handlers["ingest_from_artifact"] = MethodType(handle_ingest_from_artifact, agent)
+    agent._handlers["ingest_url_with_body"] = MethodType(handle_ingest_url_with_body, agent)
     agent._handlers["distill_repo_docs"] = MethodType(handle_distill_repo_docs, agent)
     agent._handlers["ingest_github_async"] = MethodType(handle_ingest_github_async, agent)
     agent._handlers["ingest_file_async"] = MethodType(handle_ingest_file_async, agent)

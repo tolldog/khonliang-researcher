@@ -389,6 +389,34 @@ Most tools accept detail="compact|brief|full":
             return f"Error reading {path}: {e}"
 
     @mcp.tool()
+    async def ingest_url_with_body(
+        url: str, body: str, title: str = "",
+        content_type: str = "text/markdown",
+    ) -> str:
+        """Ingest a URL whose page body was fetched OUTSIDE the service.
+
+        The recovery path when fetch_paper is blocked (403) and the service
+        can't retrieve the page itself: an agent with a working fetcher (browser
+        WebFetch, Playwright, an external distiller) hands the already-retrieved
+        body here. Stores an entry in the same shape as fetch_paper success,
+        source = the original URL. Returns the entry ID for later distillation.
+        """
+        if not url or not url.strip():
+            return "Error: url is required"
+        if not body or not body.strip():
+            return "Error: body is required"
+        try:
+            entry_id = await pipeline.ingest_url_with_body(
+                url.strip(), body, title=(title or "").strip(),
+                content_type=(content_type or "text/markdown").strip(),
+            )
+        except Exception as e:
+            return f"Error ingesting {url}: {e}"
+        if not entry_id:
+            return f"No extractable content in body for: {url}"
+        return f"Ingested URL (caller body): {url}\nEntry ID: {entry_id}"
+
+    @mcp.tool()
     async def fetch_paper_list(url: str) -> str:
         """Parse a URL containing a list of papers (awesome-list, bibliography, etc.).
 

@@ -142,3 +142,66 @@ def test_readability_fallback_cfg_handles_malformed_config():
     assert _readability_fallback_cfg({"fetcher": "str"}) is None
     cfg = {"proxy": "https://r.jina.ai/{url}", "hosts": ["x.com"]}
     assert _readability_fallback_cfg({"fetcher": {"readability_fallback": cfg}}) == cfg
+
+
+# ---------------------------------------------------------------------------
+# ingest_url_with_body (fr_researcher_22486af4, layer 2)
+# ---------------------------------------------------------------------------
+
+
+def _body_pipe():
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    captured = {}
+    pipe._url_index = {}
+    pipe.knowledge = SimpleNamespace(add=lambda e: captured.__setitem__("entry", e))
+    pipe.digest = SimpleNamespace(record=lambda **k: None)
+    return pipe, captured
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_stores_research_entry():
+    from khonliang.knowledge.store import EntryStatus, Tier
+
+    pipe, captured = _body_pipe()
+    eid = await pipe.ingest_url_with_body(
+        "https://x.substack.com/p/a", "# Heading\n\nthe article body",
+        content_type="text/markdown",
+    )
+    assert eid
+    e = captured["entry"]
+    # Same shape as fetch_paper success.
+    assert e.tier == Tier.IMPORTED
+    assert e.status == EntryStatus.INGESTED
+    assert e.scope == "research"  # retrievable via find_relevant/brief_on
+    assert e.tags == ["paper"]
+    assert e.source == "https://x.substack.com/p/a"  # source=URL, not file://
+    assert "the article body" in e.content
+    assert e.metadata["source"] == "url_with_body"
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_strips_html():
+    pipe, captured = _body_pipe()
+    await pipe.ingest_url_with_body(
+        "https://x.com/a",
+        "<html><body><h1>T</h1><p>hello world</p></body></html>",
+        content_type="text/html",
+    )
+    e = captured["entry"]
+    assert "hello world" in e.content
+    assert "<p>" not in e.content
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_empty_body_returns_none():
+    pipe, captured = _body_pipe()
+    assert await pipe.ingest_url_with_body("https://x.com/a", "   ") is None
+    assert "entry" not in captured  # nothing stored
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_dedupes_on_url():
+    pipe, captured = _body_pipe()
+    first = await pipe.ingest_url_with_body("https://x.com/a", "body one")
+    second = await pipe.ingest_url_with_body("https://x.com/a", "body two")
+    assert second == first  # same url -> existing entry, not re-stored
