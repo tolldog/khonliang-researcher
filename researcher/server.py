@@ -419,18 +419,26 @@ Most tools accept detail="compact|brief|full":
             return "Error: body is required"
         # All tool output echoes the URL — it may carry userinfo / query tokens,
         # so use a sanitized scheme://host/path ref everywhere (as fetcher does),
-        # not just on the error path.
+        # not just on the error path. Fall back to a placeholder when the input
+        # doesn't parse as an absolute http(s) URL (avoids "://..." garbage or
+        # leaking a non-URL string).
         from urllib.parse import urlparse
 
         p = urlparse(url)
-        safe_ref = f"{p.scheme}://{(p.hostname or '').lower()}{p.path or ''}"
+        if p.scheme in ("http", "https") and p.hostname:
+            safe_ref = f"{p.scheme}://{p.hostname.lower()}{p.path or ''}"
+        else:
+            safe_ref = "<non-http url>"
         try:
             entry_id = await pipeline.ingest_url_with_body(
                 url, body, title=title.strip(),
                 content_type=content_type.strip() or "text/markdown",
             )
         except Exception as e:
-            return f"Error ingesting {safe_ref}: {e}"
+            # Return only the exception type — its str can embed the URL/tokens.
+            # The full detail is logged server-side.
+            logger.warning("ingest_url_with_body failed for %s: %s", safe_ref, e)
+            return f"Error ingesting {safe_ref}: {type(e).__name__}"
         if not entry_id:
             return f"No extractable content in body for: {safe_ref}"
         return f"Ingested URL (caller body): {safe_ref}\nEntry ID: {entry_id}"
