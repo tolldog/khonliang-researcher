@@ -1,0 +1,25 @@
+# khonliang-researcher deploy manifest -- TEMPLATE for khonliang-deploy.
+#
+# researcher restarts TWO agents from one source: researcher-primary +
+# librarian-primary (librarian runs from the researcher install).
+#
+# Copy to deploy.yaml (gitignored, machine-specific) and edit the real values, then:
+#   khonliang-deploy --manifest deploy.yaml
+# The tool lives at tolldog/khonliang-deploy; it replaces the old per-repo
+# scripts/deploy.sh. This committed .example documents the shape with placeholders;
+# the real deploy.yaml is kept on local disk only.
+#
+# Env overrides win for dev installs: SRC, VENV, BUS, REF, DEPLOY_USER, SSH_KEY,
+# SOURCE_MODE (git|local). For a local dev-mirror deploy, set source_mode: local.
+
+source: /opt/khonliang/src/khonliang-researcher
+venv:   /opt/khonliang/agents/researcher/.venv
+bus:    http://localhost:8788
+deploy_user: khonliang
+ref: main
+source_mode: git                                  # git (prod, pull origin) | local (dev tree as-is)
+agents: [researcher-primary, librarian-primary]   # both restarted after install
+
+# Post-install smoke: importing the two agent modules proves the fresh code for
+# both restarted agents is present.
+verify_import: "import researcher.agent, researcher.librarian_agent"
