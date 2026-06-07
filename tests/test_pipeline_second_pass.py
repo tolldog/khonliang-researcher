@@ -145,6 +145,120 @@ def test_readability_fallback_cfg_handles_malformed_config():
 
 
 # ---------------------------------------------------------------------------
+# ingest_url_with_body (fr_researcher_22486af4, layer 2)
+# ---------------------------------------------------------------------------
+
+
+def _body_pipe():
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    captured = {}
+    pipe._url_index = {}
+    pipe.knowledge = SimpleNamespace(add=lambda e: captured.__setitem__("entry", e))
+    pipe.digest = SimpleNamespace(
+        record=lambda **k: captured.__setitem__("digest", k)
+    )
+    return pipe, captured
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_stores_research_entry():
+    from khonliang.knowledge.store import EntryStatus, Tier
+
+    pipe, captured = _body_pipe()
+    eid = await pipe.ingest_url_with_body(
+        "https://x.substack.com/p/a", "# Heading\n\nthe article body",
+        content_type="text/markdown",
+    )
+    assert eid
+    e = captured["entry"]
+    # Same shape as fetch_paper success.
+    assert e.tier == Tier.IMPORTED
+    assert e.status == EntryStatus.INGESTED
+    assert e.scope == "research"  # retrievable via find_relevant/brief_on
+    assert e.tags == ["paper"]
+    assert e.source == "https://x.substack.com/p/a"  # source=URL, not file://
+    assert "the article body" in e.content
+    assert e.metadata["source"] == "url_with_body"
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_digest_records_sanitized_ref():
+    """The digest is an audit trail — it must record the sanitized scheme://
+    host/path ref, never the raw URL's query tokens."""
+    pipe, captured = _body_pipe()
+    await pipe.ingest_url_with_body("https://x.com/p?token=SECRET", "body")
+    assert captured["digest"]["metadata"]["url"] == "https://x.com/p"
+    assert "SECRET" not in captured["digest"]["metadata"]["url"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_strips_html():
+    pipe, captured = _body_pipe()
+    await pipe.ingest_url_with_body(
+        "https://x.com/a",
+        "<html><body><h1>T</h1><p>hello world</p></body></html>",
+        content_type="text/html",
+    )
+    e = captured["entry"]
+    assert "hello world" in e.content
+    assert "<p>" not in e.content
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_empty_body_returns_none():
+    pipe, captured = _body_pipe()
+    assert await pipe.ingest_url_with_body("https://x.com/a", "   ") is None
+    assert "entry" not in captured  # nothing stored
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_dedupes_on_url():
+    pipe, captured = _body_pipe()
+    first = await pipe.ingest_url_with_body("https://x.com/a", "body one")
+    second = await pipe.ingest_url_with_body("https://x.com/a", "body two")
+    assert second == first  # same url -> existing entry, not re-stored
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_rejects_non_http_url():
+    """The method contracts on a URL and stores it as the entry source/dedupe
+    key — a file:// or bare-string input must raise, not silently ingest."""
+    pipe, captured = _body_pipe()
+    for bad in ("file:///etc/passwd", "not-a-url", "ftp://h/x"):
+        with pytest.raises(ValueError, match="absolute http"):
+            await pipe.ingest_url_with_body(bad, "# T\n\nbody")
+    assert "entry" not in captured  # nothing stored
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_strips_url_before_storing():
+    """is_http_url tolerates surrounding whitespace; the stored source/dedupe
+    key must be the stripped URL, or a padded variant breaks dedupe/backlinks."""
+    pipe, captured = _body_pipe()
+    eid = await pipe.ingest_url_with_body("  https://x.com/a  ", "body")
+    e = captured["entry"]
+    assert e.source == "https://x.com/a"  # no surrounding spaces
+    assert pipe._url_index.get("https://x.com/a") == eid  # indexed under stripped key
+    # A subsequent unpadded ingest collapses to the same entry (dedupe intact).
+    assert await pipe.ingest_url_with_body("https://x.com/a", "body two") == eid
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_blank_content_type_normalized():
+    """A direct pipeline caller passing content_type='' must NOT misroute
+    through the HTML converter (_detect_format('', '') defaults to HTML) and
+    must not store the blank value — normalize to text/markdown up-front."""
+    pipe, captured = _body_pipe()
+    await pipe.ingest_url_with_body(
+        "https://x.com/a", "# Title\n\nplain markdown body", content_type="   ",
+    )
+    e = captured["entry"]
+    assert e.metadata["content_type"] == "text/markdown"  # normalized, not ""
+    # Markdown passthrough kept the heading text (HTML strip would not apply).
+    assert "plain markdown body" in e.content
+
+
+# ---------------------------------------------------------------------------
 # ingest_idea search-query promotion (bug_developer_609eecb0 / dog_912b9f0d)
 # ---------------------------------------------------------------------------
 

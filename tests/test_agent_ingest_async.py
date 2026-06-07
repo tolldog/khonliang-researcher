@@ -771,3 +771,58 @@ async def test_progress_events_published_on_research_ingest_progress_topic():
     for _, p in agent.events:
         assert p["job_id"] == job_id
         assert p["skill"] == "ingest_idea"
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_handler_validates_and_dispatches():
+    """The ingest_url_with_body bus handler: strict isinstance validation, then
+    dispatch to pipeline.ingest_url_with_body, returning {entry_id, url, source}."""
+    async def fake_ingest_url_with_body(url, body, *, title="", content_type="text/markdown"):
+        return "entry_xyz"
+
+    pipeline = _make_pipeline()
+    pipeline.ingest_url_with_body = fake_ingest_url_with_body
+    agent = _build_fake_agent(pipeline)
+    h = agent._handlers["ingest_url_with_body"]
+
+    assert "url is required" in (await h({}))["error"]
+    assert "url must be a string" in (await h({"url": 123, "body": "b"}))["error"]
+    # Non-http(s) inputs rejected before the body check so they can't be stored.
+    assert "absolute http" in (await h({"url": "file:///etc/passwd", "body": "b"}))["error"]
+    assert "absolute http" in (await h({"url": "not-a-url", "body": "b"}))["error"]
+    assert "body is required" in (await h({"url": "https://x/a"}))["error"]
+    assert "body must be a string" in (await h({"url": "https://x/a", "body": 5}))["error"]
+
+    # Non-arxiv: source == the input url.
+    out = await h({"url": "https://x/a", "body": "# T\n\nbody"})
+    assert out == {"entry_id": "entry_xyz", "url": "https://x/a", "source": "https://x/a"}
+
+    # Arxiv: source is the canonical (arxiv-normalized) URL the pipeline stores.
+    out2 = await h({"url": "https://arxiv.org/pdf/2511.19699", "body": "b"})
+    assert out2 == {
+        "entry_id": "entry_xyz",
+        "url": "https://arxiv.org/pdf/2511.19699",
+        "source": "https://arxiv.org/abs/2511.19699",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_handler_error_does_not_leak_url():
+    """On pipeline failure the bus handler must return only the exception TYPE,
+    never the exception str — which can embed the URL's query tokens/userinfo
+    and would leak into bus transcripts."""
+    # No userinfo (that's rejected up-front by is_http_url); a query token is
+    # the realistic leak vector that reaches the pipeline call.
+    secret = "https://host/p?token=SECRETTOKEN"
+
+    async def boom(url, body, *, title="", content_type="text/markdown"):
+        raise ValueError(f"connection failed for {url}")  # str carries the secret
+
+    pipeline = _make_pipeline()
+    pipeline.ingest_url_with_body = boom
+    agent = _build_fake_agent(pipeline)
+    h = agent._handlers["ingest_url_with_body"]
+
+    out = await h({"url": secret, "body": "# T\n\nbody"})
+    assert out["error"] == "ingest failed: ValueError"
+    assert "SECRETTOKEN" not in out["error"]

@@ -389,6 +389,61 @@ Most tools accept detail="compact|brief|full":
             return f"Error reading {path}: {e}"
 
     @mcp.tool()
+    async def ingest_url_with_body(
+        url: str, body: str, title: str = "",
+        content_type: str = "text/markdown",
+    ) -> str:
+        """Ingest a URL whose page body was fetched OUTSIDE the service.
+
+        The recovery path when fetch_paper is blocked (403/429/503, or a known
+        anti-bot host) and the service
+        can't retrieve the page itself: an agent with a working fetcher (browser
+        WebFetch, Playwright, an external distiller) hands the already-retrieved
+        body here. Stores an entry in the same shape as fetch_paper success;
+        the stored entry's source is the URL (arxiv-canonicalized for dedupe).
+        Returns the entry ID for later distillation.
+        """
+        # Validate types before any .strip() so a non-string arg returns a
+        # clean error instead of crashing the tool with AttributeError.
+        if not isinstance(url, str):
+            return "Error: url must be a string"
+        if not isinstance(body, str):
+            return "Error: body must be a string"
+        if not isinstance(title, str):
+            return "Error: title must be a string"
+        if not isinstance(content_type, str):
+            return "Error: content_type must be a string"
+        url = url.strip()
+        if not url:
+            return "Error: url is required"
+        if not body.strip():
+            return "Error: body is required"
+        # Contract is "Ingest a URL" — reject non-http(s)/non-hostname inputs
+        # (file://, bare strings) up-front so they can't land in the store as a
+        # bogus source. The error names no specifics, so it can't leak the input.
+        from researcher.fetcher import is_http_url, safe_url_ref
+
+        if not is_http_url(url):
+            return "Error: url must be an absolute http(s) URL"
+        # All tool output echoes the URL — it may carry userinfo / query tokens,
+        # so use a sanitized scheme://host/path ref everywhere (as fetcher does),
+        # not just on the error path.
+        safe_ref = safe_url_ref(url)
+        try:
+            entry_id = await pipeline.ingest_url_with_body(
+                url, body, title=title.strip(),
+                content_type=content_type.strip() or "text/markdown",
+            )
+        except Exception as e:
+            # Log/return only the exception type — its str can embed the
+            # URL/tokens, and even server-side logs shouldn't leak them.
+            logger.warning("ingest_url_with_body failed for %s: %s", safe_ref, type(e).__name__)
+            return f"Error ingesting {safe_ref}: {type(e).__name__}"
+        if not entry_id:
+            return f"No extractable content in body for: {safe_ref}"
+        return f"Ingested URL (caller body): {safe_ref}\nEntry ID: {entry_id}"
+
+    @mcp.tool()
     async def fetch_paper_list(url: str) -> str:
         """Parse a URL containing a list of papers (awesome-list, bibliography, etc.).
 

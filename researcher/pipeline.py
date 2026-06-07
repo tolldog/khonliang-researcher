@@ -322,6 +322,117 @@ class ResearchPipeline:
         logger.info("Ingested paper %s: %s", entry_id, result.title)
         return entry_id
 
+    async def ingest_url_with_body(
+        self, url: str, body: str, *, title: str = "",
+        content_type: str = "text/markdown",
+    ) -> Optional[str]:
+        """Ingest a URL whose body was fetched OUTSIDE the service (browser-grade
+        WebFetch, Playwright, an external distiller) — the recovery path for
+        ``fetch_paper`` blocked-fetch failures (403/429/503, or a known anti-bot
+        host) where the service itself can't retrieve the page.
+
+        Stores an entry in the same Tier.IMPORTED / ``["paper"]`` / INGESTED
+        shape as ``ingest_paper`` success. ``source`` is the URL,
+        arxiv-canonicalized (``https://arxiv.org/abs/<id>``) the same way
+        ``ingest_paper`` does so the two ingest paths dedupe + backlink to one
+        entry; the caller-supplied URL is preserved in ``metadata.original_url``
+        when it differs. No fetch or /tmp round-trip. Returns the entry_id, the
+        existing id on a duplicate, or None on empty body.
+        """
+        import hashlib
+        import time
+
+        from researcher.fetcher import (
+            ContentFormat,
+            _convert,
+            _detect_format,
+            is_http_url,
+            safe_url_ref,
+        )
+
+        # The tool contracts on "a URL" and stores it as the entry ``source`` /
+        # dedupe key — reject non-http(s) inputs (file://, bare strings) so they
+        # can't pollute the knowledge store. Raise rather than return None so the
+        # caller surfaces a distinct error, not "no extractable content".
+        if not is_http_url(url):
+            raise ValueError("url must be an absolute http(s) URL")
+        # is_http_url tolerates surrounding whitespace; strip before the url is
+        # used as the canonical/source/dedupe key so " https://x " doesn't store
+        # a space-padded source or split dedupe across padded/unpadded variants.
+        url = url.strip()
+        safe_ref = safe_url_ref(url)
+
+        # Dedupe on the (arxiv-canonicalized) URL, matching ingest_paper so an
+        # arxiv page ingested either way collapses to one entry.
+        arxiv_id = extract_arxiv_id(url)
+        canonical_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else url
+        if canonical_url in self._url_index:
+            logger.info("URL already ingested: %s", safe_ref)
+            if url != canonical_url:
+                self._url_index[url] = self._url_index[canonical_url]
+            return self._url_index[canonical_url]
+
+        if not body or not body.strip():
+            logger.warning("Empty body supplied for %s", safe_ref)
+            return None
+
+        # Normalize content_type here too — the server/agent surfaces strip+
+        # default, but a direct pipeline caller passing "" would otherwise hit
+        # _detect_format("", "") → HTML default and store a blank value.
+        content_type = (content_type or "").strip() or "text/markdown"
+
+        # Convert the caller-supplied body through the same converters fetch
+        # uses (strip HTML, pass markdown/text through). Detect format from the
+        # content_type, NOT the URL — a ".pdf" URL with a markdown/text body
+        # would otherwise misroute through the HTML converter and lose markdown
+        # title extraction / the TEXT first-line title fallback. The body is
+        # text, so a PDF classification can't apply: treat it as TEXT.
+        fmt = _detect_format("", content_type)
+        if fmt == ContentFormat.PDF:
+            fmt = ContentFormat.TEXT
+        extracted_title, content = _convert(b"", body, fmt)
+        if not content.strip():
+            logger.warning("Body for %s had no extractable text", safe_ref)
+            return None
+
+        entry_id = hashlib.sha256(canonical_url.encode()).hexdigest()[:16]
+        entry = KnowledgeEntry(
+            id=entry_id,
+            tier=Tier.IMPORTED,
+            title=(title or "").strip() or extracted_title or canonical_url,
+            content=content,
+            source=canonical_url,
+            scope="research",
+            tags=["paper"],
+            status=EntryStatus.INGESTED,
+            metadata={
+                "url": canonical_url,
+                "original_url": url if url != canonical_url else "",
+                # No separate fetched URL (caller supplied the body); kept for
+                # metadata-schema parity with ingest_paper.
+                "fetched_url": "",
+                "fetched_at": time.time(),
+                "source": "url_with_body",
+                "content_type": content_type,
+            },
+        )
+        self.knowledge.add(entry)
+        self._url_index[canonical_url] = entry_id
+        if url != canonical_url:
+            self._url_index[url] = entry_id
+
+        self.digest.record(
+            summary=f"Ingested URL (caller body): {entry.title}",
+            source="pipeline",
+            audience="research",
+            tags=["ingested"],
+            # safe_ref (not raw url) — the digest is an audit trail and has no
+            # functional need for query tokens that the raw URL may carry.
+            metadata={"entry_id": entry_id, "url": safe_ref},
+        )
+        logger.info("Ingested url_with_body %s: %s", entry_id, entry.title)
+        return entry_id
+
     async def ingest_paper_list(self, url: str) -> List[PaperReference]:
         """Fetch an awesome-list and extract paper references."""
         from researcher.fetcher import fetch_raw

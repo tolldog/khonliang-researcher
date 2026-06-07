@@ -122,6 +122,36 @@ def extract_arxiv_id(url_or_id: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def is_http_url(url: str) -> bool:
+    """True iff ``url`` is an absolute http(s) URL with a hostname.
+
+    The gate for ingest paths that contract on "a URL" — rejects ``file://``,
+    bare strings, and scheme-relative inputs that would otherwise pollute the
+    knowledge store's ``source``/dedupe index. Also rejects embedded credentials
+    (``user:pw@host``) so userinfo can't be persisted/echoed via ``source`` —
+    matching ``_fetch_url_direct`` / ``_readability_proxy_url``.
+    """
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url.strip())
+    if parsed.username or parsed.password:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+
+
+def safe_url_ref(url: str) -> str:
+    """``scheme://host/path`` for logging — drops userinfo + query/fragment.
+
+    Blocked-page URLs commonly carry query tokens / userinfo; logging the raw
+    value leaks them. Returns ``<non-http url>`` for anything not absolute
+    http(s), matching the sanitization convention in ``_fetch_url_direct``.
+    """
+    parsed = urlparse(url.strip() if isinstance(url, str) else "")
+    if parsed.scheme in ("http", "https") and parsed.hostname:
+        return f"{parsed.scheme}://{parsed.hostname.lower()}{parsed.path or ''}"
+    return "<non-http url>"
+
+
 def _extract_linkedin_external_url(html: str, source_url: str = "") -> Optional[str]:
     """Extract the real target from LinkedIn's shortlink interstitial page."""
     soup = BeautifulSoup(html, "html.parser")
