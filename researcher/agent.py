@@ -693,7 +693,11 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 url, body, title=title_raw.strip(), content_type=content_type,
             )
         except Exception as e:  # noqa: BLE001 — surface as a clean error envelope
-            return {"error": f"ingest failed: {e}"}
+            # Return/log only the exception type — its str can embed the
+            # caller URL's query tokens/userinfo, which would leak into bus
+            # transcripts. Matches the MCP tool's sanitized error path.
+            logger.warning("ingest_url_with_body bus handler failed: %s", type(e).__name__)
+            return {"error": f"ingest failed: {type(e).__name__}"}
         if not entry_id:
             return {"error": "no extractable content in body"}
         # Echo the stored entry's canonical `source` (arxiv-normalized the same

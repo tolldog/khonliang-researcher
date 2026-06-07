@@ -207,6 +207,21 @@ async def test_ingest_url_with_body_dedupes_on_url():
     assert second == first  # same url -> existing entry, not re-stored
 
 
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_blank_content_type_normalized():
+    """A direct pipeline caller passing content_type='' must NOT misroute
+    through the HTML converter (_detect_format('', '') defaults to HTML) and
+    must not store the blank value — normalize to text/markdown up-front."""
+    pipe, captured = _body_pipe()
+    await pipe.ingest_url_with_body(
+        "https://x.com/a", "# Title\n\nplain markdown body", content_type="   ",
+    )
+    e = captured["entry"]
+    assert e.metadata["content_type"] == "text/markdown"  # normalized, not ""
+    # Markdown passthrough kept the heading text (HTML strip would not apply).
+    assert "plain markdown body" in e.content
+
+
 # ---------------------------------------------------------------------------
 # ingest_idea search-query promotion (bug_developer_609eecb0 / dog_912b9f0d)
 # ---------------------------------------------------------------------------

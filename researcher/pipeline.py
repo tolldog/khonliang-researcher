@@ -358,6 +358,11 @@ class ResearchPipeline:
             logger.warning("Empty body supplied for %s", url)
             return None
 
+        # Normalize content_type here too — the server/agent surfaces strip+
+        # default, but a direct pipeline caller passing "" would otherwise hit
+        # _detect_format("", "") → HTML default and store a blank value.
+        content_type = (content_type or "").strip() or "text/markdown"
+
         # Convert the caller-supplied body through the same converters fetch
         # uses (strip HTML, pass markdown/text through). Detect format from the
         # content_type, NOT the URL — a ".pdf" URL with a markdown/text body
