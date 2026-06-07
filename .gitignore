@@ -15,3 +15,6 @@ config.yaml
 # to sibling MCP servers. Copy .mcp.example.json to .mcp.json and edit
 # the paths for your environment.
 .mcp.json
+
+# Real, machine-specific deploy manifest (khonliang-deploy); commit deploy.yaml.example only.
+deploy.yaml
