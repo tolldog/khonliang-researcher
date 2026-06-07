@@ -426,7 +426,9 @@ class ResearchPipeline:
             source="pipeline",
             audience="research",
             tags=["ingested"],
-            metadata={"entry_id": entry_id, "url": url},
+            # safe_ref (not raw url) — the digest is an audit trail and has no
+            # functional need for query tokens that the raw URL may carry.
+            metadata={"entry_id": entry_id, "url": safe_ref},
         )
         logger.info("Ingested url_with_body %s: %s", entry_id, entry.title)
         return entry_id

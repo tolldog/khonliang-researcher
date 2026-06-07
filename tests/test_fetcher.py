@@ -814,6 +814,8 @@ def test_is_http_url_accepts_absolute_http(url):
 @pytest.mark.parametrize("url", [
     "", "   ", "not-a-url", "file:///etc/passwd", "ftp://host/x",
     "//host/x", "mailto:a@b.com", 123, None,
+    # Embedded credentials rejected — userinfo must not reach `source`.
+    "https://user:pw@host/p", "http://user@host/p",
 ])
 def test_is_http_url_rejects_non_http(url):
     assert fetcher.is_http_url(url) is False

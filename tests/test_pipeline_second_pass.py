@@ -154,7 +154,9 @@ def _body_pipe():
     captured = {}
     pipe._url_index = {}
     pipe.knowledge = SimpleNamespace(add=lambda e: captured.__setitem__("entry", e))
-    pipe.digest = SimpleNamespace(record=lambda **k: None)
+    pipe.digest = SimpleNamespace(
+        record=lambda **k: captured.__setitem__("digest", k)
+    )
     return pipe, captured
 
 
@@ -177,6 +179,16 @@ async def test_ingest_url_with_body_stores_research_entry():
     assert e.source == "https://x.substack.com/p/a"  # source=URL, not file://
     assert "the article body" in e.content
     assert e.metadata["source"] == "url_with_body"
+
+
+@pytest.mark.asyncio
+async def test_ingest_url_with_body_digest_records_sanitized_ref():
+    """The digest is an audit trail — it must record the sanitized scheme://
+    host/path ref, never the raw URL's query tokens."""
+    pipe, captured = _body_pipe()
+    await pipe.ingest_url_with_body("https://x.com/p?token=SECRET", "body")
+    assert captured["digest"]["metadata"]["url"] == "https://x.com/p"
+    assert "SECRET" not in captured["digest"]["metadata"]["url"]
 
 
 @pytest.mark.asyncio

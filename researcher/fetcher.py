@@ -127,11 +127,15 @@ def is_http_url(url: str) -> bool:
 
     The gate for ingest paths that contract on "a URL" — rejects ``file://``,
     bare strings, and scheme-relative inputs that would otherwise pollute the
-    knowledge store's ``source``/dedupe index.
+    knowledge store's ``source``/dedupe index. Also rejects embedded credentials
+    (``user:pw@host``) so userinfo can't be persisted/echoed via ``source`` —
+    matching ``_fetch_url_direct`` / ``_readability_proxy_url``.
     """
     if not isinstance(url, str):
         return False
     parsed = urlparse(url.strip())
+    if parsed.username or parsed.password:
+        return False
     return parsed.scheme in ("http", "https") and bool(parsed.hostname)
 
 

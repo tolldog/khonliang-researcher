@@ -811,7 +811,9 @@ async def test_ingest_url_with_body_handler_error_does_not_leak_url():
     """On pipeline failure the bus handler must return only the exception TYPE,
     never the exception str — which can embed the URL's query tokens/userinfo
     and would leak into bus transcripts."""
-    secret = "https://user:pw@host/p?token=SECRETTOKEN"
+    # No userinfo (that's rejected up-front by is_http_url); a query token is
+    # the realistic leak vector that reaches the pipeline call.
+    secret = "https://host/p?token=SECRETTOKEN"
 
     async def boom(url, body, *, title="", content_type="text/markdown"):
         raise ValueError(f"connection failed for {url}")  # str carries the secret
@@ -824,4 +826,3 @@ async def test_ingest_url_with_body_handler_error_does_not_leak_url():
     out = await h({"url": secret, "body": "# T\n\nbody"})
     assert out["error"] == "ingest failed: ValueError"
     assert "SECRETTOKEN" not in out["error"]
-    assert "user:pw" not in out["error"]
