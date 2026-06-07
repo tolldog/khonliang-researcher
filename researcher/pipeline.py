@@ -328,7 +328,8 @@ class ResearchPipeline:
     ) -> Optional[str]:
         """Ingest a URL whose body was fetched OUTSIDE the service (browser-grade
         WebFetch, Playwright, an external distiller) — the recovery path for
-        ``fetch_paper`` 403s where the service itself can't retrieve the page.
+        ``fetch_paper`` blocked-fetch failures (403/429/503, or a known anti-bot
+        host) where the service itself can't retrieve the page.
 
         Stores an entry in the same Tier.IMPORTED / ``["paper"]`` / INGESTED
         shape as ``ingest_paper`` success. ``source`` is the URL,

@@ -517,7 +517,8 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "ingest_url_with_body",
                 "Ingest a URL whose page body was fetched OUTSIDE the service "
                 "(browser-grade WebFetch, Playwright, an external distiller) — "
-                "the recovery path when fetch_paper is blocked (403) and the "
+                "the recovery path when fetch_paper is blocked (403/429/503, or "
+                "a known anti-bot host) and the "
                 "service can't retrieve the page itself. Stores an entry in the "
                 "same Tier.IMPORTED / paper / INGESTED shape as fetch_paper "
                 "success, then the distillation worker picks it up. Returns "

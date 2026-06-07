@@ -395,7 +395,8 @@ Most tools accept detail="compact|brief|full":
     ) -> str:
         """Ingest a URL whose page body was fetched OUTSIDE the service.
 
-        The recovery path when fetch_paper is blocked (403) and the service
+        The recovery path when fetch_paper is blocked (403/429/503, or a known
+        anti-bot host) and the service
         can't retrieve the page itself: an agent with a working fetcher (browser
         WebFetch, Playwright, an external distiller) hands the already-retrieved
         body here. Stores an entry in the same shape as fetch_paper success;
@@ -435,9 +436,9 @@ Most tools accept detail="compact|brief|full":
                 content_type=content_type.strip() or "text/markdown",
             )
         except Exception as e:
-            # Return only the exception type — its str can embed the URL/tokens.
-            # The full detail is logged server-side.
-            logger.warning("ingest_url_with_body failed for %s: %s", safe_ref, e)
+            # Log/return only the exception type — its str can embed the
+            # URL/tokens, and even server-side logs shouldn't leak them.
+            logger.warning("ingest_url_with_body failed for %s: %s", safe_ref, type(e).__name__)
             return f"Error ingesting {safe_ref}: {type(e).__name__}"
         if not entry_id:
             return f"No extractable content in body for: {safe_ref}"
