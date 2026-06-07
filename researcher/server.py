@@ -417,22 +417,23 @@ Most tools accept detail="compact|brief|full":
             return "Error: url is required"
         if not body.strip():
             return "Error: body is required"
+        # All tool output echoes the URL — it may carry userinfo / query tokens,
+        # so use a sanitized scheme://host/path ref everywhere (as fetcher does),
+        # not just on the error path.
+        from urllib.parse import urlparse
+
+        p = urlparse(url)
+        safe_ref = f"{p.scheme}://{(p.hostname or '').lower()}{p.path or ''}"
         try:
             entry_id = await pipeline.ingest_url_with_body(
                 url, body, title=title.strip(),
                 content_type=content_type.strip() or "text/markdown",
             )
         except Exception as e:
-            # Sanitize the URL in the error string — it may carry userinfo or
-            # query tokens; show scheme://host/path only (as fetcher does).
-            from urllib.parse import urlparse
-
-            p = urlparse(url)
-            safe_ref = f"{p.scheme}://{(p.hostname or '').lower()}{p.path or ''}"
             return f"Error ingesting {safe_ref}: {e}"
         if not entry_id:
-            return f"No extractable content in body for: {url}"
-        return f"Ingested URL (caller body): {url}\nEntry ID: {entry_id}"
+            return f"No extractable content in body for: {safe_ref}"
+        return f"Ingested URL (caller body): {safe_ref}\nEntry ID: {entry_id}"
 
     @mcp.tool()
     async def fetch_paper_list(url: str) -> str:
