@@ -402,15 +402,25 @@ Most tools accept detail="compact|brief|full":
         the stored entry's source is the URL (arxiv-canonicalized for dedupe).
         Returns the entry ID for later distillation.
         """
-        url = (url or "").strip()
+        # Validate types before any .strip() so a non-string arg returns a
+        # clean error instead of crashing the tool with AttributeError.
+        if not isinstance(url, str):
+            return "Error: url must be a string"
+        if not isinstance(body, str):
+            return "Error: body must be a string"
+        if not isinstance(title, str):
+            return "Error: title must be a string"
+        if not isinstance(content_type, str):
+            return "Error: content_type must be a string"
+        url = url.strip()
         if not url:
             return "Error: url is required"
-        if not body or not body.strip():
+        if not body.strip():
             return "Error: body is required"
         try:
             entry_id = await pipeline.ingest_url_with_body(
-                url, body, title=(title or "").strip(),
-                content_type=(content_type or "text/markdown").strip(),
+                url, body, title=title.strip(),
+                content_type=content_type.strip() or "text/markdown",
             )
         except Exception as e:
             # Sanitize the URL in the error string — it may carry userinfo or
