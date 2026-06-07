@@ -790,5 +790,14 @@ async def test_ingest_url_with_body_handler_validates_and_dispatches():
     assert "body is required" in (await h({"url": "https://x/a"}))["error"]
     assert "body must be a string" in (await h({"url": "https://x/a", "body": 5}))["error"]
 
+    # Non-arxiv: source == the input url.
     out = await h({"url": "https://x/a", "body": "# T\n\nbody"})
-    assert out == {"entry_id": "entry_xyz", "url": "https://x/a"}
+    assert out == {"entry_id": "entry_xyz", "url": "https://x/a", "source": "https://x/a"}
+
+    # Arxiv: source is the canonical (arxiv-normalized) URL the pipeline stores.
+    out2 = await h({"url": "https://arxiv.org/pdf/2511.19699", "body": "b"})
+    assert out2 == {
+        "entry_id": "entry_xyz",
+        "url": "https://arxiv.org/pdf/2511.19699",
+        "source": "https://arxiv.org/abs/2511.19699",
+    }

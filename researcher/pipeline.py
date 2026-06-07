@@ -358,11 +358,14 @@ class ResearchPipeline:
             return None
 
         # Convert the caller-supplied body through the same converters fetch
-        # uses (strip HTML, pass markdown/text through). body is text, so the
-        # PDF branch never applies here.
-        fmt = _detect_format(url, content_type)
+        # uses (strip HTML, pass markdown/text through). Detect format from the
+        # content_type, NOT the URL — a ".pdf" URL with a markdown/text body
+        # would otherwise misroute through the HTML converter and lose markdown
+        # title extraction / the TEXT first-line title fallback. The body is
+        # text, so a PDF classification can't apply: treat it as TEXT.
+        fmt = _detect_format("", content_type)
         if fmt == ContentFormat.PDF:
-            fmt = ContentFormat.HTML  # a text body can't be a PDF; treat as HTML
+            fmt = ContentFormat.TEXT
         extracted_title, content = _convert(b"", body, fmt)
         if not content.strip():
             logger.warning("Body for %s had no extractable text", url)
@@ -688,6 +691,23 @@ class ResearchPipeline:
         if source_label:
             title = f"{title} ({source_label})"
 
+        claims = parsed.get("claims", []) or []
+        # research_idea reads metadata.search_queries to drive the search. Some
+        # idea-parser outputs put the query per-claim (claim.search_query) and
+        # leave the top-level search_queries list empty, which silently broke
+        # the ingest_idea -> research_idea handoff (bug_developer_609eecb0 /
+        # dog_912b9f0d). Union both shapes, order-preserving + deduped, so the
+        # queries are never lost regardless of where the parser placed them.
+        search_queries: list = []
+        for q in parsed.get("search_queries", []) or []:
+            if isinstance(q, str) and q.strip() and q.strip() not in search_queries:
+                search_queries.append(q.strip())
+        for claim in claims:
+            if isinstance(claim, dict):
+                q = claim.get("search_query")
+                if isinstance(q, str) and q.strip() and q.strip() not in search_queries:
+                    search_queries.append(q.strip())
+
         entry = KnowledgeEntry(
             id=entry_id,
             tier=Tier.IMPORTED,
@@ -699,15 +719,15 @@ class ResearchPipeline:
             status=EntryStatus.INGESTED,
             metadata={
                 "source_type": parsed.get("source_type", "freeform"),
-                "claims": parsed.get("claims", []),
-                "search_queries": parsed.get("search_queries", []),
+                "claims": claims,
+                "search_queries": search_queries,
                 "keywords": parsed.get("keywords", []),
             },
         )
         self.knowledge.add(entry)
 
         self.digest.record(
-            summary=f"Ingested idea: {title} — {len(parsed.get('claims', []))} claims, {len(parsed.get('search_queries', []))} queries",
+            summary=f"Ingested idea: {title} — {len(claims)} claims, {len(search_queries)} queries",
             source="pipeline",
             audience="research",
             tags=["idea", "ingested"],

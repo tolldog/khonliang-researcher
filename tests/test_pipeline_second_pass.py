@@ -205,3 +205,49 @@ async def test_ingest_url_with_body_dedupes_on_url():
     first = await pipe.ingest_url_with_body("https://x.com/a", "body one")
     second = await pipe.ingest_url_with_body("https://x.com/a", "body two")
     assert second == first  # same url -> existing entry, not re-stored
+
+
+# ---------------------------------------------------------------------------
+# ingest_idea search-query promotion (bug_developer_609eecb0 / dog_912b9f0d)
+# ---------------------------------------------------------------------------
+
+
+def _idea_pipe(parsed):
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    captured = {}
+    pipe.knowledge = SimpleNamespace(add=lambda e: captured.__setitem__("entry", e))
+    pipe.digest = SimpleNamespace(record=lambda **k: None)
+    pipe.idea_parser = SimpleNamespace(handle=lambda text: _as_async(parsed))
+    return pipe, captured
+
+
+async def _as_async(value):
+    return value
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_promotes_per_claim_search_queries():
+    # Parser put the query per-claim and left top-level search_queries empty —
+    # ingest_idea must promote (and dedupe) them so research_idea isn't starved.
+    pipe, captured = _idea_pipe({
+        "success": True, "title": "An idea",
+        "claims": [
+            {"claim": "c1", "search_query": "query one"},
+            {"claim": "c2", "search_query": "query two"},
+            {"claim": "c3", "search_query": "query one"},  # duplicate
+        ],
+        "search_queries": [],
+    })
+    await pipe.ingest_idea("some idea text")
+    assert captured["entry"].metadata["search_queries"] == ["query one", "query two"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_unions_top_level_and_per_claim_queries():
+    pipe, captured = _idea_pipe({
+        "success": True, "title": "x",
+        "claims": [{"claim": "c", "search_query": "from claim"}],
+        "search_queries": ["top level", "  "],  # blank entries filtered
+    })
+    await pipe.ingest_idea("t")
+    assert captured["entry"].metadata["search_queries"] == ["top level", "from claim"]

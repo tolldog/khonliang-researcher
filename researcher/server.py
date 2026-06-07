@@ -402,17 +402,24 @@ Most tools accept detail="compact|brief|full":
         the stored entry's source is the URL (arxiv-canonicalized for dedupe).
         Returns the entry ID for later distillation.
         """
-        if not url or not url.strip():
+        url = (url or "").strip()
+        if not url:
             return "Error: url is required"
         if not body or not body.strip():
             return "Error: body is required"
         try:
             entry_id = await pipeline.ingest_url_with_body(
-                url.strip(), body, title=(title or "").strip(),
+                url, body, title=(title or "").strip(),
                 content_type=(content_type or "text/markdown").strip(),
             )
         except Exception as e:
-            return f"Error ingesting {url}: {e}"
+            # Sanitize the URL in the error string — it may carry userinfo or
+            # query tokens; show scheme://host/path only (as fetcher does).
+            from urllib.parse import urlparse
+
+            p = urlparse(url)
+            safe_ref = f"{p.scheme}://{(p.hostname or '').lower()}{p.path or ''}"
+            return f"Error ingesting {safe_ref}: {e}"
         if not entry_id:
             return f"No extractable content in body for: {url}"
         return f"Ingested URL (caller body): {url}\nEntry ID: {entry_id}"

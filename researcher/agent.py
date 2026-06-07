@@ -520,9 +520,10 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "the recovery path when fetch_paper is blocked (403) and the "
                 "service can't retrieve the page itself. Stores an entry in the "
                 "same Tier.IMPORTED / paper / INGESTED shape as fetch_paper "
-                "success; the stored entry's source is the URL "
-                "(arxiv-canonicalized for dedupe), then the distillation worker "
-                "picks it up. Returns {entry_id, url}.",
+                "success, then the distillation worker picks it up. Returns "
+                "{entry_id, url, source} where url is the caller's input and "
+                "source is the stored canonical (arxiv-normalized) URL used for "
+                "dedupe/backlinks.",
                 {
                     "url": {"type": "string", "required": True},
                     "body": {"type": "string", "required": True},
@@ -694,10 +695,14 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             return {"error": f"ingest failed: {e}"}
         if not entry_id:
             return {"error": "no extractable content in body"}
-        # Return the caller's url only — the stored entry's `source` is
-        # arxiv-canonicalized, so we don't echo a `source` that could disagree
-        # with what was persisted.
-        return {"entry_id": entry_id, "url": url}
+        # Echo the stored entry's canonical `source` (arxiv-normalized the same
+        # way the pipeline does) so callers can dedupe/backlink without
+        # re-implementing the rule. `url` stays the caller's original input.
+        from researcher.fetcher import extract_arxiv_id
+
+        arxiv_id = extract_arxiv_id(url)
+        source = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else url
+        return {"entry_id": entry_id, "url": url, "source": source}
 
     async def handle_distill_repo_docs(self, args):
         return await distill_repo_docs_handler(self, pipeline, args)
