@@ -356,6 +356,10 @@ class ResearchPipeline:
         # caller surfaces a distinct error, not "no extractable content".
         if not is_http_url(url):
             raise ValueError("url must be an absolute http(s) URL")
+        # is_http_url tolerates surrounding whitespace; strip before the url is
+        # used as the canonical/source/dedupe key so " https://x " doesn't store
+        # a space-padded source or split dedupe across padded/unpadded variants.
+        url = url.strip()
         safe_ref = safe_url_ref(url)
 
         # Dedupe on the (arxiv-canonicalized) URL, matching ingest_paper so an

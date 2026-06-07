@@ -828,3 +828,9 @@ def test_safe_url_ref_drops_userinfo_and_query():
 def test_safe_url_ref_placeholder_for_non_http():
     assert fetcher.safe_url_ref("file:///etc/passwd") == "<non-http url>"
     assert fetcher.safe_url_ref("") == "<non-http url>"
+
+
+@pytest.mark.parametrize("bad", [123, None, ["x"], object()])
+def test_safe_url_ref_non_string_does_not_raise(bad):
+    # Must not AttributeError on non-string truthy inputs (docstring says "anything").
+    assert fetcher.safe_url_ref(bad) == "<non-http url>"

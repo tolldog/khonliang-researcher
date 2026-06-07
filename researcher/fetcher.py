@@ -142,7 +142,7 @@ def safe_url_ref(url: str) -> str:
     value leaks them. Returns ``<non-http url>`` for anything not absolute
     http(s), matching the sanitization convention in ``_fetch_url_direct``.
     """
-    parsed = urlparse((url or "").strip())
+    parsed = urlparse(url.strip() if isinstance(url, str) else "")
     if parsed.scheme in ("http", "https") and parsed.hostname:
         return f"{parsed.scheme}://{parsed.hostname.lower()}{parsed.path or ''}"
     return "<non-http url>"
