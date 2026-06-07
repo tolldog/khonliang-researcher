@@ -795,3 +795,36 @@ async def test_paper_fetcher_threads_readability_fallback(monkeypatch):
     )
     await pf.research(task)
     assert captured["rf"] == cfg
+
+
+# ---------------------------------------------------------------------------
+# is_http_url / safe_url_ref (PR #50 pass-9 — URL guard + log sanitization)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/p",
+    "http://host/a?b=1",
+    "  https://example.com/p  ",  # surrounding whitespace tolerated
+])
+def test_is_http_url_accepts_absolute_http(url):
+    assert fetcher.is_http_url(url) is True
+
+
+@pytest.mark.parametrize("url", [
+    "", "   ", "not-a-url", "file:///etc/passwd", "ftp://host/x",
+    "//host/x", "mailto:a@b.com", 123, None,
+])
+def test_is_http_url_rejects_non_http(url):
+    assert fetcher.is_http_url(url) is False
+
+
+def test_safe_url_ref_drops_userinfo_and_query():
+    # userinfo + query token must not survive into a log reference.
+    ref = fetcher.safe_url_ref("https://user:pw@Host.com/path?token=SECRET#frag")
+    assert ref == "https://host.com/path"  # host lowercased, no creds/query/frag
+
+
+def test_safe_url_ref_placeholder_for_non_http():
+    assert fetcher.safe_url_ref("file:///etc/passwd") == "<non-http url>"
+    assert fetcher.safe_url_ref("") == "<non-http url>"

@@ -342,20 +342,34 @@ class ResearchPipeline:
         import hashlib
         import time
 
-        from researcher.fetcher import ContentFormat, _convert, _detect_format
+        from researcher.fetcher import (
+            ContentFormat,
+            _convert,
+            _detect_format,
+            is_http_url,
+            safe_url_ref,
+        )
+
+        # The tool contracts on "a URL" and stores it as the entry ``source`` /
+        # dedupe key — reject non-http(s) inputs (file://, bare strings) so they
+        # can't pollute the knowledge store. Raise rather than return None so the
+        # caller surfaces a distinct error, not "no extractable content".
+        if not is_http_url(url):
+            raise ValueError("url must be an absolute http(s) URL")
+        safe_ref = safe_url_ref(url)
 
         # Dedupe on the (arxiv-canonicalized) URL, matching ingest_paper so an
         # arxiv page ingested either way collapses to one entry.
         arxiv_id = extract_arxiv_id(url)
         canonical_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else url
         if canonical_url in self._url_index:
-            logger.info("URL already ingested: %s", canonical_url)
+            logger.info("URL already ingested: %s", safe_ref)
             if url != canonical_url:
                 self._url_index[url] = self._url_index[canonical_url]
             return self._url_index[canonical_url]
 
         if not body or not body.strip():
-            logger.warning("Empty body supplied for %s", url)
+            logger.warning("Empty body supplied for %s", safe_ref)
             return None
 
         # Normalize content_type here too — the server/agent surfaces strip+
@@ -374,7 +388,7 @@ class ResearchPipeline:
             fmt = ContentFormat.TEXT
         extracted_title, content = _convert(b"", body, fmt)
         if not content.strip():
-            logger.warning("Body for %s had no extractable text", url)
+            logger.warning("Body for %s had no extractable text", safe_ref)
             return None
 
         entry_id = hashlib.sha256(canonical_url.encode()).hexdigest()[:16]

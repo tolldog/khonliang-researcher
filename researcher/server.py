@@ -418,18 +418,17 @@ Most tools accept detail="compact|brief|full":
             return "Error: url is required"
         if not body.strip():
             return "Error: body is required"
+        # Contract is "Ingest a URL" — reject non-http(s)/non-hostname inputs
+        # (file://, bare strings) up-front so they can't land in the store as a
+        # bogus source. The error names no specifics, so it can't leak the input.
+        from researcher.fetcher import is_http_url, safe_url_ref
+
+        if not is_http_url(url):
+            return "Error: url must be an absolute http(s) URL"
         # All tool output echoes the URL — it may carry userinfo / query tokens,
         # so use a sanitized scheme://host/path ref everywhere (as fetcher does),
-        # not just on the error path. Fall back to a placeholder when the input
-        # doesn't parse as an absolute http(s) URL (avoids "://..." garbage or
-        # leaking a non-URL string).
-        from urllib.parse import urlparse
-
-        p = urlparse(url)
-        if p.scheme in ("http", "https") and p.hostname:
-            safe_ref = f"{p.scheme}://{p.hostname.lower()}{p.path or ''}"
-        else:
-            safe_ref = "<non-http url>"
+        # not just on the error path.
+        safe_ref = safe_url_ref(url)
         try:
             entry_id = await pipeline.ingest_url_with_body(
                 url, body, title=title.strip(),

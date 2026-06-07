@@ -208,6 +208,17 @@ async def test_ingest_url_with_body_dedupes_on_url():
 
 
 @pytest.mark.asyncio
+async def test_ingest_url_with_body_rejects_non_http_url():
+    """The method contracts on a URL and stores it as the entry source/dedupe
+    key — a file:// or bare-string input must raise, not silently ingest."""
+    pipe, captured = _body_pipe()
+    for bad in ("file:///etc/passwd", "not-a-url", "ftp://h/x"):
+        with pytest.raises(ValueError, match="absolute http"):
+            await pipe.ingest_url_with_body(bad, "# T\n\nbody")
+    assert "entry" not in captured  # nothing stored
+
+
+@pytest.mark.asyncio
 async def test_ingest_url_with_body_blank_content_type_normalized():
     """A direct pipeline caller passing content_type='' must NOT misroute
     through the HTML converter (_detect_format('', '') defaults to HTML) and

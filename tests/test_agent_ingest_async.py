@@ -787,6 +787,9 @@ async def test_ingest_url_with_body_handler_validates_and_dispatches():
 
     assert "url is required" in (await h({}))["error"]
     assert "url must be a string" in (await h({"url": 123, "body": "b"}))["error"]
+    # Non-http(s) inputs rejected before the body check so they can't be stored.
+    assert "absolute http" in (await h({"url": "file:///etc/passwd", "body": "b"}))["error"]
+    assert "absolute http" in (await h({"url": "not-a-url", "body": "b"}))["error"]
     assert "body is required" in (await h({"url": "https://x/a"}))["error"]
     assert "body must be a string" in (await h({"url": "https://x/a", "body": 5}))["error"]
 

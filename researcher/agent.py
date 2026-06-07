@@ -672,6 +672,12 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         url = url_raw.strip()
         if not url:
             return {"error": "url is required"}
+        # Contract is "Ingest a URL" — reject non-http(s)/non-hostname inputs so
+        # they can't pollute dedupe/backlinking or store a non-URL `source`.
+        from researcher.fetcher import is_http_url
+
+        if not is_http_url(url):
+            return {"error": "url must be an absolute http(s) URL"}
         # Distinguish missing (required-field error) from wrong type, like
         # stage_payload does for `content`.
         if "body" not in args:
