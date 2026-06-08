@@ -433,11 +433,19 @@ async def _fetch_url_direct(
         # aiohttp raises a synthetic 400 ClientResponseError when it can't decode
         # the response body's content-encoding — brotli sent but the `Brotli`
         # wheel isn't importable, or `br` returned despite our Accept-Encoding (a
-        # misbehaving CDN). The message is "Can not decode content-encoding: ...".
-        # Retry once without advertising `br`; guard on _no_brotli so we don't
-        # loop, and re-raise anything else (real 4xx/5xx from raise_for_status).
-        # (bug_khonliang-researcher_e5ad3234)
-        if not _no_brotli and "content-encoding" in (exc.message or "").lower():
+        # misbehaving CDN). Match the SPECIFIC decode-failure shape (status 400 +
+        # "Can not decode content-encoding" + brotli), not just any message
+        # mentioning "content-encoding": a real server 400 or a different
+        # undecodable encoding (zstd) must NOT trigger a pointless retry — only
+        # dropping `br` can help, and only for the brotli case. Guard on
+        # _no_brotli so we don't loop. (bug_khonliang-researcher_e5ad3234)
+        _msg = (exc.message or "").lower()
+        if (
+            not _no_brotli
+            and getattr(exc, "status", None) == 400
+            and "can not decode content-encoding" in _msg
+            and "brotli" in _msg
+        ):
             logger.warning(
                 "Undecodable content-encoding for %s; retrying without brotli",
                 safe_url_ref(url),

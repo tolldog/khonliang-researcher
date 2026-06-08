@@ -1009,3 +1009,39 @@ def test_fetch_url_does_not_retry_on_real_http_error(monkeypatch):
     with pytest.raises(fetcher.aiohttp.ClientResponseError):
         asyncio.run(fetcher.fetch_url("https://blog.example.com/missing"))
     assert len(attempts) == 1  # no retry on a real HTTP error
+
+
+def test_fetch_url_does_not_retry_on_non_brotli_encoding_failure(monkeypatch):
+    """A *different* undecodable content-encoding (e.g. zstd) must NOT trigger
+    the no-br retry — dropping `br` can't help it, so retrying is pointless.
+    The predicate is tightened to status 400 + 'content-encoding' + brotli."""
+    attempts = []
+
+    class FakeResponse:
+        async def __aenter__(self):
+            raise fetcher.aiohttp.ClientResponseError(
+                request_info=None, history=(), status=400,
+                message="Can not decode content-encoding: zstandard (zstd)",
+            )
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            attempts.append(1)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse()
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+
+    with pytest.raises(fetcher.aiohttp.ClientResponseError):
+        asyncio.run(fetcher.fetch_url("https://blog.example.com/post"))
+    assert len(attempts) == 1  # zstd failure → no brotli retry
