@@ -607,6 +607,22 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 },
                 since="0.5.0",
             ),
+            Skill(
+                "distill_paper_async",
+                "Schedule LLM distillation of a stored paper as a background "
+                "job. The synchronous distill_paper blocks the agent and times "
+                "out over MCP on large papers (summarize is a 7B-model call on "
+                "the full body); this returns {job_id, accepted_at} immediately "
+                "and runs the distill off the request path. Progress fires on "
+                "'research.ingest.progress'; poll ingest_status(job_id) for the "
+                "race-free terminal state, whose result carries {entry_id, "
+                "title, success, triples, assessments} — where `triples` and "
+                "`assessments` are integer COUNTS, not the payloads (call "
+                "paper_digest / paper_context for the full distilled content). "
+                "bug_khonliang-researcher_d4068c16.",
+                {"entry_id": {"type": "string", "required": True}},
+                since="0.5.0",
+            ),
         ]
         for skill in extras:
             if skill.name not in names:
@@ -978,6 +994,37 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             "ingest_idea", {"source_label": source_label}, work,
         )
 
+    async def handle_distill_paper_async(self, args):
+        # isinstance-validate at the boundary like the sibling async handlers —
+        # str()-coercing would enqueue a job for a bogus entry_id.
+        entry_id = args.get("entry_id", "")
+        if not isinstance(entry_id, str):
+            return {"error": f"entry_id must be a string, got {type(entry_id).__name__}"}
+        if not entry_id.strip():
+            return {"error": "entry_id is required"}
+        entry_id = entry_id.strip()
+
+        async def work(progress):
+            # distill() is monolithic (summarize → extract+assess → store) and
+            # persists internally, so there's no mid-pipeline hook. Emit a single
+            # "distilling" intent marker BEFORE the call; the job's terminal
+            # "done" (run_ingest_job, on return) signals completion. Don't emit a
+            # post-call "storing": distill already stored, so a cancellation
+            # between its persist and that emit would mark a false phase=error.
+            await progress("distilling", progress_pct=30)
+            result = await pipeline.distill(entry_id)
+            return {
+                "entry_id": entry_id,
+                "title": result.title,
+                "success": result.success,
+                "triples": len(result.triples),
+                "assessments": len(result.assessments),
+            }
+
+        return await self._spawn_ingest_job(
+            "distill_paper", {"entry_id": entry_id}, work,
+        )
+
     async def handle_ingest_status(self, args):
         # Strict isinstance — ``None`` / ``{}`` / ``123`` should
         # surface as a validation error, not get silently coerced
@@ -1193,6 +1240,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["ingest_github_async"] = MethodType(handle_ingest_github_async, agent)
     agent._handlers["ingest_file_async"] = MethodType(handle_ingest_file_async, agent)
     agent._handlers["ingest_idea_async"] = MethodType(handle_ingest_idea_async, agent)
+    agent._handlers["distill_paper_async"] = MethodType(handle_distill_paper_async, agent)
     agent._handlers["ingest_status"] = MethodType(handle_ingest_status, agent)
     agent._get_job_store = MethodType(_get_job_store, agent)
     agent._get_ingest_semaphore = MethodType(_get_ingest_semaphore, agent)
