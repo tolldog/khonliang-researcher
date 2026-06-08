@@ -836,3 +836,174 @@ def test_safe_url_ref_placeholder_for_non_http():
 def test_safe_url_ref_non_string_does_not_raise(bad):
     # Must not AttributeError on non-string truthy inputs (docstring says "anything").
     assert fetcher.safe_url_ref(bad) == "<non-http url>"
+
+
+# ---------------------------------------------------------------------------
+# brotli content-encoding (bug_khonliang-researcher_e5ad3234)
+# ---------------------------------------------------------------------------
+
+
+def test_brotli_supported_true_when_importable():
+    # Brotli is a declared dependency, so it's importable in the test env and
+    # the default Accept-Encoding advertises `br`.
+    assert fetcher._brotli_supported() is True
+    assert "br" in fetcher._HEADERS["Accept-Encoding"]
+
+
+def test_brotli_supported_false_when_missing(monkeypatch):
+    """The gate must report no-brotli when neither backend imports — that's the
+    deploy env where the wheel wasn't installed, and advertising `br` there is
+    exactly what broke ingestion."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name in ("brotli", "brotlicffi"):
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert fetcher._brotli_supported() is False
+
+
+def _content_encoding_error():
+    # Mirrors what aiohttp raises (verified empirically): a synthetic 400
+    # ClientResponseError whose message names the undecodable content-encoding.
+    return fetcher.aiohttp.ClientResponseError(
+        request_info=None, history=(), status=400,
+        message="Can not decode content-encoding: brotli (br)",
+    )
+
+
+def test_fetch_url_retries_without_brotli_on_content_encoding_error(monkeypatch):
+    """A server that returns an undecodable brotli body (despite our header)
+    must trigger one retry with `br` dropped from Accept-Encoding, and succeed.
+
+    The error surfaces from aiohttp at `async with session.get(...)` (resp.start
+    decodes at headers-complete), i.e. from the response __aenter__."""
+    seen_encodings = []
+
+    class FakeResponse:
+        def __init__(self, accept_encoding):
+            self.status = 200
+            self.headers = {"Content-Type": "text/html; charset=utf-8"}
+            self._ae = accept_encoding
+
+        async def __aenter__(self):
+            if "br" in self._ae:  # first attempt advertised br → undecodable
+                raise _content_encoding_error()
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def text(self):
+            return "<html><body><p>decoded ok</p></body></html>"
+
+        async def read(self):
+            return (await self.text()).encode()
+
+    class FakeSession:
+        def __init__(self, *args, headers=None, **kwargs):
+            self._ae = (headers or {}).get("Accept-Encoding", "")
+            seen_encodings.append(self._ae)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse(self._ae)
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+    # Pin the primary header to advertise br regardless of the local install.
+    monkeypatch.setattr(
+        fetcher, "_HEADERS",
+        {**fetcher._HEADERS, "Accept-Encoding": "gzip, deflate, br"},
+    )
+
+    result = asyncio.run(fetcher.fetch_url("https://blog.example.com/post"))
+
+    assert "decoded ok" in result.content
+    # Exactly two sessions: br advertised (failed), then br dropped (succeeded).
+    assert len(seen_encodings) == 2
+    assert "br" in seen_encodings[0]
+    assert "br" not in seen_encodings[1]
+
+
+def test_fetch_url_brotli_retry_does_not_loop(monkeypatch):
+    """If the no-brotli retry still hits the content-encoding error, it must
+    surface rather than recursing forever."""
+    attempts = []
+
+    class FakeResponse:
+        async def __aenter__(self):
+            raise _content_encoding_error()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            attempts.append(1)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse()
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+
+    with pytest.raises(fetcher.aiohttp.ClientResponseError):
+        asyncio.run(fetcher.fetch_url("https://blog.example.com/post"))
+    assert len(attempts) == 2  # original + one retry, no infinite loop
+
+
+def test_fetch_url_does_not_retry_on_real_http_error(monkeypatch):
+    """A genuine 4xx (raise_for_status) must NOT be mistaken for a brotli decode
+    failure — only the 'content-encoding' message triggers the no-br retry."""
+    attempts = []
+
+    class FakeResponse:
+        status = 404
+        headers = {"Content-Type": "text/html"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            raise fetcher.aiohttp.ClientResponseError(
+                request_info=None, history=(), status=404, message="Not Found",
+            )
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            attempts.append(1)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def get(self, url, timeout):
+            return FakeResponse()
+
+    monkeypatch.setattr(fetcher.aiohttp, "ClientSession", FakeSession)
+
+    with pytest.raises(fetcher.aiohttp.ClientResponseError):
+        asyncio.run(fetcher.fetch_url("https://blog.example.com/missing"))
+    assert len(attempts) == 1  # no retry on a real HTTP error

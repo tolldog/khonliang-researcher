@@ -54,11 +54,34 @@ class SearchResult:
 
 _ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?")
 
+
+def _brotli_supported() -> bool:
+    """True iff aiohttp can decode ``br`` content-encoding here — i.e. ``Brotli``
+    or ``brotlicffi`` is importable.
+
+    We only advertise ``br`` in ``Accept-Encoding`` when we can actually decode
+    it. Otherwise a server that honours ``br`` returns a brotli body aiohttp
+    can't read, and the fetch fails on every brotli-serving blog
+    (bug_khonliang-researcher_e5ad3234). ``Brotli`` is a declared dependency, so
+    this is normally True; the gate is the safety net for environments where the
+    wheel didn't install (e.g. an unmigrated deploy).
+    """
+    for mod in ("brotli", "brotlicffi"):
+        try:
+            __import__(mod)
+            return True
+        except ImportError:
+            continue
+    return False
+
+
+_ACCEPT_ENCODING = "gzip, deflate, br" if _brotli_supported() else "gzip, deflate"
+
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": _ACCEPT_ENCODING,
     # Modern Chrome client-hints + Sec-Fetch-* set. Some Cloudflare-
     # fronted hosts (Substack and others) return 403 to UA strings
     # that aren't accompanied by these headers — the fingerprint
@@ -345,6 +368,7 @@ async def _fetch_url_direct(
     timeout: int = 60,
     *,
     _shortlink_depth: int = 0,
+    _no_brotli: bool = False,
 ) -> FetchResult:
     """Single-attempt fetch: HTTP GET, format detect, shortlink resolve, convert.
 
@@ -352,48 +376,74 @@ async def _fetch_url_direct(
     :class:`FetchBlockedError` on 403/429/503 (and on any 4xx/5xx from
     known-blocked hosts) so the :func:`fetch_url` orchestrator can try the
     readability-proxy fallback rather than retrying the same request.
+
+    ``_no_brotli`` (internal) drops ``br`` from ``Accept-Encoding`` for a single
+    retry when a server hands back an undecodable brotli body — see the
+    ``ClientResponseError`` handler below.
     """
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     known_blocked = _is_known_blocked_host(host)
-    async with aiohttp.ClientSession(headers=_HEADERS) as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            if resp.status in (403, 429, 503) or (known_blocked and resp.status >= 400):
-                if known_blocked:
-                    detail = (
-                        f"{host} is on the known-anti-bot list; "
-                        "fingerprint headers don't bypass it."
+    headers = {**_HEADERS, "Accept-Encoding": "gzip, deflate"} if _no_brotli else _HEADERS
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                if resp.status in (403, 429, 503) or (known_blocked and resp.status >= 400):
+                    if known_blocked:
+                        detail = (
+                            f"{host} is on the known-anti-bot list; "
+                            "fingerprint headers don't bypass it."
+                        )
+                    else:
+                        detail = (
+                            f"{resp.status} may be a bot challenge / rate-limit "
+                            "rather than a real ACL deny; try the readability "
+                            "fallback before assuming an authorization issue."
+                        )
+                    # Don't echo the full url — it may carry userinfo or
+                    # sensitive query params that would leak via logs. Show
+                    # scheme://host/path only.
+                    safe_ref = f"{parsed.scheme}://{host}{parsed.path or ''}"
+                    raise FetchBlockedError(
+                        f"{safe_ref} returned {resp.status} despite browser "
+                        f"headers. {detail} Fall back to WebFetch (or a "
+                        "browser-driven fetcher) and pipe the result via "
+                        "ingest_file.",
+                        # Only carry the url when it has no embedded credentials —
+                        # a consumer that logs/serializes exc.url must not leak
+                        # user:pass@ basic-auth.
+                        url=url if not (parsed.username or parsed.password) else None,
                     )
-                else:
-                    detail = (
-                        f"{resp.status} may be a bot challenge / rate-limit "
-                        "rather than a real ACL deny; try the readability "
-                        "fallback before assuming an authorization issue."
-                    )
-                # Don't echo the full url — it may carry userinfo or
-                # sensitive query params that would leak via logs. Show
-                # scheme://host/path only.
-                safe_ref = f"{parsed.scheme}://{host}{parsed.path or ''}"
-                raise FetchBlockedError(
-                    f"{safe_ref} returned {resp.status} despite browser "
-                    f"headers. {detail} Fall back to WebFetch (or a "
-                    "browser-driven fetcher) and pipe the result via "
-                    "ingest_file.",
-                    # Only carry the url when it has no embedded credentials —
-                    # a consumer that logs/serializes exc.url must not leak
-                    # user:pass@ basic-auth.
-                    url=url if not (parsed.username or parsed.password) else None,
-                )
-            resp.raise_for_status()
-            content_type = resp.headers.get("Content-Type", "")
-            fmt = _detect_format(url, content_type)
+                resp.raise_for_status()
+                content_type = resp.headers.get("Content-Type", "")
+                fmt = _detect_format(url, content_type)
 
-            if fmt == ContentFormat.PDF:
-                raw = await resp.read()
-                text_content = ""
-            else:
-                raw = b""
-                text_content = await resp.text()
+                if fmt == ContentFormat.PDF:
+                    raw = await resp.read()
+                    text_content = ""
+                else:
+                    raw = b""
+                    text_content = await resp.text()
+    except aiohttp.ClientResponseError as exc:
+        # aiohttp raises a synthetic 400 ClientResponseError when it can't decode
+        # the response body's content-encoding — brotli sent but the `Brotli`
+        # wheel isn't importable, or `br` returned despite our Accept-Encoding (a
+        # misbehaving CDN). The message is "Can not decode content-encoding: ...".
+        # Retry once without advertising `br`; guard on _no_brotli so we don't
+        # loop, and re-raise anything else (real 4xx/5xx from raise_for_status).
+        # (bug_khonliang-researcher_e5ad3234)
+        if not _no_brotli and "content-encoding" in (exc.message or "").lower():
+            logger.warning(
+                "Undecodable content-encoding for %s; retrying without brotli",
+                safe_url_ref(url),
+            )
+            return await _fetch_url_direct(
+                url,
+                timeout=timeout,
+                _shortlink_depth=_shortlink_depth,
+                _no_brotli=True,
+            )
+        raise
 
     if fmt == ContentFormat.HTML and _shortlink_depth < _MAX_SHORTLINK_REDIRECTS:
         target_url = _extract_linkedin_external_url(text_content, source_url=url)

@@ -7,6 +7,9 @@ dependencies = [
     "ollama-khonliang @ git+https://github.com/tolldog/ollama-khonliang.git@main",
     "khonliang-researcher-lib @ git+https://github.com/tolldog/khonliang-researcher-lib.git@1a1421e8b355fa061395ab6bac111b86d805b4ae",
     "aiohttp>=3.9",
+    "Brotli>=1.1.0",  # aiohttp decodes `br` content-encoding only when this is
+                      # importable; undeclared-transitive in dev, absent in prod
+                      # → brotli blogs failed (bug_khonliang-researcher_e5ad3234)
     "beautifulsoup4>=4.12",
     "click>=8.0",
     "pyyaml>=6.0",
