@@ -59,6 +59,14 @@ PHASES: tuple[str, ...] = (
 TERMINAL_PHASES: frozenset[str] = frozenset({"done", "error"})
 
 
+class IngestQueueFull(RuntimeError):
+    """Raised by :meth:`IngestJobStore.create` when the in-flight job count is
+    at the configured ``max_inflight`` cap. Callers translate this into a
+    synchronous error envelope (HTTP-429-like backpressure) rather than
+    accepting an unbounded queue of parked jobs.
+    """
+
+
 @dataclass
 class JobRecord:
     """Per-job state held in :class:`IngestJobStore`."""
@@ -104,14 +112,32 @@ class IngestJobStore:
     job table without limit. In-flight jobs are never evicted.
     """
 
-    def __init__(self, max_completed: int = 64):
+    def __init__(self, max_completed: int = 64, max_inflight: int = 128):
         self._jobs: dict[str, JobRecord] = {}
         self._completed_order: list[str] = []  # FIFO of finished job_ids
         self._max_completed = max_completed
+        self._max_inflight = max_inflight
         self._lock = asyncio.Lock()
 
     async def create(self, skill: str, args: dict[str, Any]) -> JobRecord:
+        """Admit a new job, or raise :class:`IngestQueueFull` if the in-flight
+        (non-terminal) job count is already at ``max_inflight``.
+
+        The concurrency semaphore only bounds how many jobs *run* at once —
+        without an admission cap, a burst of async-ingest calls would still
+        create an unbounded number of JobRecords + parked driver tasks queued
+        behind it. The count is taken under the lock so concurrent ``create``
+        calls can't both slip past the cap.
+        """
         async with self._lock:
+            inflight = sum(
+                1 for j in self._jobs.values() if j.phase not in TERMINAL_PHASES
+            )
+            if inflight >= self._max_inflight:
+                raise IngestQueueFull(
+                    f"ingest queue full: {inflight} jobs in flight "
+                    f"(max {self._max_inflight}); retry once some complete"
+                )
             job = JobRecord(
                 job_id=f"job_{uuid.uuid4().hex[:12]}",
                 skill=skill,

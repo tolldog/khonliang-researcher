@@ -896,3 +896,30 @@ async def test_distill_paper_async_surfaces_unsuccessful_distill():
     assert status["phase"] == "done"  # job completed; distill itself was unsuccessful
     assert status["result"]["success"] is False
     assert status["result"]["triples"] == 0
+
+
+# ---------------------------------------------------------------------------
+# in-flight admission cap (bug_khonliang-researcher_fa9a951c)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_when_inflight_cap_reached_without_scheduling():
+    """When the JobStore's in-flight cap is hit, the async handler must reject
+    synchronously with a retryable error envelope — no JobRecord, no scheduled
+    task, no progress events — rather than queuing an unbounded parked job."""
+    pipeline = _make_pipeline()
+    pipeline.config = {"ingest_max_inflight": 1, "ingest_async_concurrency": 4}
+    agent = _build_fake_agent(pipeline)
+
+    # Occupy the single in-flight slot with a job that never completes.
+    store = agent._get_job_store()
+    await store.create("ingest_idea", {"manual": "occupant"})
+
+    out = await agent._handlers["ingest_idea_async"]({"text": "rejected"})
+    assert "error" in out
+    assert out.get("retryable") is True
+    assert "queue full" in out["error"].lower()
+    assert "job_id" not in out  # nothing was admitted
+    # No task was scheduled and no progress event fired for the rejected call.
+    assert agent.events == []

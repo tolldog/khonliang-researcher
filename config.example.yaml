@@ -60,6 +60,14 @@ distill_worker:
   pause_between: 2.0   # seconds between entries
   idle_poll: 30        # seconds to sleep when the queue is empty
 
+# Async ingest jobs (ingest_*_async / distill_paper_async). Two independent
+# bounds: ingest_async_concurrency caps how many jobs RUN at once (others park
+# at phase=accepted); ingest_max_inflight caps how many accepted-but-unfinished
+# jobs may exist at all — a spawn beyond it is rejected synchronously with a
+# retryable error rather than queuing an unbounded backlog of parked tasks.
+ingest_async_concurrency: 4
+ingest_max_inflight: 128
+
 db_path: data/researcher.db
 
 # Domain rules — optional. When set, these rules are appended to the

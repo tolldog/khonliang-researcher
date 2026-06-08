@@ -13,6 +13,7 @@ import pytest
 
 from researcher.ingest_jobs import (
     IngestJobStore,
+    IngestQueueFull,
     JobRecord,
     PROGRESS_TOPIC,
     TERMINAL_PHASES,
@@ -117,6 +118,27 @@ async def test_in_flight_jobs_not_evicted_when_completed_overflow():
         j = await store.create("ingest_idea", {"i": i})
         await store.transition(j.job_id, phase="done")
     assert await store.get(flight.job_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_above_inflight_cap_and_frees_on_completion():
+    """The semaphore caps *running* jobs; max_inflight caps *accepted* ones.
+    create() must raise IngestQueueFull at the cap (atomically under the lock)
+    and admit again once an in-flight job reaches a terminal phase — terminal
+    jobs don't count toward in-flight even while retained for status reads."""
+    store = IngestJobStore(max_inflight=2)
+    a = await store.create("ingest_idea", {"i": 0})
+    await store.create("ingest_idea", {"i": 1})  # 2 in flight → at cap
+
+    with pytest.raises(IngestQueueFull):
+        await store.create("ingest_idea", {"i": 2})
+
+    # Completing one frees a slot (done is terminal → not counted in-flight).
+    await store.transition(a.job_id, phase="done")
+    c = await store.create("ingest_idea", {"i": 3})  # admitted again
+    assert c.job_id != a.job_id
+    # The completed job is still retained for status reads.
+    assert await store.get(a.job_id) is not None
 
 
 @pytest.mark.asyncio
