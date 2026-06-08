@@ -77,10 +77,18 @@ def _make_pipeline(stub_ingest_github_repo=None, stub_ingest_idea=None) -> Any:
     async def default_ingest_idea(text, source_label=""):
         return "idea_test"
 
+    async def default_distill(entry_id):
+        return SimpleNamespace(
+            entry_id=entry_id, title="A Paper", success=True,
+            summary={"x": 1}, triples=[{"a": 1}, {"b": 2}],
+            assessments={"khonliang": {"score": 0.5}},
+        )
+
     return SimpleNamespace(
         config={},  # ingest_async_concurrency falls back to default 4
         ingest_github_repo=stub_ingest_github_repo or default_ingest_github_repo,
         ingest_idea=stub_ingest_idea or default_ingest_idea,
+        distill=default_distill,
     )
 
 
@@ -826,3 +834,65 @@ async def test_ingest_url_with_body_handler_error_does_not_leak_url():
     out = await h({"url": secret, "body": "# T\n\nbody"})
     assert out["error"] == "ingest failed: ValueError"
     assert "SECRETTOKEN" not in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# distill_paper_async (bug_khonliang-researcher_d4068c16)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_distill_paper_async_happy_path_reaches_done_with_result():
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+
+    accepted = await agent._handlers["distill_paper_async"]({"entry_id": "e1"})
+    assert "job_id" in accepted
+    assert accepted["skill"] == "distill_paper"
+    assert accepted["accepted_at"] > 0
+
+    status = await _await_terminal(agent, accepted["job_id"])
+    assert status["phase"] == "done"
+    assert status["error"] is None
+    # Compact result: counts, not the full triple/assessment payloads.
+    assert status["result"] == {
+        "entry_id": "e1", "title": "A Paper", "success": True,
+        "triples": 2, "assessments": 1,
+    }
+    phases = [h["phase"] for h in status["history"]]
+    assert phases[0] == "started"
+    assert phases[-1] == "done"
+    assert "distilling" in phases
+
+
+@pytest.mark.asyncio
+async def test_distill_paper_async_strips_and_validates_entry_id():
+    pipeline = _make_pipeline()
+    agent = _build_fake_agent(pipeline)
+    h = agent._handlers["distill_paper_async"]
+
+    assert "entry_id is required" in (await h({}))["error"]
+    assert "entry_id is required" in (await h({"entry_id": "   "}))["error"]
+    assert "must be a string" in (await h({"entry_id": 123}))["error"]
+
+
+@pytest.mark.asyncio
+async def test_distill_paper_async_surfaces_unsuccessful_distill():
+    """A distill that fails internally (e.g. summarizer down → success=False)
+    still completes the job; the caller reads success=False from the result,
+    matching the sync distill_paper's behavior of not raising."""
+    async def failing_distill(entry_id):
+        return SimpleNamespace(
+            entry_id=entry_id, title="NOT FOUND", success=False,
+            summary=None, triples=[], assessments={},
+        )
+
+    pipeline = _make_pipeline()
+    pipeline.distill = failing_distill
+    agent = _build_fake_agent(pipeline)
+
+    accepted = await agent._handlers["distill_paper_async"]({"entry_id": "missing"})
+    status = await _await_terminal(agent, accepted["job_id"])
+    assert status["phase"] == "done"  # job completed; distill itself was unsuccessful
+    assert status["result"]["success"] is False
+    assert status["result"]["triples"] == 0
