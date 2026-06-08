@@ -850,17 +850,19 @@ def test_brotli_supported_true_when_importable():
     assert "br" in fetcher._HEADERS["Accept-Encoding"]
 
 
-def test_brotli_supported_false_when_missing(monkeypatch):
-    """The gate must report no-brotli when neither backend imports — that's the
-    deploy env where the wheel wasn't installed, and advertising `br` there is
-    exactly what broke ingestion."""
+@pytest.mark.parametrize("exc", [ImportError("missing"), OSError("broken .so"), RuntimeError("x")])
+def test_brotli_supported_false_when_import_fails(monkeypatch, exc):
+    """The gate must report no-brotli when neither backend imports — whether the
+    wheel is simply absent (ImportError) or present-but-broken (OSError/other).
+    The probe runs at module import, so an uncaught error there would crash the
+    whole fetcher module rather than degrade to gzip/deflate."""
     import builtins
 
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
         if name in ("brotli", "brotlicffi"):
-            raise ImportError(name)
+            raise exc
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)

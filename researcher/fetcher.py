@@ -70,7 +70,12 @@ def _brotli_supported() -> bool:
         try:
             __import__(mod)
             return True
-        except ImportError:
+        except Exception:
+            # Not just ImportError: a present-but-broken wheel (bad .so, platform
+            # mismatch) can raise OSError/other at import. This runs at module
+            # import (``_ACCEPT_ENCODING`` is computed eagerly), so anything
+            # uncaught here would take down the whole fetcher module. Treat any
+            # import failure as "br unavailable" and fall back to gzip/deflate.
             continue
     return False
 
