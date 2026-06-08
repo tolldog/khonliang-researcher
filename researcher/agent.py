@@ -616,7 +616,9 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "and runs the distill off the request path. Progress fires on "
                 "'research.ingest.progress'; poll ingest_status(job_id) for the "
                 "race-free terminal state, whose result carries {entry_id, "
-                "title, success, triples, assessments}. "
+                "title, success, triples, assessments} — where `triples` and "
+                "`assessments` are integer COUNTS, not the payloads (call "
+                "paper_digest / paper_context for the full distilled content). "
                 "bug_khonliang-researcher_d4068c16.",
                 {"entry_id": {"type": "string", "required": True}},
                 since="0.5.0",
