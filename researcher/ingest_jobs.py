@@ -33,6 +33,7 @@ across restarts is a deliberate future extension.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 import uuid
@@ -84,7 +85,15 @@ class JobRecord:
     history: list[dict[str, Any]] = field(default_factory=list)
 
     def to_status(self) -> dict[str, Any]:
-        """Public-facing snapshot — what ``ingest_status`` returns."""
+        """Public-facing snapshot — what ``ingest_status`` returns.
+
+        ``result`` and ``history`` are deep-copied so a caller mutating the
+        returned snapshot can't corrupt the stored JobRecord. ``list(self.history)``
+        alone is insufficient: it makes a fresh list but shares the entry dicts
+        (and a history entry's ``detail`` may itself be nested), and ``result``
+        was previously returned by reference entirely. The payloads are small
+        (a counts/keys dict + a handful of phase entries), so deepcopy is cheap.
+        """
         return {
             "job_id": self.job_id,
             "skill": self.skill,
@@ -93,9 +102,9 @@ class JobRecord:
             "accepted_at": self.accepted_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
-            "result": self.result,
+            "result": copy.deepcopy(self.result),
             "error": self.error,
-            "history": list(self.history),
+            "history": copy.deepcopy(self.history),
         }
 
 

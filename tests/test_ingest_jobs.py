@@ -65,6 +65,36 @@ async def test_transition_records_phase_history_and_started_at():
 
 
 @pytest.mark.asyncio
+async def test_to_status_snapshot_is_isolated_from_stored_record():
+    """to_status() must deep-copy result + history so a caller mutating the
+    returned snapshot can't corrupt the stored JobRecord. The prior
+    ``"result": self.result`` returned the dict by reference, and
+    ``list(self.history)`` shared the (possibly nested-``detail``) entry dicts.
+    """
+    store = IngestJobStore()
+    j = await store.create("ingest_idea", {"text": "x"})
+    await store.transition(
+        j.job_id, phase="distilling", progress_pct=30,
+        detail={"nested": {"k": "orig"}},
+    )
+    await store.set_result(j.job_id, {"payload": {"k": "orig"}})
+
+    snap = (await store.get(j.job_id)).to_status()
+    # Mutate every layer the caller can reach: top-level result, nested result,
+    # the history list, and a nested value inside a history entry's detail.
+    snap["result"]["payload"]["k"] = "mutated"
+    snap["result"]["injected"] = True
+    snap["history"].append({"phase": "injected", "at": 0})
+    snap["history"][0]["detail"]["nested"]["k"] = "mutated"
+
+    fresh = await store.get(j.job_id)
+    assert fresh.result == {"payload": {"k": "orig"}}  # nested value intact
+    assert "injected" not in fresh.result
+    assert [h["phase"] for h in fresh.history] == ["distilling"]  # no appended entry
+    assert fresh.history[0]["detail"]["nested"]["k"] == "orig"  # nested detail intact
+
+
+@pytest.mark.asyncio
 async def test_transition_to_done_marks_completed_and_pegs_progress_at_100():
     store = IngestJobStore()
     j = await store.create("ingest_idea", {"text": "x"})
