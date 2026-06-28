@@ -9,21 +9,13 @@ don't silently empty it.
 
 from __future__ import annotations
 
-import pytest
-
 
 def test_librarian_welcome_is_populated():
     """LibrarianAgent.WELCOME advertises a complete cold-start surface."""
-    try:
-        from researcher.librarian_agent import LibrarianAgent
-    except ImportError as exc:
-        # Narrow skip: only the known pre-existing researcher-lib export
-        # gap (AmbiguityRecord) is tolerated. Any other import failure —
-        # including welcome-side regressions that break this module —
-        # must red-fail so we notice.
-        if "AmbiguityRecord" in str(exc):
-            pytest.skip(f"pre-existing researcher-lib gap: {exc}")
-        raise
+    # The researcher-lib pin now exports AmbiguityRecord et al.
+    # (bug_khonliang-researcher_2357735d), so this imports cleanly — a regression of
+    # the pin would surface as a hard import error here, which is what we want.
+    from researcher.librarian_agent import LibrarianAgent
     from khonliang_bus import Welcome
 
     w = LibrarianAgent.WELCOME
