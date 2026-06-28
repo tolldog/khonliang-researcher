@@ -12,8 +12,8 @@ from __future__ import annotations
 
 def test_librarian_welcome_is_populated():
     """LibrarianAgent.WELCOME advertises a complete cold-start surface."""
-    # The researcher-lib pin now exports AmbiguityRecord et al. (bug
-    # khonliang-researcher_2357735d), so this imports cleanly — a regression of
+    # The researcher-lib pin now exports AmbiguityRecord et al.
+    # (bug_khonliang-researcher_2357735d), so this imports cleanly — a regression of
     # the pin would surface as a hard import error here, which is what we want.
     from researcher.librarian_agent import LibrarianAgent
     from khonliang_bus import Welcome
