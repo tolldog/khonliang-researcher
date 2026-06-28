@@ -80,7 +80,7 @@ class JobRecord:
         """Public-facing snapshot — what ``ingest_status`` returns.
 
         ``result`` and ``history`` are deep-copied so a caller mutating the
-        returned snapshot can't corrupt the stored JobRecord. ``list(history)``
+        returned snapshot can't corrupt the stored JobRecord. ``list(self.history)``
         alone is insufficient: it makes a fresh list but shares the entry dicts
         (and a history entry's ``detail`` may itself be nested), and ``result``
         was previously returned by reference entirely. The payloads are small
