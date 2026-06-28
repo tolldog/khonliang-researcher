@@ -31,7 +31,12 @@ from types import MethodType
 from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint
 from khonliang_bus.connector import BusConnector
 
-from researcher.ingest_jobs import IngestJobStore, _publish_progress, run_ingest_job
+from researcher.ingest_jobs import (
+    IngestJobStore,
+    IngestQueueFull,
+    _publish_progress,
+    run_ingest_job,
+)
 from researcher.ingest_watcher import IngestWatcherRegistry, IngestWatcherStore
 
 logger = logging.getLogger(__name__)
@@ -737,7 +742,11 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     def _get_job_store(self) -> IngestJobStore:
         store = getattr(self, "_ingest_job_store", None)
         if store is None:
-            store = IngestJobStore()
+            # max_inflight bounds accepted-but-not-finished jobs (the semaphore
+            # only bounds *running* ones); a burst of spawns beyond it is
+            # rejected synchronously rather than queuing unbounded parked tasks.
+            max_inflight = int(pipeline.config.get("ingest_max_inflight", 128))
+            store = IngestJobStore(max_inflight=max(1, max_inflight))
             self._ingest_job_store = store
         return store
 
@@ -786,7 +795,14 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         the set when it completes.
         """
         store = self._get_job_store()
-        job = await store.create(skill, args)
+        try:
+            job = await store.create(skill, args)
+        except IngestQueueFull as e:
+            # Backpressure: the in-flight cap is hit. Reject synchronously with
+            # an error envelope — no JobRecord, no parked task — so the caller
+            # can retry/back off instead of growing an unbounded queue.
+            logger.warning("ingest job rejected (queue full): %s", e)
+            return {"error": str(e), "retryable": True}
         semaphore = self._get_ingest_semaphore()
 
         async def driver():
