@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,6 +132,93 @@ def _readability_fallback_cfg(config) -> "Dict[str, Any] | None":
     if not isinstance(fetcher_cfg, dict):
         return None
     return fetcher_cfg.get("readability_fallback")
+
+
+_IDEA_TITLE_MAX_CHARS = 120
+
+# Cap on the body text fed to the triple extractor for ideas/blogs. The
+# extractor is prompt-tuned for paper *summaries*, not full articles, and has
+# no input-length guard; a full RSS/web post can overflow the model context and
+# degrade to ``success=False`` (0 triples) on exactly the large posts the
+# feature targets. Extracting from the lead section keeps it bounded and
+# reliable (Codex review on bug_khonliang-researcher_4acd9bbd).
+_IDEA_EXTRACT_MAX_CHARS = 8000
+
+
+def derive_idea_title(text: str, parsed_title: object = "") -> str:
+    """Best-effort human-readable title for an ingested idea / blog.
+
+    The idea-parser often returns no usable title for a full blog post
+    (it's tuned for short informal notes), so ``ingest_idea`` used to fall
+    straight back to the literal string ``"Untitled idea"``
+    (bug_khonliang-researcher_4acd9bbd). Backfill from the source instead:
+
+    1. the parser's title, when it's a real non-empty string (not the
+       ``"Untitled idea"`` sentinel);
+    2. an explicit ``title:`` field in YAML/TOML front matter, when the body
+       is a static-site-generator export (Jekyll/Hugo etc.);
+    3. the first Markdown/Setext heading or first non-empty line of the
+       body (after any front matter), stripped of ``#``/list/quote markers;
+    4. ``"Untitled idea"`` when nothing is derivable.
+
+    The result is whitespace-collapsed and capped at
+    ``_IDEA_TITLE_MAX_CHARS`` on a word boundary. The ``source_label`` is
+    deliberately NOT consulted here — ``ingest_idea`` owns the ``(label)``
+    suffix and falls back to the bare label itself, so passing it in would
+    double it (``"feed (feed)"``).
+    """
+    def _clean(line: str) -> str:
+        # Strip leading Markdown heading (#), blockquote (>) and bullet-list
+        # (-, *, +) markers, then collapse internal whitespace. Numbered
+        # prefixes (``1.``/``2)``) are deliberately NOT stripped — a title like
+        # "2024. A year in review" or "1) Why this matters" is a real title, not
+        # a list item, and mangling it is worse than leaving an actual list
+        # number in place (Codex review on bug_khonliang-researcher_4acd9bbd).
+        stripped = re.sub(r"^\s*(#{1,6}\s+|>\s+|[-*+]\s+)+", "", line)
+        return re.sub(r"\s+", " ", stripped).strip()
+
+    if isinstance(parsed_title, str):
+        candidate = parsed_title.strip()
+        if candidate and candidate.lower() != "untitled idea":
+            return _cap_title(candidate)
+
+    if isinstance(text, str):
+        lines = text.splitlines()
+        # Skip a leading YAML (---) / TOML (+++) front-matter block, but mine
+        # it for an explicit ``title:`` / ``title =`` first — SSG exports put
+        # the real title there, and the first body line is the "---" fence
+        # otherwise (Codex review on bug_khonliang-researcher_4acd9bbd).
+        first = next((i for i, l in enumerate(lines) if l.strip()), None)
+        body_start = 0
+        if first is not None and lines[first].strip() in ("---", "+++"):
+            fence = lines[first].strip()
+            # Skip at least the opening fence so an unclosed block doesn't make
+            # the bare "---" the title; advance past the closing fence if found.
+            body_start = first + 1
+            for j in range(first + 1, len(lines)):
+                if lines[j].strip() == fence:
+                    body_start = j + 1
+                    break
+                m = re.match(r"\s*title\s*[:=]\s*(.+)", lines[j])
+                if m:
+                    val = m.group(1).strip().strip("'\"").strip()
+                    if val:
+                        return _cap_title(val)
+        for raw in lines[body_start:]:
+            cleaned = _clean(raw)
+            if cleaned:
+                return _cap_title(cleaned)
+
+    return "Untitled idea"
+
+
+def _cap_title(title: str) -> str:
+    """Collapse whitespace and cap at ``_IDEA_TITLE_MAX_CHARS`` (word-aware)."""
+    title = re.sub(r"\s+", " ", title).strip()
+    if len(title) <= _IDEA_TITLE_MAX_CHARS:
+        return title
+    cut = title[:_IDEA_TITLE_MAX_CHARS].rsplit(" ", 1)[0].rstrip()
+    return (cut or title[:_IDEA_TITLE_MAX_CHARS].rstrip()) + "…"
 
 
 class ResearchPipeline:
@@ -665,10 +753,14 @@ class ResearchPipeline:
             self.knowledge.remove(summary_id)
             removed["summary"] = True
 
-        # Remove triples sourced from this paper
+        # Remove triples sourced from this entry — papers tag
+        # ``paper:<id>`` and ideas/blogs tag ``idea:<id>``
+        # (bug_khonliang-researcher_4acd9bbd), so strike must clear both or an
+        # idea's triples would dangle in the concept graph after removal.
+        entry_sources = {f"paper:{entry_id}", f"idea:{entry_id}"}
         all_triples = self.triples.get(limit=10000)
         for t in all_triples:
-            if f"paper:{entry_id}" in (t.source or ""):
+            if (t.source or "") in entry_sources:
                 self.triples.remove(t.subject, t.predicate, t.object)
                 removed["triples"] += 1
 
@@ -706,16 +798,22 @@ class ResearchPipeline:
 
         Returns the idea entry_id.
         """
-        import hashlib
-
         parsed = await self.idea_parser.handle(text)
         if not parsed.get("success"):
             raise RuntimeError(f"Idea parsing failed: {parsed.get('error', 'unknown')}")
 
         entry_id = hashlib.sha256(text.encode()).hexdigest()[:16]
-        title = parsed.get("title", "Untitled idea")
+        # Backfill a real title from the body when the parser returns none —
+        # otherwise blogs landed as the literal "Untitled idea"
+        # (bug_khonliang-researcher_4acd9bbd). The source_label is appended as a
+        # suffix, except when nothing was derivable: then the label IS the best
+        # title, so use it bare rather than "Untitled idea (label)" or
+        # "label (label)".
+        base_title = derive_idea_title(text, parsed.get("title"))
         if source_label:
-            title = f"{title} ({source_label})"
+            title = source_label if base_title == "Untitled idea" else f"{base_title} ({source_label})"
+        else:
+            title = base_title
 
         claims = parsed.get("claims", []) or []
         # research_idea reads metadata.search_queries to drive the search. Some
@@ -752,16 +850,101 @@ class ResearchPipeline:
         )
         self.knowledge.add(entry)
 
+        # Extract triples so ideas / blogs contribute to the concept graph
+        # (previously they landed with 0 triples and never reached the graph —
+        # bug_khonliang-researcher_4acd9bbd). Blogs are lower-certainty than
+        # peer-reviewed papers, so the extracted confidences are scaled down by
+        # ``idea_confidence_factor`` (see ``_extract_idea_triples``); the graph
+        # already weights by confidence, so blogs rank below papers for free.
+        triple_count = await self._extract_idea_triples(entry_id, text)
+
         self.digest.record(
-            summary=f"Ingested idea: {title} — {len(claims)} claims, {len(search_queries)} queries",
+            summary=(
+                f"Ingested idea: {title} — {len(claims)} claims, "
+                f"{len(search_queries)} queries, {triple_count} triples"
+            ),
             source="pipeline",
             audience="research",
             tags=["idea", "ingested"],
-            metadata={"entry_id": entry_id},
+            metadata={"entry_id": entry_id, "triple_count": triple_count},
         )
 
-        logger.info("Ingested idea %s: %s", entry_id, title)
+        logger.info(
+            "Ingested idea %s: %s (%d triples)", entry_id, title, triple_count
+        )
         return entry_id
+
+    def _idea_confidence_factor(self) -> float:
+        """Per-source certainty scaling for idea/blog triples (vs papers).
+
+        Blogs and informal notes are lower-certainty than peer-reviewed
+        papers, so their extracted triples enter the concept graph with a
+        down-scaled confidence. Configurable via ``idea_confidence_factor``
+        (default 0.6); clamped to [0, 1] and fail-safe on bad config.
+        """
+        try:
+            factor = float(self.config.get("idea_confidence_factor", 0.6))
+        except (TypeError, ValueError):
+            factor = 0.6
+        return max(0.0, min(1.0, factor))
+
+    async def _extract_idea_triples(self, entry_id: str, text: str) -> int:
+        """Extract triples from idea/blog text and store them, source-tagged.
+
+        Mirrors the extraction half of :meth:`distill` but runs the extractor
+        directly on the body (ideas have no summary step) and tags triples
+        ``source="idea:<id>"`` with confidence scaled by
+        :meth:`_idea_confidence_factor`. Returns the number stored. Never
+        raises — a parser/LLM hiccup must not fail the ingest.
+        """
+        try:
+            resp = await self.extractor.handle(text[:_IDEA_EXTRACT_MAX_CHARS])
+        except Exception:
+            logger.exception("Idea triple extraction failed for %s", entry_id)
+            return 0
+        if not resp.get("success"):
+            return 0
+
+        factor = self._idea_confidence_factor()
+        stored = 0
+        for triple in resp.get("triples", []) or []:
+            if not (isinstance(triple, dict) and triple.get("subject") and triple.get("object")):
+                continue
+            subject = triple["subject"]
+            predicate = triple.get("predicate", "related_to")
+            obj = triple["object"]
+            # Don't retag an existing triple's provenance. TripleStore.add()
+            # overwrites ``source`` on re-add (and takes max() confidence), so a
+            # blog repeating a paper's SPO would steal its ``paper:<id>`` source
+            # and break strike() on both. Only contribute genuinely-new triples
+            # from ideas; an already-stored triple keeps its (higher-certainty)
+            # paper provenance. ``get`` normalizes the predicate the same way
+            # ``add`` does, so this match is alias-safe.
+            #
+            # Limitation: TripleStore holds a single source per SPO, so a triple
+            # extracted by two ideas is attributed to whichever ingested first
+            # (striking it then drops a triple the second idea still supports).
+            # This pre-dates this change — distill has the same single-source
+            # behavior for two papers sharing an SPO — and a full fix needs
+            # multi-source support in the lib, tracked in
+            # bug_khonliang-researcher_a905176b. Skip-if-exists is strictly safer
+            # than the prior overwrite: it preserves the higher-certainty paper
+            # provenance instead of clobbering it.
+            if self.triples.get(subject=subject, predicate=predicate, obj=obj, limit=1):
+                continue
+            try:
+                base = float(triple.get("confidence", 0.7))
+            except (TypeError, ValueError):
+                base = 0.7
+            self.triples.add(
+                subject=subject,
+                predicate=predicate,
+                obj=obj,
+                confidence=max(0.0, min(1.0, base * factor)),
+                source=f"idea:{entry_id}",
+            )
+            stored += 1
+        return stored
 
     async def research_idea(
         self, idea_id: str, max_papers: int = 10, auto_distill: bool = True
