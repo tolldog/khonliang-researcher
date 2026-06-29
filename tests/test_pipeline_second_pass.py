@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from researcher.pipeline import ResearchPipeline
+from researcher.pipeline import ResearchPipeline, derive_idea_title
 
 
 @pytest.mark.asyncio
@@ -263,12 +263,33 @@ async def test_ingest_url_with_body_blank_content_type_normalized():
 # ---------------------------------------------------------------------------
 
 
-def _idea_pipe(parsed):
+def _idea_pipe(parsed, extracted=None, config=None, existing_spo=None):
     pipe = ResearchPipeline.__new__(ResearchPipeline)
-    captured = {}
+    captured = {"triples": []}
     pipe.knowledge = SimpleNamespace(add=lambda e: captured.__setitem__("entry", e))
-    pipe.digest = SimpleNamespace(record=lambda **k: None)
+    pipe.digest = SimpleNamespace(record=lambda **k: captured.__setitem__("digest", k))
     pipe.idea_parser = SimpleNamespace(handle=lambda text: _as_async(parsed))
+    # Default extractor returns nothing (success=False) so query-promotion tests
+    # see 0 triples; pass ``extracted`` to exercise triple extraction.
+    extract_resp = (
+        {"success": True, "triples": extracted}
+        if extracted is not None
+        else {"success": False}
+    )
+    def _extract(text):
+        captured["extract_input"] = text
+        return _as_async(extract_resp)
+    pipe.extractor = SimpleNamespace(handle=_extract)
+    # ``existing_spo``: set of (subject, predicate, object) already in the store
+    # so ``_extract_idea_triples`` skips them (provenance-preservation path).
+    existing = existing_spo or set()
+    pipe.triples = SimpleNamespace(
+        add=lambda **k: captured["triples"].append(k),
+        get=lambda subject=None, predicate=None, obj=None, limit=None: (
+            [object()] if (subject, predicate, obj) in existing else []
+        ),
+    )
+    pipe.config = config or {}
     return pipe, captured
 
 
@@ -302,3 +323,168 @@ async def test_ingest_idea_unions_top_level_and_per_claim_queries():
     })
     await pipe.ingest_idea("t")
     assert captured["entry"].metadata["search_queries"] == ["top level", "from claim"]
+
+
+# ---------------------------------------------------------------------------
+# Blog ingest: title backfill + triple extraction w/ certainty scaling
+# (bug_khonliang-researcher_4acd9bbd)
+# ---------------------------------------------------------------------------
+
+
+def test_derive_idea_title_prefers_real_parser_title():
+    assert derive_idea_title("body", "A Real Title") == "A Real Title"
+
+
+def test_derive_idea_title_ignores_untitled_sentinel():
+    # Parser's "Untitled idea" sentinel must not win over a usable heading.
+    assert derive_idea_title("# Heading Here\nbody", "Untitled idea") == "Heading Here"
+
+
+def test_derive_idea_title_strips_markdown_heading_and_list_markers():
+    assert derive_idea_title("###   Spaced Heading  \nrest") == "Spaced Heading"
+    assert derive_idea_title("- bullet first line\nrest") == "bullet first line"
+
+
+def test_derive_idea_title_preserves_leading_numbers():
+    # Numbered prefixes are real title text, not list markers — keep them.
+    assert derive_idea_title("2024. A year in review\nbody") == "2024. A year in review"
+    assert derive_idea_title("1) Why this matters\nbody") == "1) Why this matters"
+
+
+def test_derive_idea_title_skips_blank_lines_to_first_content():
+    assert derive_idea_title("\n\n   \nFirst real line\n", None) == "First real line"
+
+
+def test_derive_idea_title_mines_yaml_front_matter_title():
+    md = "---\ntitle: The Real Post Title\ndate: 2026-01-01\n---\n# Heading\nbody"
+    assert derive_idea_title(md) == "The Real Post Title"
+
+
+def test_derive_idea_title_quoted_and_toml_front_matter():
+    assert derive_idea_title('---\ntitle: "Quoted Title"\n---\nbody') == "Quoted Title"
+    assert derive_idea_title('+++\ntitle = "Hugo Title"\n+++\nbody') == "Hugo Title"
+
+
+def test_derive_idea_title_skips_front_matter_without_title_field():
+    # No title: field → skip the fenced block, take the first real heading,
+    # never the "---" fence itself.
+    md = "---\ndate: 2026-01-01\ntags: [x]\n---\n# Actual Heading\nbody"
+    assert derive_idea_title(md) == "Actual Heading"
+
+
+def test_derive_idea_title_unclosed_front_matter_falls_through():
+    # A lone leading "---" with no closing fence must not eat the whole body.
+    assert derive_idea_title("---\nFirst line wins") == "First line wins"
+
+
+def test_derive_idea_title_sentinel_when_nothing_derivable():
+    # Helper no longer consults source_label (ingest_idea owns the suffix) —
+    # nothing derivable yields the sentinel.
+    assert derive_idea_title("", None) == "Untitled idea"
+    assert derive_idea_title("   \n  ", "  ") == "Untitled idea"
+
+
+def test_derive_idea_title_caps_long_titles_on_word_boundary():
+    long = "word " * 60  # 300 chars, no heading
+    out = derive_idea_title(long)
+    assert len(out) <= 121  # 120 + ellipsis
+    assert out.endswith("…")
+    assert "word" in out and not out.endswith(" …")
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_backfills_title_from_body_heading():
+    pipe, captured = _idea_pipe({"success": True, "claims": [], "search_queries": []})
+    await pipe.ingest_idea("# Why Brotli Broke Blog Ingest\n\nlong post body")
+    assert captured["entry"].title == "Why Brotli Broke Blog Ingest"
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_uses_bare_label_when_nothing_derivable():
+    # Whitespace-only body + no parser title → label is the title, NOT
+    # "Untitled idea (label)" or "label (label)" (Codex P3).
+    pipe, captured = _idea_pipe({"success": True, "claims": [], "search_queries": []})
+    await pipe.ingest_idea("   \n  ", "my-feed")
+    assert captured["entry"].title == "my-feed"
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_appends_label_suffix_to_derived_title():
+    pipe, captured = _idea_pipe({"success": True, "claims": [], "search_queries": []})
+    await pipe.ingest_idea("# Real Heading\nbody", "my-feed")
+    assert captured["entry"].title == "Real Heading (my-feed)"
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_skips_triples_already_in_store():
+    # An SPO already present (e.g. from a paper) must NOT be re-added by an
+    # idea — that would overwrite its source/provenance (Codex P1).
+    pipe, captured = _idea_pipe(
+        {"success": True, "title": "t", "claims": [], "search_queries": []},
+        extracted=[
+            {"subject": "A", "predicate": "rel", "object": "B"},   # already exists
+            {"subject": "C", "predicate": "rel", "object": "D"},   # new
+        ],
+        existing_spo={("A", "rel", "B")},
+    )
+    await pipe.ingest_idea("body")
+    stored = captured["triples"]
+    assert len(stored) == 1 and stored[0]["subject"] == "C"
+    assert captured["digest"]["metadata"]["triple_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_extracts_triples_with_scaled_confidence():
+    # Two valid triples + one malformed (no object) → only valid ones stored,
+    # each with source idea:<id> and confidence scaled by the default 0.6.
+    pipe, captured = _idea_pipe(
+        {"success": True, "title": "t", "claims": [], "search_queries": []},
+        extracted=[
+            {"subject": "A", "predicate": "rel", "object": "B", "confidence": 0.8},
+            {"subject": "C", "object": "D"},          # no confidence → base 0.7
+            {"subject": "no-object"},                  # malformed → skipped
+        ],
+    )
+    eid = await pipe.ingest_idea("blog body")
+    triples = captured["triples"]
+    assert len(triples) == 2
+    assert all(t["source"] == f"idea:{eid}" for t in triples)
+    assert triples[0]["confidence"] == pytest.approx(0.8 * 0.6)
+    assert triples[1]["confidence"] == pytest.approx(0.7 * 0.6)
+    # Digest reflects the triple count.
+    assert captured["digest"]["metadata"]["triple_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_caps_extractor_input_length():
+    # Long blog bodies are truncated before the extractor (which is tuned for
+    # summaries) to avoid context overflow → 0 triples on big posts.
+    from researcher.pipeline import _IDEA_EXTRACT_MAX_CHARS
+    pipe, captured = _idea_pipe(
+        {"success": True, "title": "t", "claims": [], "search_queries": []},
+        extracted=[],
+    )
+    await pipe.ingest_idea("x" * (_IDEA_EXTRACT_MAX_CHARS + 5000))
+    assert len(captured["extract_input"]) == _IDEA_EXTRACT_MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_confidence_factor_is_configurable():
+    pipe, captured = _idea_pipe(
+        {"success": True, "title": "t", "claims": [], "search_queries": []},
+        extracted=[{"subject": "A", "predicate": "r", "object": "B", "confidence": 1.0}],
+        config={"idea_confidence_factor": 0.25},
+    )
+    await pipe.ingest_idea("body")
+    assert captured["triples"][0]["confidence"] == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_ingest_idea_extraction_failure_is_nonfatal():
+    pipe, captured = _idea_pipe(
+        {"success": True, "title": "t", "claims": [], "search_queries": []},
+    )
+    # Default extractor returns success=False → 0 triples, ingest still succeeds.
+    eid = await pipe.ingest_idea("body")
+    assert eid and captured["triples"] == []
+    assert captured["entry"].title == "t"
