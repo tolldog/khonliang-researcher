@@ -360,6 +360,46 @@ Respond with JSON:
 Only output JSON. No other text.
 """
 
+# Whole-repo consolidation pass (FR 97eb7550). The per-chunk scan above sees only
+# 20 modules at a time and reports each chunk's local architecture; the first
+# chunk's guess used to win arbitrarily (synthesizer.py all_architectures[0]),
+# and per-function capabilities buried the repo's actual intent (dog_6d734159
+# under-extraction, dog_36ae942f signal-dilution). This pass reads the WHOLE
+# repo's strongest architectural signals — dependency graph, module/file names,
+# README/description narrative, and the accumulated capabilities — and names one
+# overarching intent plus the single most representative top-line capability.
+_SCAN_CONSOLIDATE_PROMPT = """\
+You are identifying the OVERARCHING architectural intent of a software project \
+from its strongest signals. Per-function capabilities are the surface; the intent \
+(e.g. "shell-output compression proxy", "conversation-memory store", "MCP agent \
+runtime") usually lives in the dependency graph, module names, and README.
+
+PROJECT: {project_name}
+DESCRIPTION: {project_description}
+DEPENDS ON: {dependencies}
+
+KEY MODULE / FILE NAMES:
+{module_names}
+
+PER-CHUNK ARCHITECTURE GUESSES (each saw only part of the repo):
+{chunk_architectures}
+
+EXTRACTED CAPABILITIES (may be noisy / surface-level):
+{capabilities}
+
+Decide:
+1. "architecture": ONE phrase (3-10 words) naming the project's primary intent, \
+informed mostly by the dependency graph + module names + description, not by the \
+longest capability list. Prefer the architectural role (proxy / interceptor / \
+pipeline / store / runtime / UI) over a generic "CLI tool" when the signals support it.
+2. "top_capability": the single capability that best expresses what the project is \
+FOR. Reuse one of the extracted capabilities verbatim if a good one exists; \
+otherwise write a better 3-8 word one.
+
+Respond with JSON only:
+{{"architecture": "...", "top_capability": "..."}}
+"""
+
 _LANDSCAPE_PROMPT = """\
 Analyze these {count} paper summaries to map the research landscape.
 
@@ -1234,10 +1274,59 @@ class Synthesizer:
                         )
                         continue
 
+                # ---- Phase 3: Whole-repo consolidation (FR 97eb7550) ----
+                # Replaces first-chunk-wins architecture selection. One extra call
+                # over the strongest cross-chunk signals (deps + module names +
+                # description + accumulated capabilities) names the repo's intent
+                # and surfaces the most representative capability. On any failure
+                # we fall back to the legacy first-chunk architecture.
+                architecture = all_architectures[0] if all_architectures else ""
+                if module_map and (all_capabilities or all_architectures):
+                    module_names = ", ".join(
+                        rel for rel, _ in module_map[:40]
+                    )
+                    consolidate_prompt = _SCAN_CONSOLIDATE_PROMPT.format(
+                        project_name=project_name,
+                        project_description=description or "No description",
+                        dependencies=dependencies or "None",
+                        module_names=module_names or "None",
+                        chunk_architectures="; ".join(all_architectures) or "None",
+                        capabilities=", ".join(all_capabilities[:25]) or "None",
+                    )
+                    try:
+                        craw = await reviewer.generate(
+                            prompt=consolidate_prompt,
+                            system="You identify a project's architectural intent. Output only JSON.",
+                            temperature=0.1,
+                            max_tokens=400,
+                        )
+                        cj = craw.strip()
+                        if cj.startswith("```"):
+                            cj = "\n".join(cj.split("\n")[1:])
+                        if cj.endswith("```"):
+                            cj = "\n".join(cj.split("\n")[:-1])
+                        cdata = json.loads(cj)
+                        arch2 = str(cdata.get("architecture", "")).strip()
+                        if arch2:
+                            architecture = arch2
+                        top_cap = str(cdata.get("top_capability", "")).strip()
+                        if top_cap:
+                            # Promote the consolidated top capability to the front,
+                            # de-duplicating case-insensitively against the existing
+                            # accumulated list.
+                            rest = [
+                                c for c in all_capabilities
+                                if c.lower() != top_cap.lower()
+                            ]
+                            all_capabilities = [top_cap] + rest
+                    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+                        logger.warning("Scan consolidation failed for %s: %s",
+                                       project_name, e)
+
                 content = json.dumps({
                     "capabilities": all_capabilities,
                     "imports_from": all_imports,
-                    "architecture": all_architectures[0] if all_architectures else "",
+                    "architecture": architecture,
                 })
                 return SynthesisResult(
                     query="scan",
