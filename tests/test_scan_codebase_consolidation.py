@@ -49,6 +49,20 @@ def test_collapse_preserves_distinct_capabilities_and_order():
     assert len(out) == 3
 
 
+def test_collapse_groups_multiword_variants_via_for_connector():
+    # Variants are multi-word ("Traditional Chinese") — the " for " connector
+    # must keep them together rather than splitting on the final token (P2).
+    caps = [
+        "Language Support for Traditional Chinese",
+        "Language Support for Simplified Chinese",
+        "Language Support for Brazilian Portuguese",
+    ]
+    out = collapse_capability_families(caps)
+    assert len(out) == 1
+    assert out[0].startswith("Language Support for (3 variants:")
+    assert "Traditional Chinese" in out[0]
+
+
 def test_collapse_leaves_small_families_untouched():
     # Only 2 members — below _CAP_FAMILY_MIN (3): must stay verbatim.
     caps = ["Export to PDF", "Export to CSV"]
@@ -132,23 +146,23 @@ async def _run_scan(tmp_path, reviewer):
 
 
 @pytest.mark.asyncio
-async def test_consolidation_overrides_first_chunk_architecture(tmp_path):
+async def test_consolidation_overrides_architecture_without_injecting_capability(tmp_path):
     """The misleading per-chunk architecture ('CLI tool') is replaced by the
-    consolidated intent, and the consolidated top capability is promoted to the
-    front of the capability list."""
+    consolidated intent. A NOVEL top_capability (not extracted by any chunk) must
+    NOT be injected into the capability list — capabilities stay AST-verified
+    (P1); only the architecture narrative reflects the model's framing."""
     reviewer = _FakeReviewer(
         chunk_arch="CLI tool",
         chunk_caps=["Run benchmark sessions"],
         consolidate={
             "architecture": "shell-output compression proxy",
-            "top_capability": "Compress shell command output",
+            "top_capability": "Compress shell command output",  # never extracted
         },
     )
     data = await _run_scan(tmp_path, reviewer)
     assert data["architecture"] == "shell-output compression proxy"
-    assert data["capabilities"][0] == "Compress shell command output"
-    # the original chunk capability is retained behind the promoted one
-    assert "Run benchmark sessions" in data["capabilities"]
+    # novel capability NOT injected — only the real chunk capability remains
+    assert data["capabilities"] == ["Run benchmark sessions"]
 
 
 @pytest.mark.asyncio

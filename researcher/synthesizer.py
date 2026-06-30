@@ -1311,14 +1311,24 @@ class Synthesizer:
                             architecture = arch2
                         top_cap = str(cdata.get("top_capability", "")).strip()
                         if top_cap:
-                            # Promote the consolidated top capability to the front,
-                            # de-duplicating case-insensitively against the existing
-                            # accumulated list.
-                            rest = [
-                                c for c in all_capabilities
-                                if c.lower() != top_cap.lower()
-                            ]
-                            all_capabilities = [top_cap] + rest
+                            # REORDER ONLY — never inject. The consolidation prompt
+                            # may invent a capability, but scan_codebase capabilities
+                            # are treated downstream as AST-verified (ingest_github
+                            # stores an ``implements`` triple per item). Promote the
+                            # consolidated pick to the front only when a chunk already
+                            # extracted it; a novel top_capability is used for
+                            # architecture framing but NOT added as a verified
+                            # capability.
+                            lowered = top_cap.lower()
+                            match = next(
+                                (c for c in all_capabilities if c.lower() == lowered),
+                                None,
+                            )
+                            if match is not None:
+                                rest = [
+                                    c for c in all_capabilities if c.lower() != lowered
+                                ]
+                                all_capabilities = [match] + rest
                     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                         logger.warning("Scan consolidation failed for %s: %s",
                                        project_name, e)

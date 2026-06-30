@@ -235,41 +235,55 @@ def collapse_capability_families(
 
     README capability extraction frequently emits one entry per enumerated
     value — e.g. ``"Language Support for English"``, ``"Language Support for
-    French"`` … 24 times — which are noise, not distinct features. Any group of
-    ``>= min_family`` capabilities sharing the same leading words (everything but
-    the final token) collapses to a single ``"<prefix> (N variants: a, b, …)"``
-    entry, emitted at the position of the family's first member. Order and all
-    non-family capabilities are preserved unchanged.
+    French"`` … 24 times — which are noise, not distinct features. Capabilities
+    are grouped by a shared ``"<stem> for <variant>"`` enumerator when present
+    (so multi-word variants like ``"Traditional Chinese"`` stay intact),
+    otherwise by everything-but-the-final-token. Any group of ``>= min_family``
+    members collapses to a single ``"<prefix> (N variants: a, b, …)"`` entry at
+    the position of the family's first member. Order and all non-family
+    capabilities are preserved unchanged.
     """
-    # prefix key (all words but the last) -> list of (orig_index, capability)
-    groups: "Dict[str, list]" = {}
-    for idx, cap in enumerate(capabilities):
-        words = str(cap).split()
+    def _split(cap: str):
+        """Return ``(group_key, prefix, variant)`` or ``None`` if too short to
+        ever form a family. Prefers the ``" for "`` enumerator connector so
+        multi-word variants are not split mid-phrase."""
+        s = str(cap).strip()
+        pos = s.lower().rfind(" for ")
+        if 0 < pos < len(s) - 5:
+            prefix = s[: pos + 4]            # "<stem> for"
+            variant = s[pos + 5:].strip()
+            if prefix and variant:
+                return prefix.lower(), prefix, variant
+        words = s.split()
         # Need at least a 2-word prefix + a trailing token to form a family;
         # single/two-word capabilities are never collapsed.
         if len(words) < 3:
-            groups.setdefault(f"\0{idx}", []).append((idx, cap))
-            continue
-        key = " ".join(words[:-1]).lower()
-        groups.setdefault(key, []).append((idx, cap))
+            return None
+        return " ".join(words[:-1]).lower(), " ".join(words[:-1]), words[-1]
 
-    out: list = []
+    # group_key -> list of (orig_index, prefix, variant); ungroupable caps keyed
+    # uniquely so they always pass through in place.
+    groups: "Dict[str, list]" = {}
+    for idx, cap in enumerate(capabilities):
+        parsed = _split(cap)
+        if parsed is None:
+            groups[f"\0{idx}"] = [(idx, str(cap), None)]
+            continue
+        key, prefix, variant = parsed
+        groups.setdefault(key, []).append((idx, prefix, variant))
+
     emitted_at: "Dict[int, object]" = {}
     for key, members in groups.items():
         if len(members) >= min_family and not key.startswith("\0"):
-            first_idx = members[0][0]
-            prefix = " ".join(str(members[0][1]).split()[:-1])
-            variants = [str(c).split()[-1] for _, c in members]
+            first_idx, prefix, _ = members[0]
+            variants = [v for _, _, v in members]
             shown = ", ".join(variants[:6]) + ("…" if len(variants) > 6 else "")
             emitted_at[first_idx] = f"{prefix} ({len(members)} variants: {shown})"
         else:
-            for idx, cap in members:
-                emitted_at[idx] = cap
+            for idx, _, _ in members:
+                emitted_at[idx] = capabilities[idx]
 
-    for idx in range(len(capabilities)):
-        if idx in emitted_at:
-            out.append(emitted_at[idx])
-    return out
+    return [emitted_at[idx] for idx in range(len(capabilities)) if idx in emitted_at]
 
 
 class ResearchPipeline:
