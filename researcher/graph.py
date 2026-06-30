@@ -120,13 +120,24 @@ def build_concept_matrix(
     paper_set: Set[str] = set()
 
     for t in all_triples:
-        # A triple may now carry several provenance tokens (a905176b); credit
-        # every distinct paper that backs it, not just the first source. Each
-        # cell gets the triple's aggregate confidence (the max across sources)
-        # — per-source confidence isn't exposed on Triple yet, so a weak paper
-        # co-asserting a strong fact is over-credited. Tracked in b0aa1788.
+        # A triple may carry several provenance tokens (a905176b); credit every
+        # distinct paper that backs it, not just the first source. Each cell now
+        # gets THAT paper's own confidence (cecbd365) — confidence_for() returns
+        # the per-source value and falls back to the aggregate when the source
+        # has no side-table entry — so a weak paper co-asserting a strong fact is
+        # credited at its own strength, not the strongest contributor's.
         for source in t.sources:
             if not source.startswith("paper:"):
+                continue
+            source_conf = t.confidence_for(source)
+            # The fetch gate (min_confidence) only filters on the aggregate max,
+            # so a co-sourced triple can pass on a STRONG contributor while a weak
+            # one rides along below threshold. Now that per-source confidence is
+            # available, gate each contributor individually so a sub-threshold
+            # paper doesn't create a matrix connection it didn't earn (cecbd365).
+            # Legacy triples without side-table rows fall back to the aggregate,
+            # which already cleared the gate — so they're unaffected.
+            if source_conf < min_confidence:
                 continue
 
             # Subject is a concept, source is a paper
@@ -134,7 +145,7 @@ def build_concept_matrix(
                 concept_papers[t.subject][source] = MatrixCell()
             cell = concept_papers[t.subject][source]
             cell.predicates.append(t.predicate)
-            cell.confidence = max(cell.confidence, t.confidence)
+            cell.confidence = max(cell.confidence, source_conf)
             paper_set.add(source)
 
             # Object is also a concept connected to this paper
@@ -142,7 +153,7 @@ def build_concept_matrix(
                 concept_papers[t.object][source] = MatrixCell()
             cell2 = concept_papers[t.object][source]
             cell2.predicates.append(t.predicate)
-            cell2.confidence = max(cell2.confidence, t.confidence)
+            cell2.confidence = max(cell2.confidence, source_conf)
 
     # Filter to concepts with enough connections
     filtered = {
