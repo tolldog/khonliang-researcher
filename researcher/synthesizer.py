@@ -797,8 +797,14 @@ class Synthesizer:
         all_triples = self.triples.get(min_confidence=0.3, limit=5000)
         for t in all_triples:
             # A triple may have several sources (a905176b) — credit each paper.
+            # The fetch gate is on the aggregate max, so per-source gate each
+            # contributor (cecbd365) to avoid crediting a paper that only weakly
+            # co-asserts a fact a stronger paper carries. Legacy triples fall back
+            # to the aggregate, which already cleared the gate.
             for source in t.sources:
                 if not source.startswith("paper:"):
+                    continue
+                if t.confidence_for(source) < 0.3:
                     continue
                 paper_id = source[len("paper:"):]
                 if t.subject in qualified:
@@ -919,8 +925,13 @@ class Synthesizer:
         all_triples = self.triples.get(min_confidence=0.3, limit=5000)
         for t in all_triples:
             # A triple may have several sources (a905176b) — credit each paper.
+            # Per-source gate each contributor (cecbd365): the fetch gate is on
+            # the aggregate max, so a weak co-asserting paper would otherwise be
+            # credited. Legacy triples fall back to the aggregate (already gated).
             for source in t.sources:
                 if not source.startswith("paper:"):
+                    continue
+                if t.confidence_for(source) < 0.3:
                     continue
                 paper_id = source[len("paper:"):]
                 if t.subject in qualified:
