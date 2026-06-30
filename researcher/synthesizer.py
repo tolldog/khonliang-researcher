@@ -756,9 +756,11 @@ class Synthesizer:
         concept_papers: Dict[str, List[str]] = defaultdict(list)
         all_triples = self.triples.get(min_confidence=0.3, limit=5000)
         for t in all_triples:
-            source = t.source or ""
-            if source.startswith("paper:"):
-                paper_id = source.replace("paper:", "")
+            # A triple may have several sources (a905176b) — credit each paper.
+            for source in t.sources:
+                if not source.startswith("paper:"):
+                    continue
+                paper_id = source[len("paper:"):]
                 if t.subject in qualified:
                     concept_papers[t.subject].append(paper_id)
                 if t.object in qualified:
@@ -876,9 +878,11 @@ class Synthesizer:
         concept_papers: Dict[str, List[str]] = defaultdict(list)
         all_triples = self.triples.get(min_confidence=0.3, limit=5000)
         for t in all_triples:
-            source = t.source or ""
-            if source.startswith("paper:"):
-                paper_id = source.replace("paper:", "")
+            # A triple may have several sources (a905176b) — credit each paper.
+            for source in t.sources:
+                if not source.startswith("paper:"):
+                    continue
+                paper_id = source[len("paper:"):]
                 if t.subject in qualified:
                     concept_papers[t.subject].append(paper_id)
                 if t.object in qualified:

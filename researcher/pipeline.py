@@ -753,16 +753,21 @@ class ResearchPipeline:
             self.knowledge.remove(summary_id)
             removed["summary"] = True
 
-        # Remove triples sourced from this entry — papers tag
-        # ``paper:<id>`` and ideas/blogs tag ``idea:<id>``
-        # (bug_khonliang-researcher_4acd9bbd), so strike must clear both or an
-        # idea's triples would dangle in the concept graph after removal.
-        entry_sources = {f"paper:{entry_id}", f"idea:{entry_id}"}
+        # Retract this entry's provenance from its triples — papers tag
+        # ``paper:<id>`` and ideas/blogs tag ``idea:<id>``. ``remove_source``
+        # drops only our token and deletes the triple solely when no other
+        # contributor remains, so a fact another paper/blog also asserts
+        # survives the strike (bug_khonliang-researcher_a905176b). A triple
+        # only gets struck once even if both tokens somehow match.
         all_triples = self.triples.get(limit=10000)
         for t in all_triples:
-            if (t.source or "") in entry_sources:
-                self.triples.remove(t.subject, t.predicate, t.object)
-                removed["triples"] += 1
+            tokens = set(t.sources)
+            for src in (f"paper:{entry_id}", f"idea:{entry_id}"):
+                if src in tokens and self.triples.remove_source(
+                    t.subject, t.predicate, t.object, src
+                ):
+                    removed["triples"] += 1
+                    break
 
         # Remove the paper itself
         self.knowledge.remove(entry_id)
@@ -913,25 +918,10 @@ class ResearchPipeline:
             subject = triple["subject"]
             predicate = triple.get("predicate", "related_to")
             obj = triple["object"]
-            # Don't retag an existing triple's provenance. TripleStore.add()
-            # overwrites ``source`` on re-add (and takes max() confidence), so a
-            # blog repeating a paper's SPO would steal its ``paper:<id>`` source
-            # and break strike() on both. Only contribute genuinely-new triples
-            # from ideas; an already-stored triple keeps its (higher-certainty)
-            # paper provenance. ``get`` normalizes the predicate the same way
-            # ``add`` does, so this match is alias-safe.
-            #
-            # Limitation: TripleStore holds a single source per SPO, so a triple
-            # extracted by two ideas is attributed to whichever ingested first
-            # (striking it then drops a triple the second idea still supports).
-            # This pre-dates this change — distill has the same single-source
-            # behavior for two papers sharing an SPO — and a full fix needs
-            # multi-source support in the lib, tracked in
-            # bug_khonliang-researcher_a905176b. Skip-if-exists is strictly safer
-            # than the prior overwrite: it preserves the higher-certainty paper
-            # provenance instead of clobbering it.
-            if self.triples.get(subject=subject, predicate=predicate, obj=obj, limit=1):
-                continue
+            # TripleStore.add() unions sources per SPO and keeps max() confidence
+            # (a905176b), so a blog repeating a paper's triple adds an
+            # ``idea:<id>`` source alongside the paper's without stealing it or
+            # downgrading confidence — and strike() removes only our source.
             try:
                 base = float(triple.get("confidence", 0.7))
             except (TypeError, ValueError):

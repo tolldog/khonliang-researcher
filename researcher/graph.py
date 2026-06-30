@@ -120,10 +120,16 @@ def build_concept_matrix(
     paper_set: Set[str] = set()
 
     for t in all_triples:
-        source = t.source or ""
+        # A triple may now carry several provenance tokens (a905176b); credit
+        # every distinct paper that backs it, not just the first source. Each
+        # cell gets the triple's aggregate confidence (the max across sources)
+        # — per-source confidence isn't exposed on Triple yet, so a weak paper
+        # co-asserting a strong fact is over-credited. Tracked in b0aa1788.
+        for source in t.sources:
+            if not source.startswith("paper:"):
+                continue
 
-        # Subject is a concept, source is a paper
-        if source.startswith("paper:"):
+            # Subject is a concept, source is a paper
             if source not in concept_papers[t.subject]:
                 concept_papers[t.subject][source] = MatrixCell()
             cell = concept_papers[t.subject][source]
@@ -254,8 +260,8 @@ def build_concept_graph(
         if t.predicate not in subj_node.connections[t.object]:
             subj_node.connections[t.object].append(t.predicate)
 
-        # Count papers
-        if t.source and t.source.startswith("paper:"):
+        # Count papers — any paper among the triple's sources counts
+        if any(s.startswith("paper:") for s in t.sources):
             subj_node.paper_count = max(subj_node.paper_count, 1)
             nodes[t.object].paper_count = max(nodes[t.object].paper_count, 1)
 

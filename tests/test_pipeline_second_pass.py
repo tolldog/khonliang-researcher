@@ -101,6 +101,39 @@ def test_strike_removes_all_url_index_aliases():
     assert pipe._url_index == {"https://other": "e2"}
 
 
+def test_strike_retracts_only_its_source_keeping_co_supported_triples(tmp_path):
+    """A triple asserted by both a paper and a blog must survive striking the
+    paper — strike() retracts just the paper's source via remove_source, and
+    deletes the triple only when no contributor remains (a905176b)."""
+    from khonliang.knowledge.triples import TripleStore
+
+    triples = TripleStore(str(tmp_path / "t.db"))
+    # One triple co-asserted by paper p1 and idea i1; one only by p1.
+    triples.add("A", "rel", "B", confidence=0.9, source="paper:p1")
+    triples.add("A", "rel", "B", confidence=0.4, source="idea:i1")
+    triples.add("X", "rel", "Y", confidence=0.8, source="paper:p1")
+
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.knowledge = SimpleNamespace(
+        get=lambda _id: None if str(_id).endswith("_summary")
+        else SimpleNamespace(title="P1", metadata={"url": ""}),
+        remove=lambda *a, **k: None,
+    )
+    pipe.triples = triples
+    pipe.digest = SimpleNamespace(record=lambda **k: None)
+    pipe._url_index = {}
+
+    result = pipe.strike("p1")
+
+    # Only X-rel-Y (sole paper:p1 support) is deleted; A-rel-B survives on idea:i1.
+    assert result["triples"] == 1
+    survivors = {(t.subject, t.object): t for t in triples.get(limit=100)}
+    assert ("X", "Y") not in survivors
+    ab = survivors[("A", "B")]
+    assert ab.sources == ["idea:i1"]
+    assert ab.confidence == 0.4          # recomputed down from the struck paper
+
+
 def test_get_historical_feature_requests_tolerates_non_dict_json():
     """An FR entry whose content is valid JSON but not an object (list/scalar)
     must not blow up the **fr_data spread; degrade that row to a title-only
@@ -263,7 +296,7 @@ async def test_ingest_url_with_body_blank_content_type_normalized():
 # ---------------------------------------------------------------------------
 
 
-def _idea_pipe(parsed, extracted=None, config=None, existing_spo=None):
+def _idea_pipe(parsed, extracted=None, config=None):
     pipe = ResearchPipeline.__new__(ResearchPipeline)
     captured = {"triples": []}
     pipe.knowledge = SimpleNamespace(add=lambda e: captured.__setitem__("entry", e))
@@ -280,15 +313,7 @@ def _idea_pipe(parsed, extracted=None, config=None, existing_spo=None):
         captured["extract_input"] = text
         return _as_async(extract_resp)
     pipe.extractor = SimpleNamespace(handle=_extract)
-    # ``existing_spo``: set of (subject, predicate, object) already in the store
-    # so ``_extract_idea_triples`` skips them (provenance-preservation path).
-    existing = existing_spo or set()
-    pipe.triples = SimpleNamespace(
-        add=lambda **k: captured["triples"].append(k),
-        get=lambda subject=None, predicate=None, obj=None, limit=None: (
-            [object()] if (subject, predicate, obj) in existing else []
-        ),
-    )
+    pipe.triples = SimpleNamespace(add=lambda **k: captured["triples"].append(k))
     pipe.config = config or {}
     return pipe, captured
 
@@ -416,21 +441,23 @@ async def test_ingest_idea_appends_label_suffix_to_derived_title():
 
 
 @pytest.mark.asyncio
-async def test_ingest_idea_skips_triples_already_in_store():
-    # An SPO already present (e.g. from a paper) must NOT be re-added by an
-    # idea — that would overwrite its source/provenance (Codex P1).
+async def test_ingest_idea_adds_all_triples_with_idea_source():
+    # All extracted triples are stored tagged source="idea:<id>". An SPO also
+    # asserted by a paper is no longer skipped — TripleStore.add() unions the
+    # idea source alongside the paper's and keeps max() confidence, so paper
+    # provenance survives without an idea-side guard (a905176b).
     pipe, captured = _idea_pipe(
         {"success": True, "title": "t", "claims": [], "search_queries": []},
         extracted=[
-            {"subject": "A", "predicate": "rel", "object": "B"},   # already exists
-            {"subject": "C", "predicate": "rel", "object": "D"},   # new
+            {"subject": "A", "predicate": "rel", "object": "B"},   # also a paper's
+            {"subject": "C", "predicate": "rel", "object": "D"},   # idea-only
         ],
-        existing_spo={("A", "rel", "B")},
     )
-    await pipe.ingest_idea("body")
+    eid = await pipe.ingest_idea("body")
     stored = captured["triples"]
-    assert len(stored) == 1 and stored[0]["subject"] == "C"
-    assert captured["digest"]["metadata"]["triple_count"] == 1
+    assert len(stored) == 2
+    assert all(t["source"] == f"idea:{eid}" for t in stored)
+    assert captured["digest"]["metadata"]["triple_count"] == 2
 
 
 @pytest.mark.asyncio
