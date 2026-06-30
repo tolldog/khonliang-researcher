@@ -221,6 +221,71 @@ def _cap_title(title: str) -> str:
     return (cut or title[:_IDEA_TITLE_MAX_CHARS].rstrip()) + "…"
 
 
+# Minimum members an enumerated capability family must have before it is
+# rolled up into a single entry (FR 97eb7550, dog_36ae942f: a README's 24
+# "Language Support for <lang>" claims should collapse to one capability so
+# they don't dilute find_relevant scoring).
+_CAP_FAMILY_MIN = 3
+
+
+def collapse_capability_families(
+    capabilities: list, min_family: int = _CAP_FAMILY_MIN
+) -> list:
+    """Roll up enumerated capability families that differ only by a trailing token.
+
+    README capability extraction frequently emits one entry per enumerated
+    value — e.g. ``"Language Support for English"``, ``"Language Support for
+    French"`` … 24 times — which are noise, not distinct features. Capabilities
+    are grouped by a shared ``"<stem> for <variant>"`` enumerator when present
+    (so multi-word variants like ``"Traditional Chinese"`` stay intact),
+    otherwise by everything-but-the-final-token. Any group of ``>= min_family``
+    members collapses to a single ``"<prefix> (N variants: a, b, …)"`` entry at
+    the position of the family's first member. Order and all non-family
+    capabilities are preserved unchanged.
+    """
+    def _split(cap: str):
+        """Return ``(group_key, prefix, variant)`` or ``None`` if too short to
+        ever form a family. Prefers the ``" for "`` enumerator connector so
+        multi-word variants are not split mid-phrase."""
+        s = str(cap).strip()
+        pos = s.lower().rfind(" for ")
+        if 0 < pos < len(s) - 5:
+            prefix = s[: pos + 4]            # "<stem> for"
+            variant = s[pos + 5:].strip()
+            if prefix and variant:
+                return prefix.lower(), prefix, variant
+        words = s.split()
+        # Need at least a 2-word prefix + a trailing token to form a family;
+        # single/two-word capabilities are never collapsed.
+        if len(words) < 3:
+            return None
+        return " ".join(words[:-1]).lower(), " ".join(words[:-1]), words[-1]
+
+    # group_key -> list of (orig_index, prefix, variant); ungroupable caps keyed
+    # uniquely so they always pass through in place.
+    groups: "Dict[str, list]" = {}
+    for idx, cap in enumerate(capabilities):
+        parsed = _split(cap)
+        if parsed is None:
+            groups[f"\0{idx}"] = [(idx, str(cap), None)]
+            continue
+        key, prefix, variant = parsed
+        groups.setdefault(key, []).append((idx, prefix, variant))
+
+    emitted_at: "Dict[int, object]" = {}
+    for key, members in groups.items():
+        if len(members) >= min_family and not key.startswith("\0"):
+            first_idx, prefix, _ = members[0]
+            variants = [v for _, _, v in members]
+            shown = ", ".join(variants[:6]) + ("…" if len(variants) > 6 else "")
+            emitted_at[first_idx] = f"{prefix} ({len(members)} variants: {shown})"
+        else:
+            for idx, _, _ in members:
+                emitted_at[idx] = capabilities[idx]
+
+    return [emitted_at[idx] for idx in range(len(capabilities)) if idx in emitted_at]
+
+
 class ResearchPipeline:
     """Main orchestrator for the research paper pipeline."""
 
@@ -1601,9 +1666,15 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                         except Exception:
                             pass
 
-                # Merge capabilities: code-verified first, then README-only claims
+                # Merge capabilities: code-verified first, then README-only claims.
+                # Collapse enumerated README families (e.g. 24x "Language Support
+                # for <lang>") so they don't dilute relevance scoring (FR 97eb7550).
+                # Code-verified capabilities are left untouched — only the noisier
+                # README-derived claims are rolled up.
                 code_set = {c.lower() for c in code_capabilities}
-                readme_only = [c for c in readme_claims if c.lower() not in code_set]
+                readme_only = collapse_capability_families(
+                    [c for c in readme_claims if c.lower() not in code_set]
+                )
                 capabilities = code_capabilities + readme_only
 
                 # Build concept summary (no code stored)
