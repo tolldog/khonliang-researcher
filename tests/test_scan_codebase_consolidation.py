@@ -86,13 +86,17 @@ class _FakeReviewer:
     otherwise the per-chunk scan answer. Branch on the unique 'OVERARCHING'
     marker that only ``_SCAN_CONSOLIDATE_PROMPT`` carries."""
 
-    def __init__(self, *, chunk_arch: str, chunk_caps, consolidate: dict | None):
+    def __init__(self, *, chunk_arch: str, chunk_caps, consolidate: dict | None,
+                 consolidate_raises: bool = False):
         self.chunk_arch = chunk_arch
         self.chunk_caps = chunk_caps
         self.consolidate = consolidate
+        self.consolidate_raises = consolidate_raises
 
     async def generate(self, *, prompt, system, temperature, max_tokens):
         if "OVERARCHING" in prompt:
+            if self.consolidate_raises:
+                raise RuntimeError("simulated provider/transport failure")
             if self.consolidate is None:
                 return "not json — force fallback"
             return json.dumps(self.consolidate)
@@ -173,6 +177,37 @@ async def test_consolidation_failure_falls_back_to_first_chunk(tmp_path):
         chunk_arch="CLI tool",
         chunk_caps=["Run benchmark sessions"],
         consolidate=None,  # -> non-JSON -> fallback
+    )
+    data = await _run_scan(tmp_path, reviewer)
+    assert data["architecture"] == "CLI tool"
+    assert data["capabilities"] == ["Run benchmark sessions"]
+
+
+@pytest.mark.asyncio
+async def test_consolidation_call_failure_does_not_abort_scan(tmp_path):
+    """A transport/runtime error from the EXTRA consolidation call must degrade to
+    the chunk-derived architecture, not abort a scan whose chunks already
+    succeeded (codex P1 regression guard)."""
+    reviewer = _FakeReviewer(
+        chunk_arch="CLI tool",
+        chunk_caps=["Run benchmark sessions"],
+        consolidate=None,
+        consolidate_raises=True,
+    )
+    data = await _run_scan(tmp_path, reviewer)
+    assert data["architecture"] == "CLI tool"
+    assert data["capabilities"] == ["Run benchmark sessions"]
+
+
+@pytest.mark.asyncio
+async def test_consolidation_null_fields_preserve_fallback(tmp_path):
+    """JSON null for architecture/top_capability must be ignored (not stringified
+    to the literal 'None'); the chunk-derived architecture is preserved (codex
+    P2)."""
+    reviewer = _FakeReviewer(
+        chunk_arch="CLI tool",
+        chunk_caps=["Run benchmark sessions"],
+        consolidate={"architecture": None, "top_capability": None},
     )
     data = await _run_scan(tmp_path, reviewer)
     assert data["architecture"] == "CLI tool"

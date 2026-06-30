@@ -1306,10 +1306,14 @@ class Synthesizer:
                         if cj.endswith("```"):
                             cj = "\n".join(cj.split("\n")[:-1])
                         cdata = json.loads(cj)
-                        arch2 = str(cdata.get("architecture", "")).strip()
+                        # Guard against JSON null / non-string values: ``str(None)``
+                        # would store the literal "None" as the architecture.
+                        raw_arch = cdata.get("architecture")
+                        arch2 = raw_arch.strip() if isinstance(raw_arch, str) else ""
                         if arch2:
                             architecture = arch2
-                        top_cap = str(cdata.get("top_capability", "")).strip()
+                        raw_top = cdata.get("top_capability")
+                        top_cap = raw_top.strip() if isinstance(raw_top, str) else ""
                         if top_cap:
                             # REORDER ONLY — never inject. The consolidation prompt
                             # may invent a capability, but scan_codebase capabilities
@@ -1329,7 +1333,13 @@ class Synthesizer:
                                     c for c in all_capabilities if c.lower() != lowered
                                 ]
                                 all_capabilities = [match] + rest
-                    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+                    except Exception as e:
+                        # Best-effort enhancement: ANY failure (malformed JSON, or
+                        # an operational error from the extra LLM call — timeout,
+                        # provider/transport exception) must degrade to the
+                        # chunk-derived architecture rather than abort a scan whose
+                        # chunk results already succeeded. CancelledError is
+                        # BaseException on 3.11+, so it still propagates.
                         logger.warning("Scan consolidation failed for %s: %s",
                                        project_name, e)
 
