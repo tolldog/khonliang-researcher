@@ -18,7 +18,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 import yaml
 
@@ -2217,6 +2217,50 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         if triple_context:
             parts.append(f"## Known Relationships\n{triple_context}")
         return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Concept-graph-over-RAG: two-call described-registry consumer
+    # ------------------------------------------------------------------
+
+    def _concept_registry(
+        self, *, min_confidence: float = 0.5, max_branches: int = 3
+    ):
+        """Build a DescribedRegistry over this pipeline's concept graph."""
+        from researcher.concept_registry import build_concept_registry
+
+        return build_concept_registry(
+            self.knowledge,
+            self.triples,
+            min_confidence=min_confidence,
+            max_branches=max_branches,
+        )
+
+    async def concept_index(
+        self, scope: Optional[str] = None, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Cheap concept catalog: [{id, description, meta?}].
+
+        The token-small first call of the two-call retrieval contract — the LLM
+        scans this, picks the closest concept(s), then issues one batched
+        ``concept_expand``. Descriptions are synthesized from each concept's own
+        graph relations.
+        """
+        registry = self._concept_registry()
+        entries = await registry.index(scope=scope, limit=limit)
+        return [e.to_dict() for e in entries]
+
+    async def concept_expand(
+        self, ids: Sequence[str], depth: int = 1
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batched nearest-match expansion: {id: {detail, connected}}.
+
+        For each chosen concept id, returns matching KnowledgeStore sections
+        (RAG detail) plus connected concepts walked out to ``depth`` via the
+        concept graph. Batches over one or more ids in a single call.
+        """
+        registry = self._concept_registry()
+        result = await registry.expand(ids, depth=depth)
+        return {k: v.to_dict() for k, v in result.items()}
 
     # ------------------------------------------------------------------
     # Evidence-source catalog
