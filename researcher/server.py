@@ -820,6 +820,10 @@ Most tools accept detail="compact|brief|full":
         batch_size=0 means process all pending. Otherwise process N papers.
         Returns progress when done.
         """
+        # Reclaim papers orphaned by a dead distiller before the queue-depth
+        # check — otherwise a queue holding only crashed-owner PROCESSING rows
+        # reports 0 pending and returns early, never draining them (bug abfe679b).
+        pipeline.recover_stalled_processing()
         pending = worker.count_pending()
         if pending == 0:
             return "No pending papers to distill."

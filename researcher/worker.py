@@ -44,7 +44,15 @@ class DistillWorker(BaseQueueWorker):
         return len(self.pipeline.knowledge.get_by_status(EntryStatus.INGESTED, tier=Tier.IMPORTED))
 
     def get_next(self):
-        """Get next ingested paper, skipping papers that failed too many times."""
+        """Get next ingested paper, skipping papers that failed too many times.
+
+        Reclaims papers orphaned by a dead distiller first (bug abfe679b). The
+        run loop calls get_next every drain / idle-poll cycle, so this recovers
+        orphans that appear AFTER startup too — a sibling drainer killed mid-
+        distill — with no restart. Safe every call: recovery only touches papers
+        whose lock owner is gone, never a live in-flight distill.
+        """
+        self.pipeline.recover_stalled_processing()
         for entry in self.pipeline.knowledge.get_by_status(EntryStatus.INGESTED, tier=Tier.IMPORTED):
             retries = self._failed_ids.get(entry.id, 0)
             if retries < self.max_retries_per_item:
