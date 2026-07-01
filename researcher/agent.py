@@ -1033,6 +1033,9 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 "entry_id": entry_id,
                 "title": result.title,
                 "success": result.success,
+                # skipped == another drainer is already distilling this paper; a
+                # distinct, non-error outcome (not a failure) — bug abfe679b.
+                "skipped": getattr(result, "skipped", False),
                 "triples": len(result.triples),
                 "assessments": len(result.assessments),
             }

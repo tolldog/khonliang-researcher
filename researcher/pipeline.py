@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +35,7 @@ from researcher.queue import PaperFetcher, ListParser
 from researcher.idea import IdeaParserRole
 from khonliang_researcher import RelevanceScorer
 from researcher.roles import SummarizerRole, ExtractorRole, AssessorRole
+from researcher.distill_lock import DistillLockStore
 from researcher.search_engines import search_papers
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,9 @@ class DistillResult:
     triples: List[Dict[str, Any]] = field(default_factory=list)
     assessments: Dict[str, Any] = field(default_factory=dict)
     success: bool = False
+    # True when distill was a no-op because a live owner already holds the lock
+    # — a skip, NOT a failure (must not count against a worker's retry budget).
+    skipped: bool = False
 
 
 def is_paper_entry(entry: KnowledgeEntry) -> bool:
@@ -302,6 +307,10 @@ class ResearchPipeline:
         self.digest = digest
         self.pool = pool
         self.config = config or {}
+        # Per-paper distill ownership locks, in the shared knowledge DB so all
+        # drainers (embedded worker + on-demand start_distillation + standalone
+        # worker) coordinate cross-process (bug abfe679b).
+        self.locks = DistillLockStore(knowledge.db_path)
 
         # Domain rules — injected into LLM prompts for domain-specific evaluation.
         # Generic researcher has no rules; domain researchers add them via config.
@@ -691,51 +700,84 @@ class ResearchPipeline:
             return DistillResult(entry_id=entry_id, title="NOT FOUND")
 
         result = DistillResult(entry_id=entry_id, title=entry.title)
-        self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)
 
-        # Step 1: Summarize (must complete before extraction/assessment)
-        summary_resp = await self.summarizer.handle(entry.content)
-        if not summary_resp.get("success"):
-            logger.warning("Summarization failed for %s", entry_id)
+        # Take the distill lock. If a LIVE owner already holds it, another drainer
+        # is on this paper — skip rather than double-distill (bug abfe679b).
+        if not self.locks.claim(entry_id):
+            logger.info("Distill skipped for %s — held by a live owner", entry_id)
+            # A skip is NOT a successful distill (no summary/triples produced) and
+            # NOT a failure. success stays False so distilled-counters
+            # (sum(r.success)) correctly exclude it; skipped=True lets the few
+            # failure-recording callers branch so they don't misreport it as an
+            # error. (abfe679b)
+            result.skipped = True
+            return result
+
+        self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)
+        try:
+            # Step 1: Summarize (must complete before extraction/assessment)
+            summary_resp = await self.summarizer.handle(entry.content)
+            if not summary_resp.get("success"):
+                logger.warning("Summarization failed for %s", entry_id)
+                self.knowledge.set_status(entry_id, EntryStatus.FAILED)
+                return result
+            result.summary = summary_resp["summary"]
+
+            # Step 2: Extract triples + assess all projects in parallel
+            summary_text = json.dumps(result.summary, indent=2)
+            projects = self.config.get("projects", {})
+
+            async def _extract():
+                resp = await self.extractor.handle(summary_text)
+                return resp.get("triples", []) if resp.get("success") else []
+
+            async def _assess(name, cfg):
+                resp = await self.assessor.handle(
+                    summary_text,
+                    context={"project_description": cfg.get("description", "")},
+                )
+                return name, resp.get("assessment") if resp.get("success") else None
+
+            # Fan out: 1 extraction + N assessments concurrently
+            tasks = [_extract()]
+            for proj_name, proj_cfg in projects.items():
+                tasks.append(_assess(proj_name, proj_cfg))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Collect results
+            result.triples = results[0] if not isinstance(results[0], Exception) else []
+            for r in results[1:]:
+                if isinstance(r, tuple) and r[1] is not None:
+                    result.assessments[r[0]] = r[1]
+
+            # Store results — marks the source entry DISTILLED
+            self._store_distillation(entry, result)
+        except Exception:
+            # An unhandled error (e.g. summarizer timeout) must set a terminal
+            # status, not leave the row PROCESSING. CancelledError is
+            # BaseException on 3.11+, so a shutdown/kill still propagates and
+            # leaves PROCESSING — reclaimed via the lock when the dead owner is
+            # noticed.
+            logger.warning("Distillation failed for %s", entry_id, exc_info=True)
+            # A mid-_store crash may have persisted partial summary/triples;
+            # clear them so a FAILED row leaves no stale artifacts behind.
+            self._clear_distillation_artifacts(entry_id)
             self.knowledge.set_status(entry_id, EntryStatus.FAILED)
             return result
-        result.summary = summary_resp["summary"]
+        finally:
+            self.locks.release(entry_id)
 
-        # Step 2: Extract triples + assess all projects in parallel
-        summary_text = json.dumps(result.summary, indent=2)
-        projects = self.config.get("projects", {})
-
-        async def _extract():
-            resp = await self.extractor.handle(summary_text)
-            return resp.get("triples", []) if resp.get("success") else []
-
-        async def _assess(name, cfg):
-            resp = await self.assessor.handle(
-                summary_text,
-                context={"project_description": cfg.get("description", "")},
+        # Past here the entry is persisted + DISTILLED and the lock is released.
+        # Recording the relevance signal is best-effort telemetry — a failure
+        # must NOT flip the (already distilled) entry to FAILED.
+        try:
+            await self.relevance.record_signal(
+                entry.title, entry.content, "positive"
             )
-            return name, resp.get("assessment") if resp.get("success") else None
-
-        # Fan out: 1 extraction + N assessments concurrently
-        tasks = [_extract()]
-        for proj_name, proj_cfg in projects.items():
-            tasks.append(_assess(proj_name, proj_cfg))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Collect results
-        result.triples = results[0] if not isinstance(results[0], Exception) else []
-        for r in results[1:]:
-            if isinstance(r, tuple) and r[1] is not None:
-                result.assessments[r[0]] = r[1]
-
-        # Store results
-        self._store_distillation(entry, result)
-
-        # Record positive signal — paper was worth distilling
-        await self.relevance.record_signal(
-            entry.title, entry.content, "positive"
-        )
+        except Exception:
+            logger.warning("record_signal failed for %s (entry already distilled)",
+                           entry_id, exc_info=True)
 
         result.success = True
         return result
@@ -772,23 +814,127 @@ class ResearchPipeline:
                     source=f"paper:{entry.id}",
                 )
 
-        # Mark original entry as distilled
+        # Mark original entry as distilled — the terminal, persisted state.
         self.knowledge.set_status(entry.id, EntryStatus.DISTILLED)
 
-        self.digest.record(
-            summary=f"Distilled paper: {entry.title} — {len(result.triples)} triples extracted",
-            source="pipeline",
-            audience="research",
-            tags=["distilled"],
-            metadata={
-                "entry_id": entry.id,
-                "triple_count": len(result.triples),
-                "projects_assessed": list(result.assessments.keys()),
-            },
-        )
+        # Digest is post-persist bookkeeping: the paper is already DISTILLED with
+        # its summary/triples stored, so a digest failure must not surface as a
+        # distillation failure (distill()'s guard would otherwise flip the row
+        # back to FAILED). Best-effort.
+        try:
+            self.digest.record(
+                summary=f"Distilled paper: {entry.title} — {len(result.triples)} triples extracted",
+                source="pipeline",
+                audience="research",
+                tags=["distilled"],
+                metadata={
+                    "entry_id": entry.id,
+                    "triple_count": len(result.triples),
+                    "projects_assessed": list(result.assessments.keys()),
+                },
+            )
+        except Exception:
+            logger.warning("digest.record failed for %s (entry already distilled)",
+                           entry.id, exc_info=True)
+
+    def recover_stalled_processing(self) -> int:
+        """Requeue papers whose distiller died back to INGESTED so they retry.
+
+        A crash / kill leaves a paper PROCESSING; its distill lock's owner PID is
+        no longer running, so any live drainer can detect and reclaim it (bug
+        abfe679b). Safe to call ANYTIME — a paper still held by a LIVE owner is
+        never touched, so no in-flight distill is disrupted and no work is
+        duplicated. No timers.
+
+        A PROCESSING row is an orphan iff it is not currently locked by a live
+        owner (dead-owner lock, or — defensively — no lock at all, e.g. a crash
+        between claim and the PROCESSING write, or pre-lock data).
+        """
+        # Sweep any stray dead-owner lock rows (atomic, owner-predicated) — e.g.
+        # a lock left behind if a release ever failed. The per-paper claim below
+        # is the real recovery gate; this is cheap hygiene.
+        self.locks.reclaim_dead()
+        count = 0
+        for entry in self.knowledge.get_by_status(EntryStatus.PROCESSING, tier=Tier.IMPORTED):
+            # Use the atomic claim itself as the gate: it succeeds only if no
+            # LIVE owner holds the paper (a dead owner's lock is stolen). Holding
+            # the claim means no other drainer can take the paper while we
+            # requeue it, so recovery can't race a concurrent distill (codex).
+            if not self.locks.claim(entry.id):
+                continue
+            try:
+                # Re-read under the claim: the previous owner may have FINISHED
+                # (DISTILLED) and released between our PROCESSING scan and the
+                # claim — in that case leave it alone, don't scrub a good result.
+                fresh = self.knowledge.get(entry.id)
+                if fresh is None or fresh.status != EntryStatus.PROCESSING:
+                    continue
+                # Genuine orphan. A crash mid-_store may have persisted PARTIAL
+                # artifacts (some paper:<id> triples / a summary); clear them so
+                # the retry starts clean and stale facts don't accumulate.
+                self._clear_distillation_artifacts(entry.id)
+                self.knowledge.set_status(entry.id, EntryStatus.INGESTED)
+                count += 1
+            finally:
+                self.locks.release(entry.id)
+        if count:
+            logger.info("Recovered %d orphaned PROCESSING paper(s) -> INGESTED", count)
+        return count
+
+    def _clear_distillation_artifacts(self, entry_id: str) -> Dict[str, int]:
+        """Remove a paper's distillation OUTPUTS (summary + its triple
+        provenance), keeping the paper entry itself so it can re-distill.
+
+        Mirrors the summary/triple removal in ``strike`` but does not delete the
+        paper. ``remove_source`` drops only this paper's ``paper:<id>`` /
+        ``idea:<id>`` token, so a fact another source also asserts survives.
+        """
+        removed = {"summary": 0, "triples": 0}
+        summary_id = f"{entry_id}_summary"
+        if self.knowledge.get(summary_id):
+            self.knowledge.remove(summary_id)
+            removed["summary"] = 1
+        # Find exactly this paper's triples via a READ-ONLY query on the
+        # triple_sources side-table. TripleStore.get() is NOT read-only — it bumps
+        # access_count and commits per row — so scanning it here would rewrite the
+        # whole table and skew decay on every recovery. remove_source drops only
+        # our token, so a fact another source also asserts survives.
+        for subject, predicate, obj, src in self._triples_for_sources(
+            (f"paper:{entry_id}", f"idea:{entry_id}")
+        ):
+            if self.triples.remove_source(subject, predicate, obj, src):
+                removed["triples"] += 1
+        return removed
+
+    def _triples_for_sources(self, sources) -> List[tuple]:
+        """Read-only ``(subject, predicate, object, source)`` rows whose source
+        token is one of ``sources`` — no ``access_count`` side-effect, indexed
+        join, not a full-table scan."""
+        sources = [s for s in sources if s]
+        if not sources:
+            return []
+        try:
+            conn = sqlite3.connect(f"file:{self.triples.db_path}?mode=ro", uri=True)
+        except sqlite3.OperationalError:
+            return []
+        try:
+            placeholders = ",".join("?" * len(sources))
+            return conn.execute(
+                "SELECT t.subject, t.predicate, t.object, ts.source "
+                "FROM triples t JOIN triple_sources ts ON ts.triple_id = t.id "
+                f"WHERE ts.source IN ({placeholders})",  # nosec B608 — placeholders only
+                sources,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # triple_sources absent (pre-migration) — nothing to clear
+        finally:
+            conn.close()
 
     async def distill_all_pending(self) -> List[DistillResult]:
         """Find and distill all papers that haven't been processed yet."""
+        # Reclaim papers orphaned by a dead distiller first, so this path drains
+        # them too — safe because recovery skips live-locked papers (abfe679b).
+        self.recover_stalled_processing()
         results = []
         for entry in self.knowledge.get_by_status(EntryStatus.INGESTED, tier=Tier.IMPORTED):
             result = await self.distill(entry.id)
@@ -2316,6 +2462,10 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                             result = await self.distill(entry_id)
                             if result.success:
                                 distilled += 1
+                            elif getattr(result, "skipped", False):
+                                # Another live drainer is distilling it — benign,
+                                # not a failure (abfe679b).
+                                pass
                             else:
                                 failed.append(
                                     {

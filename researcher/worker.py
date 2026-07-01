@@ -44,11 +44,25 @@ class DistillWorker(BaseQueueWorker):
         return len(self.pipeline.knowledge.get_by_status(EntryStatus.INGESTED, tier=Tier.IMPORTED))
 
     def get_next(self):
-        """Get next ingested paper, skipping papers that failed too many times."""
+        """Get next ingested paper, skipping papers that failed too many times.
+
+        Reclaims papers orphaned by a dead distiller first (bug abfe679b). The
+        run loop calls get_next every drain / idle-poll cycle, so this recovers
+        orphans that appear AFTER startup too — a sibling drainer killed mid-
+        distill — with no restart. Safe every call: recovery only touches papers
+        whose lock owner is gone, never a live in-flight distill.
+        """
+        self.pipeline.recover_stalled_processing()
         for entry in self.pipeline.knowledge.get_by_status(EntryStatus.INGESTED, tier=Tier.IMPORTED):
             retries = self._failed_ids.get(entry.id, 0)
-            if retries < self.max_retries_per_item:
-                return entry
+            if retries >= self.max_retries_per_item:
+                continue
+            # Skip papers a sibling drainer is actively distilling (live lock) —
+            # pick a different one instead of racing to a no-op claim. Avoids
+            # wasting a batch slot on a contention skip (abfe679b).
+            if self.pipeline.locks.is_locked_live(entry.id):
+                continue
+            return entry
         return None
 
     async def process_item(self, entry) -> bool:
@@ -59,6 +73,19 @@ class DistillWorker(BaseQueueWorker):
             return True
 
         result = await self.pipeline.distill(entry.id)
+        if getattr(result, "skipped", False):
+            # A live owner claimed the paper in the tiny window between get_next
+            # (which already filters live-locked papers) and distill's claim.
+            # It's neither a success nor a failure, but BaseQueueWorker.process_item
+            # is bool-only and run_batch consumes the batch slot regardless, so
+            # the sole lever is the stat. Report success (True): the paper IS
+            # being distilled (by the sibling) and will finish or be recovered on
+            # that owner's crash — returning False would spuriously fail it and
+            # burn its retry budget. Residual: a rare contention skip counts as
+            # "processed" in stats; a precise fix needs a BaseQueueWorker skip
+            # return type (follow-up).
+            logger.info("  SKIPPED (locked by another drainer): %s", entry.title[:60])
+            return True
         if result.success:
             triples = len(result.triples) if result.triples else 0
             logger.info(
