@@ -1,0 +1,306 @@
+"""
+Concept-graph-over-RAG consumer of the generic described-registry primitive.
+
+First new consumer of ``khonliang.registry.DescribedRegistry`` (FR
+fr_khonliang_0f3c7542): reduce flat-RAG to an as-needed concept graph behind a
+two-call API.
+
+- ``index()``  -> concepts + one-line descriptions (synthesized from each
+  concept's own graph relations — the "item's own summary").
+- ``expand([ids], depth)`` -> for each chosen concept: matching KnowledgeStore
+  sections (the RAG detail) + connected concepts walked out to ``depth`` via the
+  existing concept-graph.
+
+This composes existing primitives — ``build_concept_graph`` (the graph
+builder), ``KnowledgeStore.search`` (RAG sections), and ``TripleStore`` (edges)
+— rather than duplicating ``concept_tree`` / ``knowledge_search`` /
+``concept_context``. It is the unified two-call entry point *over* them: the LLM
+scans the cheap index, picks the closest concept(s), and issues ONE batched
+expand instead of receiving a flat top-k chunk dump.
+
+The graph algorithm still lives in the khonliang-researcher lib; this adapter
+consumes its structured ``EntityNode.connections`` output (BFS mirroring
+``trace_chain``'s depth/branch semantics) instead of the rendered ASCII string.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Sequence
+
+from khonliang.registry import (
+    DescribedRegistry,
+    ExpandedItem,
+    IndexEntry,
+)
+
+# Length caps that keep the index genuinely cheap.
+_DESC_MAX_RELATIONS = 3
+_DESC_MAX_CHARS = 120
+_DETAIL_SECTION_LIMIT = 3
+_DETAIL_SECTION_CHARS = 600
+
+
+# Direction cue for incoming (reverse) edges. `→` is how concept_tree renders
+# outgoing edges; `←other` reads as "other → this", preserving the true triple
+# direction so a sink like ConsensusEngine is never rendered as if it were the
+# subject (`MAGRPO used_by ConsensusEngine` -> `ConsensusEngine — ←used_by MAGRPO`,
+# i.e. "MAGRPO used_by ConsensusEngine", not the inverse).
+_INCOMING_MARK = "←"
+
+
+def _incoming_edges(graph: Dict[str, Any]) -> Dict[str, List[tuple]]:
+    """Reverse-edge index: ``{object: [(predicates_list, subject), ...]}``.
+
+    ``EntityNode.connections`` is directional (outgoing only), so sink concepts
+    that appear only as objects have no outgoing edges. One pass over the graph
+    gives every node its incoming relations — the FULL predicate list per edge is
+    kept so branch ranking and descriptions use true multiplicity, and direction
+    is preserved (these are edges *into* the node).
+    """
+    incoming: Dict[str, List[tuple]] = {}
+    for subj_name, node in graph.items():
+        for target, predicates in node.connections.items():
+            incoming.setdefault(target, []).append((list(predicates), subj_name))
+    return incoming
+
+
+def _degree(node: Any, incoming: List[tuple]) -> int:
+    """Total degree = outgoing + incoming edges (undirected connectedness)."""
+    return len(node.connections) + len(incoming)
+
+
+def _describe(name: str, node: Any, incoming: List[tuple]) -> str:
+    """
+    Synthesize a one-line description for a concept from its own graph relations.
+
+    No per-node summary is stored, so the concept's "own summary" is its top
+    relations. Prefer outgoing (``GRPO — improved_by MAGRPO``); fall back to
+    incoming for sink nodes that only appear as objects, marking direction so the
+    relationship is not inverted (``ConsensusEngine — ←used_by MAGRPO``).
+    Deterministic, no LLM.
+    """
+    rels: List[str] = []
+    for target, predicates in node.connections.items():
+        if not predicates:
+            continue
+        rels.append(f"{predicates[0]} {target}")
+        if len(rels) >= _DESC_MAX_RELATIONS:
+            break
+    # Sink / under-described node — summarize from incoming edges instead.
+    for predicates, subj in incoming:
+        if len(rels) >= _DESC_MAX_RELATIONS:
+            break
+        pred = predicates[0] if predicates else ""
+        if pred:
+            rels.append(f"{_INCOMING_MARK}{pred} {subj}")
+    if not rels:
+        desc = name
+    else:
+        desc = f"{name} — " + "; ".join(rels)
+    if len(desc) > _DESC_MAX_CHARS:
+        desc = desc[: _DESC_MAX_CHARS - 1].rstrip() + "…"
+    return desc
+
+
+class ConceptGraphAdapter:
+    """
+    ``ItemAdapter`` mapping the concept graph onto the described-registry
+    contract. Thin: it composes the lib graph builder + the stores, holds no
+    graph algorithm of its own.
+
+    Args:
+        knowledge: KnowledgeStore (RAG sections + build_concept_graph targets).
+        triples:   TripleStore (graph edges).
+        min_confidence: edge-confidence floor for graph construction.
+        max_branches:   per-node branch cap when walking connected concepts
+                        (mirrors ``trace_chain`` semantics).
+        search_scope:   KnowledgeStore scope for section retrieval. Defaults to
+                        ``None`` = search all scopes, so concepts that entered the
+                        graph from non-research sources (``scan:``/``idea:``
+                        triples with ``capability`` knowledge) still expand to
+                        real sections instead of ``(no sections)``.
+    """
+
+    def __init__(
+        self,
+        knowledge: Any,
+        triples: Any,
+        *,
+        min_confidence: float = 0.5,
+        max_branches: int = 3,
+        search_scope: Optional[str] = None,
+    ) -> None:
+        self.knowledge = knowledge
+        self.triples = triples
+        self.min_confidence = min_confidence
+        self.max_branches = max_branches
+        self.search_scope = search_scope
+
+    def _graph(self) -> Dict[str, Any]:
+        # Compose the lib graph builder — no local graph algorithm.
+        from khonliang_researcher import build_concept_graph
+
+        return build_concept_graph(
+            self.triples,
+            min_confidence=self.min_confidence,
+            knowledge=self.knowledge,
+        )
+
+    async def catalog(
+        self, scope: Optional[str] = None, limit: Optional[int] = None
+    ) -> List[IndexEntry]:
+        # ``scope`` is accepted for Protocol conformance but inert here: the
+        # composed lib ``build_concept_graph`` builds nodes from all triples
+        # (``source_prefix`` only gates document counts, not the node set), so
+        # there is nothing to scope-filter without scope-aware graph construction
+        # in the lib. Deferred to an FR phase.
+        graph = self._graph()
+        incoming = _incoming_edges(graph)
+        nodes = list(graph.values())
+        # Rank by TOTAL degree (outgoing + incoming) so sink concepts that only
+        # appear as objects (e.g. ConsensusEngine) aren't pushed under a limit.
+        nodes.sort(
+            key=lambda n: _degree(n, incoming.get(n.name, [])), reverse=True
+        )
+        if limit is not None:
+            nodes = nodes[:limit]
+        entries: List[IndexEntry] = []
+        for node in nodes:
+            node_incoming = incoming.get(node.name, [])
+            meta: Dict[str, Any] = {}
+            if getattr(node, "document_count", 0):
+                meta["documents"] = node.document_count
+            degree = _degree(node, node_incoming)
+            if degree:
+                meta["connections"] = degree
+            entries.append(
+                IndexEntry(
+                    id=node.name,
+                    description=_describe(node.name, node, node_incoming),
+                    meta=meta,
+                )
+            )
+        return entries
+
+    async def expand(
+        self, ids: Sequence[str], depth: int = 1
+    ) -> Dict[str, ExpandedItem]:
+        from khonliang_researcher import resolve_entity
+
+        graph = self._graph()
+        incoming = _incoming_edges(graph)
+        out: Dict[str, ExpandedItem] = {}
+        for raw_id in ids:
+            canonical = resolve_entity(graph, raw_id)
+            if canonical is None:
+                continue
+            detail = self._sections_for(canonical)
+            connected = (
+                self._walk(graph, incoming, canonical, depth) if depth > 0 else []
+            )
+            out[raw_id] = ExpandedItem(
+                id=canonical,
+                detail=detail,
+                connected=connected,
+            )
+        return out
+
+    def _sections_for(self, concept: str) -> str:
+        """Matching KnowledgeStore sections for a concept (the RAG detail)."""
+        entries = self.knowledge.search(
+            concept, scope=self.search_scope, limit=_DETAIL_SECTION_LIMIT
+        )
+        if not entries:
+            return ""
+        parts: List[str] = []
+        for e in entries:
+            content = (e.content or "")[:_DETAIL_SECTION_CHARS]
+            title = getattr(e, "title", "") or e.id
+            parts.append(f"[{title}] {content}")
+        return "\n\n".join(parts)
+
+    def _neighbors(
+        self, graph: Dict[str, Any], incoming: Dict[str, List[tuple]], name: str
+    ) -> List[tuple]:
+        """
+        Undirected neighbors of ``name`` as ``(target, relation, weight)``.
+
+        Both outgoing (``node.connections``) and incoming
+        (``_incoming_edges``) edges — so a sink concept the index surfaced from
+        its incoming edges also expands to those same relations. ``weight`` =
+        predicate count, used for the branch ranking.
+        """
+        out: List[tuple] = []
+        node = graph.get(name)
+        if node is not None:
+            for target, predicates in node.connections.items():
+                out.append(
+                    (target, predicates[0] if predicates else "", len(predicates))
+                )
+        for predicates, subj in incoming.get(name, []):
+            # Mark direction (edge is subj -> name) and keep true multiplicity.
+            pred = predicates[0] if predicates else ""
+            out.append((subj, f"{_INCOMING_MARK}{pred}" if pred else "", len(predicates)))
+        return out
+
+    def _walk(
+        self,
+        graph: Dict[str, Any],
+        incoming: Dict[str, List[tuple]],
+        start: str,
+        depth: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        BFS connected concepts out to ``depth`` hops, mirroring ``trace_chain``:
+        drop already-visited neighbors FIRST, then sort by predicate weight and
+        take the top ``max_branches`` — so a visited high-ranked neighbor doesn't
+        crowd out a reachable one under the cap. Traverses undirected edges.
+        Returns structured ``{id, relation, depth}`` — the structured analogue of
+        the ASCII tree ``concept_tree`` renders.
+        """
+        connected: List[Dict[str, Any]] = []
+        visited = {start}
+        frontier = [start]
+        for hop in range(1, depth + 1):
+            next_frontier: List[str] = []
+            for node_name in frontier:
+                # Visited-filter BEFORE the branch cap (trace_chain semantics).
+                fresh = [
+                    (t, rel, w)
+                    for (t, rel, w) in self._neighbors(graph, incoming, node_name)
+                    if t not in visited
+                ]
+                fresh.sort(key=lambda x: x[2], reverse=True)
+                for target, relation, _w in fresh[: self.max_branches]:
+                    if target in visited:  # de-dupe within this frontier node
+                        continue
+                    visited.add(target)
+                    next_frontier.append(target)
+                    connected.append(
+                        {"id": target, "relation": relation, "depth": hop}
+                    )
+            frontier = next_frontier
+            if not frontier:
+                break
+        return connected
+
+
+def build_concept_registry(
+    knowledge: Any,
+    triples: Any,
+    *,
+    min_confidence: float = 0.5,
+    max_branches: int = 3,
+    max_index: int = 200,
+    max_depth: int = 3,
+    search_scope: Optional[str] = None,
+) -> DescribedRegistry:
+    """Wire a ``DescribedRegistry`` over the concept graph."""
+    adapter = ConceptGraphAdapter(
+        knowledge,
+        triples,
+        min_confidence=min_confidence,
+        max_branches=max_branches,
+        search_scope=search_scope,
+    )
+    return DescribedRegistry(adapter, max_index=max_index, max_depth=max_depth)

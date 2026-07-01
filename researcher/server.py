@@ -1006,6 +1006,68 @@ Most tools accept detail="compact|brief|full":
         return trace_chain(graph, concept, max_depth=depth, max_branches=branches)
 
     @mcp.tool()
+    async def concept_index(limit: int = 40) -> str:
+        """Cheap concept catalog — first call of the two-call retrieval contract.
+
+        Returns a token-small list of concepts + one-line descriptions (drawn
+        from each concept's own graph relations). Scan this, pick the closest
+        concept(s), then issue ONE batched ``concept_expand`` — instead of a flat
+        top-k chunk dump. Descriptions are relation summaries, not full text.
+
+        Format: ``id | description | docs=N conn=N`` (one line per concept).
+        """
+        entries = await pipeline.concept_index(limit=limit)
+        if not entries:
+            return "No concepts. Distill some papers first."
+        lines = []
+        for e in entries:
+            meta = e.get("meta") or {}
+            tags = []
+            if meta.get("documents"):
+                tags.append(f"docs={meta['documents']}")
+            if meta.get("connections"):
+                tags.append(f"conn={meta['connections']}")
+            suffix = f"  {' '.join(tags)}" if tags else ""
+            lines.append(f"{e['id']} | {e['description']}{suffix}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def concept_expand(ids: str, depth: int = 1) -> str:
+        """Batched nearest-match expansion — second call of the two-call contract.
+
+        ``ids``: comma-separated concept ids from ``concept_index`` (>=1; batch
+        several in ONE call). For each, returns matching KnowledgeStore sections
+        (RAG detail) + connected concepts out to ``depth`` hops.
+
+        This is the unified entry point over concept_tree + knowledge_search:
+        catalog + on-demand detail << chunk stuffing.
+        """
+        from researcher.util import split_csv
+
+        id_list = split_csv(ids)
+        if not id_list:
+            return "No ids. Call concept_index first, then pass comma-separated ids."
+        result = await pipeline.concept_expand(id_list, depth=depth)
+        if not result:
+            return f"No matching concepts for: {ids}"
+        blocks = []
+        for cid, data in result.items():
+            block = [f"## {data['id']}"]
+            detail = data.get("detail") or "(no sections)"
+            block.append(detail)
+            connected = data.get("connected") or []
+            if connected:
+                conn = "; ".join(
+                    f"{c['id']}"
+                    + (f" ({c['relation']})" if c.get("relation") else "")
+                    + f" @{c['depth']}"
+                    for c in connected
+                )
+                block.append(f"connected: {conn}")
+            blocks.append("\n".join(block))
+        return "\n\n".join(blocks)
+
+    @mcp.tool()
     def concept_path(start: str, end: str) -> str:
         """Find how two concepts connect through the knowledge graph.
 
