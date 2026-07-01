@@ -124,6 +124,36 @@ async def test_index_limit_keeps_most_connected(tmp_path):
     assert "GRPO" in {e.id for e in entries}
 
 
+@pytest.mark.asyncio
+async def test_index_describes_sink_nodes_from_incoming_edges(tmp_path):
+    knowledge, triples = _stores(tmp_path)
+    reg = build_concept_registry(knowledge, triples)
+    entries = {e.id: e for e in await reg.index()}
+    # ConsensusEngine only appears as an object (MAGRPO used_by ConsensusEngine)
+    # -> zero outgoing edges. It must still get a real one-liner from its
+    # incoming relation, not just its bare name.
+    ce = entries["ConsensusEngine"]
+    assert ce.description != "ConsensusEngine"
+    assert "used_by" in ce.description and "MAGRPO" in ce.description
+
+
+@pytest.mark.asyncio
+async def test_index_ranks_sink_nodes_by_total_degree(tmp_path):
+    knowledge, triples = _stores(tmp_path)
+    reg = build_concept_registry(knowledge, triples)
+    # PPO and DPO are pure sinks (each referenced once by GRPO); Embedding is a
+    # sink referenced once by RAG. A degree-1 sink must outrank / tie a truly
+    # isolated node — and must be reachable, not shoved to the bottom by an
+    # outgoing-only sort. With a limit that would drop 0-degree nodes first, a
+    # referenced sink survives.
+    entries = await reg.index(limit=len(_CONCEPTS))
+    conn = {e.id: (e.meta or {}).get("connections", 0) for e in entries}
+    # every referenced sink reports a non-zero total degree
+    assert conn["PPO"] >= 1
+    assert conn["Embedding"] >= 1
+    assert conn["ConsensusEngine"] >= 1
+
+
 # ---------------------------------------------------------------------------
 # expand() — batching + depth + RAG sections
 # ---------------------------------------------------------------------------

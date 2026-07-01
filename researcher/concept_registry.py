@@ -40,13 +40,34 @@ _DETAIL_SECTION_LIMIT = 3
 _DETAIL_SECTION_CHARS = 600
 
 
-def _describe(name: str, node: Any) -> str:
+def _incoming_edges(graph: Dict[str, Any]) -> Dict[str, List[tuple]]:
+    """Reverse-edge index: ``{object: [(predicate, subject), ...]}``.
+
+    ``EntityNode.connections`` is directional (outgoing only), so sink concepts
+    that appear only as objects have no outgoing edges. One pass over the graph
+    gives every node its incoming relations for description + degree ranking.
+    """
+    incoming: Dict[str, List[tuple]] = {}
+    for subj_name, node in graph.items():
+        for target, predicates in node.connections.items():
+            pred = predicates[0] if predicates else ""
+            incoming.setdefault(target, []).append((pred, subj_name))
+    return incoming
+
+
+def _degree(node: Any, incoming: List[tuple]) -> int:
+    """Total degree = outgoing + incoming edges (undirected connectedness)."""
+    return len(node.connections) + len(incoming)
+
+
+def _describe(name: str, node: Any, incoming: List[tuple]) -> str:
     """
     Synthesize a one-line description for a concept from its own graph relations.
 
     No per-node summary is stored, so the concept's "own summary" is its top
-    outgoing relations, e.g. ``GRPO — improved_by MAGRPO; used_by ConsensusEngine``.
-    Deterministic, no LLM.
+    relations. Prefer outgoing (``GRPO — improved_by MAGRPO``); fall back to
+    incoming for sink nodes that only appear as objects
+    (``ConsensusEngine — used_by MAGRPO``). Deterministic, no LLM.
     """
     rels: List[str] = []
     for target, predicates in node.connections.items():
@@ -55,6 +76,12 @@ def _describe(name: str, node: Any) -> str:
         rels.append(f"{predicates[0]} {target}")
         if len(rels) >= _DESC_MAX_RELATIONS:
             break
+    # Sink / under-described node — summarize from incoming edges instead.
+    for pred, subj in incoming:
+        if len(rels) >= _DESC_MAX_RELATIONS:
+            break
+        if pred:
+            rels.append(f"{pred} {subj}")
     if not rels:
         desc = name
     else:
@@ -117,22 +144,28 @@ class ConceptGraphAdapter:
         # there is nothing to scope-filter without scope-aware graph construction
         # in the lib. Deferred to an FR phase.
         graph = self._graph()
+        incoming = _incoming_edges(graph)
         nodes = list(graph.values())
-        # Most-connected concepts first so a soft limit keeps the salient ones.
-        nodes.sort(key=lambda n: len(n.connections), reverse=True)
+        # Rank by TOTAL degree (outgoing + incoming) so sink concepts that only
+        # appear as objects (e.g. ConsensusEngine) aren't pushed under a limit.
+        nodes.sort(
+            key=lambda n: _degree(n, incoming.get(n.name, [])), reverse=True
+        )
         if limit is not None:
             nodes = nodes[:limit]
         entries: List[IndexEntry] = []
         for node in nodes:
+            node_incoming = incoming.get(node.name, [])
             meta: Dict[str, Any] = {}
             if getattr(node, "document_count", 0):
                 meta["documents"] = node.document_count
-            if node.connections:
-                meta["connections"] = len(node.connections)
+            degree = _degree(node, node_incoming)
+            if degree:
+                meta["connections"] = degree
             entries.append(
                 IndexEntry(
                     id=node.name,
-                    description=_describe(node.name, node),
+                    description=_describe(node.name, node, node_incoming),
                     meta=meta,
                 )
             )
