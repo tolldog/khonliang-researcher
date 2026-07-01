@@ -177,17 +177,27 @@ class DistillLockStore:
         return row is not None and self._owner_alive(row[0])
 
     def reclaim_dead(self) -> List[str]:
-        """Delete every lock whose owner process is gone; return freed paper_ids."""
+        """Delete every lock whose owner process is gone; return freed paper_ids.
+
+        Runs the snapshot + delete in one ``BEGIN IMMEDIATE`` transaction and
+        predicates each DELETE on the ORIGINAL owner, so a lock that a live
+        worker re-claims between snapshot and delete is not clobbered (its owner
+        no longer matches the dead token we saw).
+        """
         conn = self._conn()
         try:
+            conn.execute("BEGIN IMMEDIATE")  # block concurrent claimers
             rows = conn.execute("SELECT paper_id, owner FROM distill_locks").fetchall()
-            dead = [pid for pid, owner in rows if not self._owner_alive(owner)]
-            if dead:
-                conn.executemany(
-                    "DELETE FROM distill_locks WHERE paper_id = ?",
-                    [(pid,) for pid in dead],
+            dead = [(pid, owner) for pid, owner in rows if not self._owner_alive(owner)]
+            for pid, owner in dead:
+                conn.execute(
+                    "DELETE FROM distill_locks WHERE paper_id = ? AND owner = ?",
+                    (pid, owner),
                 )
-                conn.commit()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
-        return dead
+        return [pid for pid, _ in dead]

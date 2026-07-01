@@ -115,6 +115,33 @@ def test_recover_requeues_processing_with_no_lock(tmp_path):
     assert pipeline.knowledge.get("nolock").status == EntryStatus.INGESTED
 
 
+def test_recover_clears_partial_triples_before_requeue(tmp_path):
+    # codex: a crash inside _store_distillation can leave partial paper:<id>
+    # triples; recovery must clear them before requeue so the retry starts clean.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "orphan", EntryStatus.PROCESSING)
+    pipeline.triples.add("A", "relates_to", "B", confidence=0.7, source="paper:orphan")
+
+    assert pipeline.recover_stalled_processing() == 1
+    assert pipeline.knowledge.get("orphan").status == EntryStatus.INGESTED
+    leftover = [t for t in pipeline.triples.get(limit=100) if "paper:orphan" in t.sources]
+    assert leftover == []  # partial triple cleared
+
+
+def test_recover_clear_preserves_co_sourced_triples(tmp_path):
+    # clearing orphan's provenance must not delete a fact another paper asserts.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "orphan", EntryStatus.PROCESSING)
+    pipeline.triples.add("A", "relates_to", "B", confidence=0.7, source="paper:orphan")
+    pipeline.triples.add("A", "relates_to", "B", confidence=0.9, source="paper:keep")
+
+    pipeline.recover_stalled_processing()
+
+    survivors = pipeline.triples.get(subject="A")
+    assert len(survivors) == 1
+    assert survivors[0].sources == ["paper:keep"]  # orphan token gone, other kept
+
+
 def test_recover_leaves_live_locked_processing(tmp_path):
     pipeline = create_pipeline(_make_config(tmp_path))
     _add(pipeline, "live", EntryStatus.PROCESSING)

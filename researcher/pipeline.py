@@ -841,11 +841,38 @@ class ResearchPipeline:
         count = 0
         for entry in self.knowledge.get_by_status(EntryStatus.PROCESSING, tier=Tier.IMPORTED):
             if not self.locks.is_locked_live(entry.id):
+                # The crashed run may have persisted PARTIAL artifacts (some
+                # paper:<id> triples / a summary) before dying mid-_store. Clear
+                # them so the retry starts clean and stale facts don't accumulate.
+                self._clear_distillation_artifacts(entry.id)
                 self.knowledge.set_status(entry.id, EntryStatus.INGESTED)
                 count += 1
         if count:
             logger.info("Recovered %d orphaned PROCESSING paper(s) -> INGESTED", count)
         return count
+
+    def _clear_distillation_artifacts(self, entry_id: str) -> Dict[str, int]:
+        """Remove a paper's distillation OUTPUTS (summary + its triple
+        provenance), keeping the paper entry itself so it can re-distill.
+
+        Mirrors the summary/triple removal in ``strike`` but does not delete the
+        paper. ``remove_source`` drops only this paper's ``paper:<id>`` /
+        ``idea:<id>`` token, so a fact another source also asserts survives.
+        """
+        removed = {"summary": 0, "triples": 0}
+        summary_id = f"{entry_id}_summary"
+        if self.knowledge.get(summary_id):
+            self.knowledge.remove(summary_id)
+            removed["summary"] = 1
+        for t in self.triples.get(limit=10000):
+            tokens = set(t.sources)
+            for src in (f"paper:{entry_id}", f"idea:{entry_id}"):
+                if src in tokens and self.triples.remove_source(
+                    t.subject, t.predicate, t.object, src
+                ):
+                    removed["triples"] += 1
+                    break
+        return removed
 
     async def distill_all_pending(self) -> List[DistillResult]:
         """Find and distill all papers that haven't been processed yet."""
