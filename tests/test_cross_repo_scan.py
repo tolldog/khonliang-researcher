@@ -369,9 +369,10 @@ def test_latent_is_corpus_grounded_not_footprint_derived(monkeypatch):
     assert "already implemented" not in latent_concepts
 
 
-def test_latent_below_confidence_threshold_is_excluded(monkeypatch):
-    # A corpus concept whose triple confidence is below threshold is not latent.
-    triples = [_StubTriple("weak concept", "x", "paper:w1", confidence=0.3)]
+def test_latent_below_corpus_floor_is_excluded(monkeypatch):
+    # A corpus concept whose triple confidence is below the corpus_floor is not
+    # latent (the latent gate is corpus_floor, not the repo threshold).
+    triples = [_StubTriple("weak concept", "x", "paper:w1", confidence=0.35)]
     pipe = _make_pipeline(
         footprints={},
         gaps_entries=[],
@@ -383,9 +384,71 @@ def test_latent_below_confidence_threshold_is_excluded(monkeypatch):
         lambda knowledge, triples, **kw: {},
     )
     report = pipe.scan_cross_repo_integration(
-        repos=["repo_a", "repo_b"], threshold=0.5
+        repos=["repo_a", "repo_b"], corpus_floor=0.5
     )
     assert not [f for f in report["findings"] if f["signal_class"] == LATENT_CONCEPT]
+
+
+def test_latent_excludes_non_corpus_triples(monkeypatch):
+    # github:/scan: triples (repo scans + imports) must NOT surface as corpus
+    # concepts, even though they live in the triple store (codex P1).
+    triples = [
+        _StubTriple("real corpus concept", "x", "paper:p1", confidence=0.8),
+        _StubTriple("SomeRepo", "y", "github:owner/repo", confidence=0.95),
+        _StubTriple("import path foo", "z", "scan:abc", confidence=0.95),
+    ]
+    pipe = _make_pipeline(
+        footprints={},
+        gaps_entries=[],
+        triples=triples,
+        evidence_sources=[{"project": "repo_a"}, {"project": "repo_b"}],
+    )
+    monkeypatch.setattr(
+        "khonliang_researcher.build_project_scores",
+        lambda knowledge, triples, **kw: {},
+    )
+    report = pipe.scan_cross_repo_integration(repos=["repo_a", "repo_b"])
+    latent = {
+        f["concept"] for f in report["findings"]
+        if f["signal_class"] == LATENT_CONCEPT
+    }
+    assert "real corpus concept" in latent
+    assert "SomeRepo" not in latent
+    assert "import path foo" not in latent
+    # provenance carries only corpus tokens
+    for f in report["findings"]:
+        if f["signal_class"] == LATENT_CONCEPT:
+            assert all(s.startswith(("paper:", "idea:", "blog:")) for s in f["corpus_sources"])
+
+
+def test_latent_cutoff_decoupled_from_repo_threshold(monkeypatch):
+    # A latent concept with corpus salience 0.5 must survive a high repo
+    # threshold (0.8), because threshold gates repo IMPLEMENTATION, not corpus
+    # relevance (codex P2). corpus_floor (default 0.3) is the latent gate.
+    triples = [_StubTriple("mid salience concept", "x", "paper:m1", confidence=0.5)]
+    pipe = _make_pipeline(
+        footprints={},
+        gaps_entries=[],
+        triples=triples,
+        evidence_sources=[{"project": "repo_a"}, {"project": "repo_b"}],
+    )
+    monkeypatch.setattr(
+        "khonliang_researcher.build_project_scores",
+        lambda knowledge, triples, **kw: {},
+    )
+    report = pipe.scan_cross_repo_integration(
+        repos=["repo_a", "repo_b"], threshold=0.8
+    )
+    latent = {
+        f["concept"] for f in report["findings"]
+        if f["signal_class"] == LATENT_CONCEPT
+    }
+    assert "mid salience concept" in latent
+    # but below the explicit corpus_floor it drops
+    report2 = pipe.scan_cross_repo_integration(
+        repos=["repo_a", "repo_b"], threshold=0.8, corpus_floor=0.6
+    )
+    assert not [f for f in report2["findings"] if f["signal_class"] == LATENT_CONCEPT]
 
 
 def test_latent_provenance_includes_all_multi_source_tokens(monkeypatch):

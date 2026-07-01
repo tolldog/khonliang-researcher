@@ -1838,6 +1838,7 @@ Most tools accept detail="compact|brief|full":
         max_findings: int = 50,
         already_filed: str = "",
         dismissed: str = "",
+        corpus_floor: float = 0.3,
         detail: str = "brief",
     ) -> str:
         """Cross-repo integration-opportunity scan. detail: compact|brief|full.
@@ -1852,7 +1853,9 @@ Most tools accept detail="compact|brief|full":
         Generic infra concepts (HTTP, logging, config, serialization) are
         filtered as noise. Findings carry provenance (repos, concepts, corpus
         sources). ``repos`` is a comma-separated project list; empty scans all
-        registered repos.
+        registered repos. ``threshold`` gates repo IMPLEMENTATION; latent
+        concepts use the independent ``corpus_floor`` (min triple confidence),
+        so raising ``threshold`` doesn't drop otherwise-valid latent findings.
 
         DEDUP: pass ``already_filed`` / ``dismissed`` as JSON arrays of
         ``{concept, signal_class?, repos?}`` (or ``{dedup_key}``) — matching
@@ -1888,6 +1891,7 @@ Most tools accept detail="compact|brief|full":
             max_findings=max_findings,
             already_filed=filed,
             dismissed=dropped,
+            corpus_floor=corpus_floor,
         )
 
         if report.get("error"):

@@ -1607,6 +1607,16 @@ class ResearchPipeline:
             gaps.setdefault(target, set()).add(normalize_concept(concept))
         return gaps
 
+    # Corpus-backed triple source prefixes (what the RESEARCH corpus asserts).
+    # Allowlist — not a denylist of non-corpus tokens — so a future non-corpus
+    # source kind (github:/scan:/… from repo scans + imports) can't leak into
+    # the latent-concept pool as a fake "corpus" concept (codex P1).
+    _CORPUS_SOURCE_PREFIXES = ("paper:", "idea:", "blog:")
+
+    @classmethod
+    def _is_corpus_source(cls, token: str) -> bool:
+        return bool(token) and token.startswith(cls._CORPUS_SOURCE_PREFIXES)
+
     def _corpus_concept_salience(
         self, min_confidence: float = 0.3
     ) -> Dict[str, Dict[str, Any]]:
@@ -1614,16 +1624,21 @@ class ResearchPipeline:
 
         Returns ``{normalized_concept: {"label", "score", "sources"}}`` where
         ``score`` is the max triple confidence the concept appears with and
-        ``sources`` are the contributing paper/source ids (corpus provenance).
-        This is the CORPUS signal for latent concepts — grounded in what the
-        research corpus asserts, NOT in ``build_project_scores`` (whose targets
-        are the projects/repos themselves, so it carries no repo-independent
-        "the corpus rates this" dimension — that was the dead-path bug the
-        latent class had). One triple scan, reused across all concepts.
+        ``sources`` are the contributing corpus source ids (provenance). This is
+        the CORPUS signal for latent concepts — grounded in what the research
+        corpus asserts, NOT in ``build_project_scores`` (whose targets are the
+        projects/repos themselves, so it carries no repo-independent "the corpus
+        rates this" dimension — the dead-path bug the latent class had).
+
+        ONLY corpus-backed triples count: a triple contributes only via its
+        ``paper:``/``idea:``/``blog:`` source tokens. ``github:``/``scan:``
+        triples (written by repo scans + imports) are excluded, so the latent
+        report can't surface repo names / import paths / code-scan capabilities
+        as if a paper asserted them (codex P1). One triple scan, reused across
+        all concepts.
 
         NOTE: ``TripleStore.get`` bumps ``access_count`` (ecosystem-wide read
-        behaviour, same as ``build_project_scores``); we incur it once here
-        rather than once-per-concept as the prior provenance lookup did.
+        behaviour, same as ``build_project_scores``); we incur it once here.
         """
         from researcher.cross_repo_scan import normalize_concept
 
@@ -1635,8 +1650,12 @@ class ResearchPipeline:
         for t in triples:
             conf = float(getattr(t, "confidence", 0.0) or 0.0)
             # Co-sourced triples carry every contributor in ``sources``;
-            # ``source`` is only the primary token (bug a905176b).
+            # ``source`` is only the primary token (bug a905176b). Keep only the
+            # corpus-backed tokens.
             srcs = getattr(t, "sources", None) or ([t.source] if t.source else [])
+            corpus_srcs = [s for s in srcs if self._is_corpus_source(s)]
+            if not corpus_srcs:
+                continue  # non-corpus triple (github:/scan:/…) — not evidence
             for raw in (t.subject, t.object):
                 if not raw:
                     continue
@@ -1647,11 +1666,10 @@ class ResearchPipeline:
                 if slot is None:
                     slot = {"label": raw, "score": conf, "sources": []}
                     salience[norm] = slot
-                else:
-                    if conf > slot["score"]:
-                        slot["score"] = conf
-                for s in srcs:
-                    if s and s not in slot["sources"]:
+                elif conf > slot["score"]:
+                    slot["score"] = conf
+                for s in corpus_srcs:
+                    if s not in slot["sources"]:
                         slot["sources"].append(s)
         return salience
 
@@ -1662,22 +1680,24 @@ class ResearchPipeline:
         threshold: float,
         limit: int,
         salience: Optional[Dict[str, Dict[str, Any]]] = None,
+        corpus_floor: float = 0.3,
     ) -> List[Dict[str, Any]]:
         """Corpus concepts that no target repo uses above threshold.
 
         Candidate pool + relevance come from the CORPUS (triple salience,
         repo-independent), not from ``build_project_scores``. The footprint is
         used ONLY to exclude concepts a target repo already implements above
-        threshold. That is the real "corpus concept no repo uses but the corpus
-        rates" signal (codex P1 — the previous footprint-derived corpus_max was
-        always 0 in production because build_project_scores' only targets are
-        the repos themselves).
+        ``threshold`` (the repo-implementation cutoff). Latent salience is gated
+        by ``corpus_floor`` — a SEPARATE corpus-confidence floor, NOT
+        ``threshold``: raising ``threshold`` to demand stronger per-repo
+        evidence must not silently drop otherwise-valid latent concepts whose
+        corpus salience sits in ``[corpus_floor, threshold)`` (codex P2).
         """
         from researcher.cross_repo_scan import normalize_concept
 
         repo_set = set(repos)
         if salience is None:
-            salience = self._corpus_concept_salience()
+            salience = self._corpus_concept_salience(min_confidence=corpus_floor)
 
         # Concepts any target repo already implements (by normalized name), so
         # we can exclude them from the latent pool.
@@ -1692,7 +1712,7 @@ class ResearchPipeline:
 
         latent: List[Dict[str, Any]] = []
         for norm, slot in salience.items():
-            if slot["score"] < threshold:
+            if slot["score"] < corpus_floor:
                 continue
             if norm in implemented:
                 continue
@@ -1713,6 +1733,7 @@ class ResearchPipeline:
         dismissed: Optional[List[Dict[str, Any]]] = None,
         max_findings: int = 50,
         latent_limit: int = 20,
+        corpus_floor: float = 0.3,
     ) -> Dict[str, Any]:
         """On-demand cross-repo integration-opportunity scan (report only).
 
@@ -1731,6 +1752,9 @@ class ResearchPipeline:
                 a dismissed-candidates record via the bus.
             max_findings: cap on returned findings.
             latent_limit: cap on latent-concept candidates considered.
+            corpus_floor: min corpus (triple) confidence for a latent concept —
+                independent of ``threshold`` (the repo-implementation cutoff),
+                so raising ``threshold`` doesn't silently drop latent findings.
         """
         from khonliang_researcher import build_project_scores
 
@@ -1795,6 +1819,7 @@ class ResearchPipeline:
         gaps = self._repo_capability_gaps(target_repos)
         latent = self._latent_corpus_concepts(
             footprints, target_repos, threshold, latent_limit,
+            corpus_floor=corpus_floor,
         )
 
         # Dedup gap note: if the caller supplied no dedup sources, flag it so the
