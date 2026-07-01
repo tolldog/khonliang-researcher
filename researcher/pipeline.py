@@ -1727,15 +1727,33 @@ class ResearchPipeline:
             classify_cross_repo_findings,
         )
 
-        # Resolve target repos.
+        # Resolve target repos against the registry.
+        registered = [
+            r.get("project")
+            for r in self.list_evidence_sources()
+            if r.get("project")
+        ]
+        registered_set = set(registered)
         if repos:
             raw_repos = list(repos)
+            # Fail fast on unknown/typo/stale names rather than silently
+            # comparing against a repo with no footprint/gap data, which would
+            # produce misleading latent/complementarity findings (codex P2).
+            unknown = [r for r in raw_repos if r not in registered_set]
+            if unknown:
+                return {
+                    "repos": [],
+                    "finding_count": 0,
+                    "by_class": {},
+                    "findings": [],
+                    "auto_filed": False,
+                    "error": (
+                        f"unknown repo(s): {', '.join(sorted(set(unknown)))}; "
+                        "register via register_repo before scanning"
+                    ),
+                }
         else:
-            raw_repos = [
-                r.get("project")
-                for r in self.list_evidence_sources()
-                if r.get("project")
-            ]
+            raw_repos = registered
         # De-dup while preserving order — for BOTH the explicit and discovered
         # paths, so repos="researcher,researcher" can't pass the >=2 guard and
         # produce a bogus single-repo "cross-repo" report (codex P3).

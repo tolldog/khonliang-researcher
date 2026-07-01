@@ -443,6 +443,26 @@ def test_pipeline_dedups_explicit_duplicate_repo_args(monkeypatch):
     assert report["finding_count"] == 0
 
 
+def test_pipeline_rejects_unknown_repo_names(monkeypatch):
+    # A typo/stale name must fail fast, not silently compare against a repo with
+    # no footprint/gap data (codex P2).
+    pipe = _make_pipeline(
+        footprints={},
+        gaps_entries=[],
+        triples=[],
+        evidence_sources=[{"project": "repo_a"}, {"project": "repo_b"}],
+    )
+    monkeypatch.setattr(
+        "khonliang_researcher.build_project_scores",
+        lambda knowledge, triples, **kw: {},
+    )
+    report = pipe.scan_cross_repo_integration(repos=["repo_a", "typo_repo"])
+    assert "unknown repo" in report.get("error", "")
+    assert "typo_repo" in report["error"]
+    assert report["finding_count"] == 0
+    assert report["auto_filed"] is False
+
+
 def test_pipeline_requires_two_repos(monkeypatch):
     pipe = _make_pipeline(
         footprints={},
