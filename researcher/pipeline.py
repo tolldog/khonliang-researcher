@@ -1607,90 +1607,102 @@ class ResearchPipeline:
             gaps.setdefault(target, set()).add(normalize_concept(concept))
         return gaps
 
+    def _corpus_concept_salience(
+        self, min_confidence: float = 0.3
+    ) -> Dict[str, Dict[str, Any]]:
+        """Repo-independent corpus salience per concept, from the triple graph.
+
+        Returns ``{normalized_concept: {"label", "score", "sources"}}`` where
+        ``score`` is the max triple confidence the concept appears with and
+        ``sources`` are the contributing paper/source ids (corpus provenance).
+        This is the CORPUS signal for latent concepts — grounded in what the
+        research corpus asserts, NOT in ``build_project_scores`` (whose targets
+        are the projects/repos themselves, so it carries no repo-independent
+        "the corpus rates this" dimension — that was the dead-path bug the
+        latent class had). One triple scan, reused across all concepts.
+
+        NOTE: ``TripleStore.get`` bumps ``access_count`` (ecosystem-wide read
+        behaviour, same as ``build_project_scores``); we incur it once here
+        rather than once-per-concept as the prior provenance lookup did.
+        """
+        from researcher.cross_repo_scan import normalize_concept
+
+        salience: Dict[str, Dict[str, Any]] = {}
+        try:
+            triples = self.triples.get(min_confidence=min_confidence, limit=5000)
+        except Exception:
+            return salience
+        for t in triples:
+            conf = float(getattr(t, "confidence", 0.0) or 0.0)
+            # Co-sourced triples carry every contributor in ``sources``;
+            # ``source`` is only the primary token (bug a905176b).
+            srcs = getattr(t, "sources", None) or ([t.source] if t.source else [])
+            for raw in (t.subject, t.object):
+                if not raw:
+                    continue
+                norm = normalize_concept(raw)
+                if not norm:
+                    continue
+                slot = salience.get(norm)
+                if slot is None:
+                    slot = {"label": raw, "score": conf, "sources": []}
+                    salience[norm] = slot
+                else:
+                    if conf > slot["score"]:
+                        slot["score"] = conf
+                for s in srcs:
+                    if s and s not in slot["sources"]:
+                        slot["sources"].append(s)
+        return salience
+
     def _latent_corpus_concepts(
         self,
         footprints: Dict[str, Dict[str, float]],
         repos: List[str],
         threshold: float,
         limit: int,
-        repo_names: Optional[set] = None,
+        salience: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Corpus concepts that no target repo uses above threshold.
 
-        Candidate pool = the *scored footprint* concepts (from
-        ``build_project_scores``): concepts that have a qualifying corpus
-        assessment. Keep the ones whose max score across target repos is below
-        threshold but which the CORPUS (not some other repo) considers relevant.
-        Corpus relevance is measured over non-repo targets only — a score on any
-        *registered repo* (target OR excluded from this scan) is repo relevance,
-        not corpus evidence, so counting it would report a concept that only an
-        excluded repo implements as a latent opportunity (codex P2). The LATENT
-        classifier filters infra + already-used; here we surface the raw pool
-        with corpus provenance (source paper ids).
-
-        SCOPE NOTE: this pool is bounded to scored footprint concepts. Concepts
-        that live only in triples from unassessed / sub-floor papers never enter
-        the footprint and so are invisible here; surfacing those corpus-only
-        ideas needs a separate triple-entity enumeration + relevance pass, left
-        to a follow-up (they are the weaker-evidence long tail, not the graded
-        corpus signal this Phase-1 report is grounded on).
+        Candidate pool + relevance come from the CORPUS (triple salience,
+        repo-independent), not from ``build_project_scores``. The footprint is
+        used ONLY to exclude concepts a target repo already implements above
+        threshold. That is the real "corpus concept no repo uses but the corpus
+        rates" signal (codex P1 — the previous footprint-derived corpus_max was
+        always 0 in production because build_project_scores' only targets are
+        the repos themselves).
         """
+        from researcher.cross_repo_scan import normalize_concept
+
         repo_set = set(repos)
-        # All registered repos are excluded from the corpus-evidence tally, not
-        # just the ones in scope for this run.
-        all_repos = set(repo_names) if repo_names is not None else repo_set
-        latent: List[Dict[str, Any]] = []
+        if salience is None:
+            salience = self._corpus_concept_salience()
+
+        # Concepts any target repo already implements (by normalized name), so
+        # we can exclude them from the latent pool.
+        implemented: set = set()
         for concept, repo_scores in footprints.items():
             in_repo_max = max(
                 (s for r, s in repo_scores.items() if r in repo_set),
                 default=0.0,
             )
             if in_repo_max >= threshold:
+                implemented.add(normalize_concept(concept))
+
+        latent: List[Dict[str, Any]] = []
+        for norm, slot in salience.items():
+            if slot["score"] < threshold:
                 continue
-            # corpus relevance: best score among NON-repo targets (papers /
-            # research projects) — evidence the corpus considers it worth
-            # adopting, independent of any repo's footprint.
-            corpus_max = max(
-                (s for tgt, s in repo_scores.items() if tgt not in all_repos),
-                default=0.0,
-            )
-            if corpus_max < threshold:
+            if norm in implemented:
                 continue
-            # provenance: papers whose distilled triples mention this concept
-            sources = self._concept_source_papers(concept)
             latent.append({
-                "concept": concept,
-                "score": corpus_max,
-                "sources": sources,
+                "concept": slot["label"],
+                "score": slot["score"],
+                "sources": list(slot["sources"][:5]),
             })
         latent.sort(key=lambda d: -d["score"])
         return latent[:limit]
-
-    def _concept_source_papers(self, concept: str, limit: int = 5) -> List[str]:
-        """Paper/source ids whose triples reference ``concept`` (corpus provenance)."""
-        sources: List[str] = []
-        seen = set()
-        try:
-            triples = self.triples.get(min_confidence=0.3, limit=5000)
-        except Exception:
-            return sources
-        target = concept.lower()
-        for t in triples:
-            if concept in (t.subject, t.object) or target in (
-                (t.subject or "").lower(),
-                (t.object or "").lower(),
-            ):
-                # Co-sourced triples carry every contributor in ``sources``;
-                # ``source`` is only the primary token (bug a905176b handled
-                # multi-source provenance the same way). Emit all of them so
-                # the report's corpus provenance is complete.
-                for src in (getattr(t, "sources", None) or ([t.source] if t.source else [])):
-                    if src and src not in seen:
-                        seen.add(src)
-                        sources.append(src)
-                if len(sources) >= limit:
-                    break
-        return sources[:limit]
 
     def scan_cross_repo_integration(
         self,
@@ -1780,20 +1792,9 @@ class ResearchPipeline:
             self.knowledge, self.triples, min_score=min(threshold, 0.3)
         )
 
-        # Every registered repo (not just the in-scope ones) is excluded from
-        # the corpus-evidence tally so a concept implemented only by an excluded
-        # repo isn't reported as latent for the scanned subset (codex P2).
-        all_repo_names = {
-            r.get("project")
-            for r in self.list_evidence_sources()
-            if r.get("project")
-        }
-        all_repo_names.update(target_repos)
-
         gaps = self._repo_capability_gaps(target_repos)
         latent = self._latent_corpus_concepts(
             footprints, target_repos, threshold, latent_limit,
-            repo_names=all_repo_names,
         )
 
         # Dedup gap note: if the caller supplied no dedup sources, flag it so the

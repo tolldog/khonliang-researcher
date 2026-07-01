@@ -146,6 +146,13 @@ def test_infra_denylist_does_not_over_match():
     assert is_infra_concept("consensus routing") is False
 
 
+def test_infra_phrase_match_respects_word_boundaries():
+    # "command line" is infra, but "precommand line" must NOT match it inside a
+    # word (Copilot correctness fix).
+    assert is_infra_concept("command line parsing") is True
+    assert is_infra_concept("precommand line orchestration") is False
+
+
 def test_dedup_against_filed_fr_by_key():
     footprints = {"consensus voting": {"a": 0.8, "b": 0.7}}
     dup = Finding(DUPLICATION, "consensus voting", ["a", "b"], "")
@@ -192,10 +199,11 @@ def test_build_report_marks_nothing_filed():
 # --------------------------------------------------------- pipeline wiring ----
 
 class _StubTriple:
-    def __init__(self, subject, obj, source, sources=None):
+    def __init__(self, subject, obj, source, sources=None, confidence=0.9):
         self.subject = subject
         self.object = obj
         self.source = source
+        self.confidence = confidence
         # multi-source provenance; primary token is `source`
         self.sources = sources if sources is not None else ([source] if source else [])
 
@@ -205,7 +213,7 @@ class _StubTriples:
         self._triples = triples
 
     def get(self, min_confidence=0.3, limit=5000):
-        return self._triples
+        return [t for t in self._triples if getattr(t, "confidence", 1.0) >= min_confidence]
 
 
 class _StubKnowledge:
@@ -327,22 +335,26 @@ def test_pipeline_dedup_removes_filed_candidate(monkeypatch):
     assert "dedup_gap" not in report
 
 
-def test_latent_excludes_scores_from_out_of_scope_repos(monkeypatch):
-    # A concept implemented ONLY by an excluded registered repo (repo_c) must
-    # NOT be reported as latent for a repo_a,repo_b subset scan (codex P2).
+def test_latent_is_corpus_grounded_not_footprint_derived(monkeypatch):
+    # Latent candidates + relevance come from the CORPUS (triple salience),
+    # repo-independent — NOT from build_project_scores, whose only targets are
+    # the repos themselves (codex P1: that path was always empty in production).
+    # A corpus concept no target repo implements must surface; one an in-scope
+    # repo implements must not.
     footprints = {
-        "repo_c only concept": {"repo_c": 0.9, "repo_a": 0.0, "repo_b": 0.0},
-        # a genuine latent concept: corpus (paper target) rates it, no repo uses it
-        "genuine latent": {"paper_target": 0.85, "repo_a": 0.0, "repo_b": 0.0},
+        # repo_a implements this concept in its footprint -> NOT latent
+        "already implemented": {"repo_a": 0.8, "repo_b": 0.0},
     }
-    evidence_sources = [
-        {"project": "repo_a"}, {"project": "repo_b"}, {"project": "repo_c"},
+    triples = [
+        # corpus asserts both concepts; only "genuine latent" is unused by repos
+        _StubTriple("genuine latent", "llm inference", "paper:g1", confidence=0.85),
+        _StubTriple("already implemented", "x", "paper:ai", confidence=0.9),
     ]
     pipe = _make_pipeline(
         footprints=footprints,
         gaps_entries=[],
-        triples=[_StubTriple("genuine latent", "x", "paper:g1")],
-        evidence_sources=evidence_sources,
+        triples=triples,
+        evidence_sources=[{"project": "repo_a"}, {"project": "repo_b"}],
     )
     monkeypatch.setattr(
         "khonliang_researcher.build_project_scores",
@@ -353,26 +365,44 @@ def test_latent_excludes_scores_from_out_of_scope_repos(monkeypatch):
         f["concept"] for f in report["findings"]
         if f["signal_class"] == LATENT_CONCEPT
     }
-    assert "repo_c only concept" not in latent_concepts
     assert "genuine latent" in latent_concepts
+    assert "already implemented" not in latent_concepts
+
+
+def test_latent_below_confidence_threshold_is_excluded(monkeypatch):
+    # A corpus concept whose triple confidence is below threshold is not latent.
+    triples = [_StubTriple("weak concept", "x", "paper:w1", confidence=0.3)]
+    pipe = _make_pipeline(
+        footprints={},
+        gaps_entries=[],
+        triples=triples,
+        evidence_sources=[{"project": "repo_a"}, {"project": "repo_b"}],
+    )
+    monkeypatch.setattr(
+        "khonliang_researcher.build_project_scores",
+        lambda knowledge, triples, **kw: {},
+    )
+    report = pipe.scan_cross_repo_integration(
+        repos=["repo_a", "repo_b"], threshold=0.5
+    )
+    assert not [f for f in report["findings"] if f["signal_class"] == LATENT_CONCEPT]
 
 
 def test_latent_provenance_includes_all_multi_source_tokens(monkeypatch):
-    footprints = {"genuine latent": {"paper_target": 0.85, "repo_a": 0.0, "repo_b": 0.0}}
     # triple whose PRIMARY source differs from a co-source token; both must surface
     triple = _StubTriple(
         "genuine latent", "x", "paper:primary",
-        sources=["paper:primary", "paper:secondary"],
+        sources=["paper:primary", "paper:secondary"], confidence=0.85,
     )
     pipe = _make_pipeline(
-        footprints=footprints,
+        footprints={},
         gaps_entries=[],
         triples=[triple],
         evidence_sources=[{"project": "repo_a"}, {"project": "repo_b"}],
     )
     monkeypatch.setattr(
         "khonliang_researcher.build_project_scores",
-        lambda knowledge, triples, **kw: pipe._footprints,
+        lambda knowledge, triples, **kw: {},
     )
     report = pipe.scan_cross_repo_integration(repos=["repo_a", "repo_b"])
     latent = [f for f in report["findings"] if f["signal_class"] == LATENT_CONCEPT]

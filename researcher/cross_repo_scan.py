@@ -104,12 +104,15 @@ def is_infra_concept(concept: str, infra: Optional[Iterable[str]] = None) -> boo
     terms = DEFAULT_INFRA_CONCEPTS if infra is None else {normalize_concept(t) for t in infra}
     words = norm.split()
     word_set = set(words)
+    padded = f" {norm} "  # word-boundary sentinel for phrase matching
     for term in terms:
         if not term:
             continue
         if " " in term:
-            # phrase: require the phrase to appear contiguously
-            if term in norm:
+            # phrase: require it to appear as whole contiguous words, not
+            # inside a longer word (" command line " matches, but
+            # "precommand line" must not) — Copilot correctness fix.
+            if f" {term} " in padded:
                 return True
         else:
             # single token: require an exact word match (not substring)
@@ -273,6 +276,14 @@ def classify_cross_repo_findings(
         )
 
     # ---- 2. COMPLEMENTARITY: repo A implements what repo B lists as a gap ---
+    # Normalize each repo's gap set ONCE up front (the pipeline already emits
+    # normalized concepts, but normalize defensively for hand-built callers) so
+    # the inner concept×gap_repo loop is plain set membership, not a recomputed
+    # comprehension per pair (Copilot perf).
+    norm_gaps: Dict[str, Set[str]] = {
+        repo: {normalize_concept(g) for g in gap_concepts}
+        for repo, gap_concepts in gaps.items()
+    }
     for concept, repo_scores in footprints.items():
         if is_infra_concept(concept, infra):
             continue
@@ -283,12 +294,12 @@ def classify_cross_repo_findings(
         )
         if not implementers:
             continue
-        for gap_repo, gap_concepts in gaps.items():
+        for gap_repo, gap_concepts in norm_gaps.items():
             if repo_set is not None and gap_repo not in repo_set:
                 continue
             if gap_repo in implementers:
                 continue  # already implements it, not a gap for this repo
-            if norm not in {normalize_concept(g) for g in gap_concepts}:
+            if norm not in gap_concepts:
                 continue
             # Name the strongest implementer as the provider (highest footprint
             # score), not an arbitrary alphabetical first — a weaker repo would
