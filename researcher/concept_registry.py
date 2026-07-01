@@ -177,14 +177,16 @@ class ConceptGraphAdapter:
         from khonliang_researcher import resolve_entity
 
         graph = self._graph()
+        incoming = _incoming_edges(graph)
         out: Dict[str, ExpandedItem] = {}
         for raw_id in ids:
             canonical = resolve_entity(graph, raw_id)
             if canonical is None:
                 continue
-            node = graph[canonical]
             detail = self._sections_for(canonical)
-            connected = self._walk(graph, canonical, depth) if depth > 0 else []
+            connected = (
+                self._walk(graph, incoming, canonical, depth) if depth > 0 else []
+            )
             out[raw_id] = ExpandedItem(
                 id=canonical,
                 detail=detail,
@@ -206,14 +208,42 @@ class ConceptGraphAdapter:
             parts.append(f"[{title}] {content}")
         return "\n\n".join(parts)
 
+    def _neighbors(
+        self, graph: Dict[str, Any], incoming: Dict[str, List[tuple]], name: str
+    ) -> List[tuple]:
+        """
+        Undirected neighbors of ``name`` as ``(target, relation, weight)``.
+
+        Both outgoing (``node.connections``) and incoming
+        (``_incoming_edges``) edges — so a sink concept the index surfaced from
+        its incoming edges also expands to those same relations. ``weight`` =
+        predicate count, used for the branch ranking.
+        """
+        out: List[tuple] = []
+        node = graph.get(name)
+        if node is not None:
+            for target, predicates in node.connections.items():
+                out.append(
+                    (target, predicates[0] if predicates else "", len(predicates))
+                )
+        for pred, subj in incoming.get(name, []):
+            out.append((subj, pred, 1))
+        return out
+
     def _walk(
-        self, graph: Dict[str, Any], start: str, depth: int
+        self,
+        graph: Dict[str, Any],
+        incoming: Dict[str, List[tuple]],
+        start: str,
+        depth: int,
     ) -> List[Dict[str, Any]]:
         """
         BFS connected concepts out to ``depth`` hops, mirroring ``trace_chain``:
-        sort each node's neighbors by predicate count desc, take the top
-        ``max_branches``. Returns structured ``{id, relation, depth}`` — the
-        structured analogue of the ASCII tree ``concept_tree`` renders.
+        drop already-visited neighbors FIRST, then sort by predicate weight and
+        take the top ``max_branches`` — so a visited high-ranked neighbor doesn't
+        crowd out a reachable one under the cap. Traverses undirected edges.
+        Returns structured ``{id, relation, depth}`` — the structured analogue of
+        the ASCII tree ``concept_tree`` renders.
         """
         connected: List[Dict[str, Any]] = []
         visited = {start}
@@ -221,20 +251,18 @@ class ConceptGraphAdapter:
         for hop in range(1, depth + 1):
             next_frontier: List[str] = []
             for node_name in frontier:
-                node = graph.get(node_name)
-                if node is None:
-                    continue
-                neighbors = sorted(
-                    node.connections.items(),
-                    key=lambda kv: len(kv[1]),
-                    reverse=True,
-                )[: self.max_branches]
-                for target, predicates in neighbors:
-                    if target in visited:
+                # Visited-filter BEFORE the branch cap (trace_chain semantics).
+                fresh = [
+                    (t, rel, w)
+                    for (t, rel, w) in self._neighbors(graph, incoming, node_name)
+                    if t not in visited
+                ]
+                fresh.sort(key=lambda x: x[2], reverse=True)
+                for target, relation, _w in fresh[: self.max_branches]:
+                    if target in visited:  # de-dupe within this frontier node
                         continue
                     visited.add(target)
                     next_frontier.append(target)
-                    relation = predicates[0] if predicates else ""
                     connected.append(
                         {"id": target, "relation": relation, "depth": hop}
                     )

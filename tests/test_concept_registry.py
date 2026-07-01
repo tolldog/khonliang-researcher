@@ -186,6 +186,31 @@ async def test_expand_depth_two_walks_further(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_expand_sink_concept_returns_incoming_neighbors(tmp_path):
+    knowledge, triples = _stores(tmp_path)
+    reg = build_concept_registry(knowledge, triples)
+    # ConsensusEngine is a pure sink (MAGRPO used_by ConsensusEngine). The index
+    # describes it via its incoming edge, so expand must surface that same
+    # relation instead of "(no connected)".
+    result = await reg.expand(["ConsensusEngine"], depth=1)
+    connected = {c["id"] for c in result["ConsensusEngine"].connected}
+    assert "MAGRPO" in connected
+
+
+@pytest.mark.asyncio
+async def test_expand_visited_filter_before_branch_cap(tmp_path):
+    knowledge, triples = _stores(tmp_path)
+    reg = build_concept_registry(knowledge, triples, max_branches=2)
+    # With undirected traversal and a tight branch cap, a reachable neighbor must
+    # not be dropped by a visited high-rank neighbor consuming a branch slot.
+    result = await reg.expand(["GRPO"], depth=2)
+    ids = {c["id"] for c in result["GRPO"].connected}
+    # GRPO reaches MAGRPO/PPO/DPO at hop 1; ConsensusEngine (via MAGRPO) at hop 2
+    assert "MAGRPO" in ids
+    assert "ConsensusEngine" in ids
+
+
+@pytest.mark.asyncio
 async def test_expand_resolves_case_insensitively(tmp_path):
     knowledge, triples = _stores(tmp_path)
     reg = build_concept_registry(knowledge, triples)
