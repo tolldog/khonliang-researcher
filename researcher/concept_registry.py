@@ -40,18 +40,27 @@ _DETAIL_SECTION_LIMIT = 3
 _DETAIL_SECTION_CHARS = 600
 
 
+# Direction cue for incoming (reverse) edges. `→` is how concept_tree renders
+# outgoing edges; `←other` reads as "other → this", preserving the true triple
+# direction so a sink like ConsensusEngine is never rendered as if it were the
+# subject (`MAGRPO used_by ConsensusEngine` -> `ConsensusEngine — ←used_by MAGRPO`,
+# i.e. "MAGRPO used_by ConsensusEngine", not the inverse).
+_INCOMING_MARK = "←"
+
+
 def _incoming_edges(graph: Dict[str, Any]) -> Dict[str, List[tuple]]:
-    """Reverse-edge index: ``{object: [(predicate, subject), ...]}``.
+    """Reverse-edge index: ``{object: [(predicates_list, subject), ...]}``.
 
     ``EntityNode.connections`` is directional (outgoing only), so sink concepts
     that appear only as objects have no outgoing edges. One pass over the graph
-    gives every node its incoming relations for description + degree ranking.
+    gives every node its incoming relations — the FULL predicate list per edge is
+    kept so branch ranking and descriptions use true multiplicity, and direction
+    is preserved (these are edges *into* the node).
     """
     incoming: Dict[str, List[tuple]] = {}
     for subj_name, node in graph.items():
         for target, predicates in node.connections.items():
-            pred = predicates[0] if predicates else ""
-            incoming.setdefault(target, []).append((pred, subj_name))
+            incoming.setdefault(target, []).append((list(predicates), subj_name))
     return incoming
 
 
@@ -66,8 +75,9 @@ def _describe(name: str, node: Any, incoming: List[tuple]) -> str:
 
     No per-node summary is stored, so the concept's "own summary" is its top
     relations. Prefer outgoing (``GRPO — improved_by MAGRPO``); fall back to
-    incoming for sink nodes that only appear as objects
-    (``ConsensusEngine — used_by MAGRPO``). Deterministic, no LLM.
+    incoming for sink nodes that only appear as objects, marking direction so the
+    relationship is not inverted (``ConsensusEngine — ←used_by MAGRPO``).
+    Deterministic, no LLM.
     """
     rels: List[str] = []
     for target, predicates in node.connections.items():
@@ -77,11 +87,12 @@ def _describe(name: str, node: Any, incoming: List[tuple]) -> str:
         if len(rels) >= _DESC_MAX_RELATIONS:
             break
     # Sink / under-described node — summarize from incoming edges instead.
-    for pred, subj in incoming:
+    for predicates, subj in incoming:
         if len(rels) >= _DESC_MAX_RELATIONS:
             break
+        pred = predicates[0] if predicates else ""
         if pred:
-            rels.append(f"{pred} {subj}")
+            rels.append(f"{_INCOMING_MARK}{pred} {subj}")
     if not rels:
         desc = name
     else:
@@ -226,8 +237,10 @@ class ConceptGraphAdapter:
                 out.append(
                     (target, predicates[0] if predicates else "", len(predicates))
                 )
-        for pred, subj in incoming.get(name, []):
-            out.append((subj, pred, 1))
+        for predicates, subj in incoming.get(name, []):
+            # Mark direction (edge is subj -> name) and keep true multiplicity.
+            pred = predicates[0] if predicates else ""
+            out.append((subj, f"{_INCOMING_MARK}{pred}" if pred else "", len(predicates)))
         return out
 
     def _walk(

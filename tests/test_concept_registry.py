@@ -135,6 +135,9 @@ async def test_index_describes_sink_nodes_from_incoming_edges(tmp_path):
     ce = entries["ConsensusEngine"]
     assert ce.description != "ConsensusEngine"
     assert "used_by" in ce.description and "MAGRPO" in ce.description
+    # direction cue preserves the true triple (MAGRPO used_by ConsensusEngine),
+    # not the inverse — the relation is marked incoming.
+    assert "←used_by MAGRPO" in ce.description
 
 
 @pytest.mark.asyncio
@@ -193,8 +196,10 @@ async def test_expand_sink_concept_returns_incoming_neighbors(tmp_path):
     # describes it via its incoming edge, so expand must surface that same
     # relation instead of "(no connected)".
     result = await reg.expand(["ConsensusEngine"], depth=1)
-    connected = {c["id"] for c in result["ConsensusEngine"].connected}
-    assert "MAGRPO" in connected
+    conn = {c["id"]: c["relation"] for c in result["ConsensusEngine"].connected}
+    assert "MAGRPO" in conn
+    # incoming relation is direction-marked, not inverted
+    assert conn["MAGRPO"] == "←used_by"
 
 
 @pytest.mark.asyncio
