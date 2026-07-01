@@ -491,6 +491,9 @@ Most tools accept detail="compact|brief|full":
         and applicability assessments for configured projects.
         """
         result = await pipeline.distill(entry_id)
+        if getattr(result, "skipped", False):
+            return (f"Distillation already in progress for {entry_id} "
+                    f"(held by another drainer): {result.title}")
         if not result.success:
             return f"Distillation failed for {entry_id}: {result.title}"
 
@@ -543,7 +546,12 @@ Most tools accept detail="compact|brief|full":
         succeeded = sum(1 for r in results if r.success)
         lines = [f"Distilled {succeeded}/{len(results)} papers:\n"]
         for r in results:
-            status = "ok" if r.success else "FAILED"
+            if getattr(r, "skipped", False):
+                status = "skip"  # held by another drainer, not a failure
+            elif r.success:
+                status = "ok"
+            else:
+                status = "FAILED"
             lines.append(f"  [{status}] {r.title}")
         return "\n".join(lines)
 

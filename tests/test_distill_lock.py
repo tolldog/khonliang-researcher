@@ -177,6 +177,20 @@ def test_recover_leaves_live_locked_processing(tmp_path):
     assert pipeline.knowledge.get("live").status == EntryStatus.PROCESSING
 
 
+def test_get_next_skips_live_locked_papers(tmp_path):
+    # codex: don't hand out a paper a sibling is actively distilling — pick a
+    # different INGESTED one so a batch slot isn't spent on a contention skip.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "locked", EntryStatus.INGESTED)
+    _add(pipeline, "free", EntryStatus.INGESTED)
+    pipeline.locks.claim("locked")  # a live owner holds it
+    worker = DistillWorker(pipeline)
+
+    nxt = worker.get_next()
+
+    assert nxt is not None and nxt.id == "free"  # the live-locked one is skipped
+
+
 def test_worker_get_next_reclaims_dead_orphan(tmp_path):
     pipeline = create_pipeline(_make_config(tmp_path))
     _add(pipeline, "orphan", EntryStatus.PROCESSING)

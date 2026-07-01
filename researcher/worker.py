@@ -55,8 +55,14 @@ class DistillWorker(BaseQueueWorker):
         self.pipeline.recover_stalled_processing()
         for entry in self.pipeline.knowledge.get_by_status(EntryStatus.INGESTED, tier=Tier.IMPORTED):
             retries = self._failed_ids.get(entry.id, 0)
-            if retries < self.max_retries_per_item:
-                return entry
+            if retries >= self.max_retries_per_item:
+                continue
+            # Skip papers a sibling drainer is actively distilling (live lock) —
+            # pick a different one instead of racing to a no-op claim. Avoids
+            # wasting a batch slot on a contention skip (abfe679b).
+            if self.pipeline.locks.is_locked_live(entry.id):
+                continue
+            return entry
         return None
 
     async def process_item(self, entry) -> bool:
