@@ -5,7 +5,7 @@ description = "Research paper ingestion and distillation pipeline powered by kho
 requires-python = ">=3.11"
 dependencies = [
     "ollama-khonliang @ git+https://github.com/tolldog/ollama-khonliang.git@main",
-    "khonliang-researcher-lib @ git+https://github.com/tolldog/khonliang-researcher-lib.git@4c72dff767fda7f3392483a874df8e39039621b0",
+    "khonliang-researcher-lib @ git+https://github.com/tolldog/khonliang-researcher-lib.git@f861055624467b534ded1b086a5ec1e5561f3d83",
     "aiohttp>=3.9",
     "Brotli>=1.1.0",  # aiohttp decodes `br` content-encoding only when this is
                       # importable; undeclared-transitive in dev, absent in prod

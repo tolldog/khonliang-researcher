@@ -27,6 +27,7 @@ from typing import Optional
 
 from khonliang.knowledge.store import EntryStatus, Tier
 from khonliang_researcher import BaseQueueWorker
+from khonliang_researcher.worker import SKIP
 
 from researcher.pipeline import ResearchPipeline, create_pipeline
 
@@ -76,16 +77,12 @@ class DistillWorker(BaseQueueWorker):
         if getattr(result, "skipped", False):
             # A live owner claimed the paper in the tiny window between get_next
             # (which already filters live-locked papers) and distill's claim.
-            # It's neither a success nor a failure, but BaseQueueWorker.process_item
-            # is bool-only and run_batch consumes the batch slot regardless, so
-            # the sole lever is the stat. Report success (True): the paper IS
-            # being distilled (by the sibling) and will finish or be recovered on
-            # that owner's crash — returning False would spuriously fail it and
-            # burn its retry budget. Residual: a rare contention skip counts as
-            # "processed" in stats; a precise fix needs a BaseQueueWorker skip
-            # return type (follow-up).
+            # It's neither a success nor a failure — return the SKIP sentinel so
+            # BaseQueueWorker counts it as `declined` (not processed, not a retry
+            # failure): the paper IS being distilled by the sibling and will
+            # finish or be recovered on that owner's crash (abfe679b).
             logger.info("  SKIPPED (locked by another drainer): %s", entry.title[:60])
-            return True
+            return SKIP
         if result.success:
             triples = len(result.triples) if result.triples else 0
             logger.info(

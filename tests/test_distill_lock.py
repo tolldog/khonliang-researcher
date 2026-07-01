@@ -295,9 +295,10 @@ async def test_distill_skip_sets_skipped_flag(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_worker_process_item_skip_is_not_a_failure(tmp_path):
-    # codex: a lock-contention skip must report success so it doesn't burn the
-    # item's retry budget (BaseQueueWorker would otherwise blacklist it).
+async def test_worker_process_item_skip_returns_skip_sentinel(tmp_path):
+    # A lock-contention skip returns the SKIP sentinel so BaseQueueWorker counts
+    # it as `declined` — neither processed nor a retry failure (bug abfe679b).
+    from khonliang_researcher.worker import SKIP
     pipeline = create_pipeline(_make_config(tmp_path))
     _add(pipeline, "p1", EntryStatus.INGESTED)
     pipeline.locks.claim("p1")  # live owner holds it
@@ -309,7 +310,7 @@ async def test_worker_process_item_skip_is_not_a_failure(tmp_path):
 
     ok = await worker.process_item(pipeline.knowledge.get("p1"))
 
-    assert ok is True  # skip reported as success, not failure
+    assert ok is SKIP
 
 
 @pytest.mark.asyncio
