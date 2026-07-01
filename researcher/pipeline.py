@@ -48,6 +48,9 @@ class DistillResult:
     triples: List[Dict[str, Any]] = field(default_factory=list)
     assessments: Dict[str, Any] = field(default_factory=dict)
     success: bool = False
+    # True when distill was a no-op because a live owner already holds the lock
+    # — a skip, NOT a failure (must not count against a worker's retry budget).
+    skipped: bool = False
 
 
 def is_paper_entry(entry: KnowledgeEntry) -> bool:
@@ -701,6 +704,7 @@ class ResearchPipeline:
         # is on this paper — skip rather than double-distill (bug abfe679b).
         if not self.locks.claim(entry_id):
             logger.info("Distill skipped for %s — held by a live owner", entry_id)
+            result.skipped = True  # contention, not a failure
             return result
 
         self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)

@@ -65,14 +65,29 @@ def _proc_start_ticks(pid: int) -> Optional[int]:
         return None
 
 
-def owner_token_for(pid: int) -> Optional[str]:
-    """``<YYYYMMDD-HHMMSS>_<pid>`` for a live pid, or None if it isn't running."""
+def _start_epoch(pid: int) -> Optional[float]:
+    """Process start time as an epoch, or None if the pid isn't resolvable.
+
+    Prefers /proc (Linux, no deps); falls back to psutil when installed so
+    non-/proc hosts (e.g. macOS dev machines) still get a reuse-safe start time.
+    """
     ticks = _proc_start_ticks(pid)
     btime = _boot_time()
-    if ticks is None or btime is None:
+    if ticks is not None and btime is not None:
+        return btime + ticks / _HZ
+    try:  # optional — only used where /proc is unavailable
+        import psutil
+        return psutil.Process(pid).create_time()
+    except Exception:
         return None
-    start_epoch = btime + ticks / _HZ
-    stamp = datetime.fromtimestamp(start_epoch).strftime("%Y%m%d-%H%M%S")
+
+
+def owner_token_for(pid: int) -> Optional[str]:
+    """``<YYYYMMDD-HHMMSS>_<pid>`` for a live pid, or None if it isn't running."""
+    start = _start_epoch(pid)
+    if start is None:
+        return None
+    stamp = datetime.fromtimestamp(start).strftime("%Y%m%d-%H%M%S")
     return f"{stamp}_{pid}"
 
 

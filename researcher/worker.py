@@ -67,6 +67,12 @@ class DistillWorker(BaseQueueWorker):
             return True
 
         result = await self.pipeline.distill(entry.id)
+        if getattr(result, "skipped", False):
+            # A live owner holds the lock — contention, not a failure. Report
+            # success so this doesn't burn the item's retry budget (a later
+            # crash of that owner requeues the paper and we must still take it).
+            logger.info("  SKIPPED (locked by another drainer): %s", entry.title[:60])
+            return True
         if result.success:
             triples = len(result.triples) if result.triples else 0
             logger.info(

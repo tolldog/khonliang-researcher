@@ -244,6 +244,33 @@ async def test_distill_skips_when_live_locked(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_distill_skip_sets_skipped_flag(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.locks.claim("p1")  # a live owner holds it
+    result = await pipeline.distill("p1")
+    assert result.success is False and result.skipped is True
+
+
+@pytest.mark.asyncio
+async def test_worker_process_item_skip_is_not_a_failure(tmp_path):
+    # codex: a lock-contention skip must report success so it doesn't burn the
+    # item's retry budget (BaseQueueWorker would otherwise blacklist it).
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.locks.claim("p1")  # live owner holds it
+
+    async def not_irrelevant(entry_id):
+        return False
+    pipeline.filter_irrelevant = not_irrelevant
+    worker = DistillWorker(pipeline)
+
+    ok = await worker.process_item(pipeline.knowledge.get("p1"))
+
+    assert ok is True  # skip reported as success, not failure
+
+
+@pytest.mark.asyncio
 async def test_distill_success_survives_record_signal_failure(tmp_path):
     pipeline = create_pipeline(_make_config(tmp_path))
     _add(pipeline, "p1", EntryStatus.INGESTED)
