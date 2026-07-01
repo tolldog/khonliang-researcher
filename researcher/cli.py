@@ -166,7 +166,12 @@ def distill(ctx, entry_id, distill_all):
                 click.echo("No pending papers to distill.")
                 return
             for r in results:
-                status = "ok" if r.success else "FAILED"
+                if getattr(r, "skipped", False):
+                    status = "skip"  # held by another drainer, not a failure
+                elif r.success:
+                    status = "ok"
+                else:
+                    status = "FAILED"
                 click.echo(f"  [{status}] {r.title}")
                 if r.success and r.triples:
                     click.echo(f"         {len(r.triples)} triples extracted")
@@ -189,6 +194,11 @@ def distill(ctx, entry_id, distill_all):
                     for proj, assess in result.assessments.items():
                         if isinstance(assess, dict):
                             click.echo(f"  {proj}: {assess.get('score', 0):.0%}")
+            elif getattr(result, "skipped", False):
+                click.echo(
+                    f"Distillation already in progress (held by another "
+                    f"drainer): {result.title}"
+                )
             else:
                 click.echo(f"Distillation failed: {result.title}", err=True)
                 sys.exit(1)
@@ -210,6 +220,10 @@ def worker(ctx, batch, pause):
     pipeline = _get_pipeline(ctx)
     w = DistillWorker(pipeline, pause_between=pause)
 
+    # Reclaim papers orphaned by a dead distiller before the queue-depth check —
+    # otherwise a queue of only crashed-owner PROCESSING rows reports 0 pending
+    # and exits without draining them (bug abfe679b).
+    pipeline.recover_stalled_processing()
     pending = w.count_pending()
     if pending == 0:
         click.echo("No pending papers.")

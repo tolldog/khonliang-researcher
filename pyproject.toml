@@ -12,6 +12,8 @@ dependencies = [
                       # → brotli blogs failed (bug_khonliang-researcher_e5ad3234)
     "beautifulsoup4>=4.12",
     "click>=8.0",
+    "psutil>=5.9",  # cross-platform process start-time for distill-lock owner
+                    # tokens on hosts without /proc (bug abfe679b)
     "pyyaml>=6.0",
     "pymupdf>=1.24",
     "markdownify>=0.12",

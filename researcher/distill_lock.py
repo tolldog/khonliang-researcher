@@ -68,14 +68,15 @@ def _proc_start_ticks(pid: int) -> Optional[int]:
 def _start_epoch(pid: int) -> Optional[float]:
     """Process start time as an epoch, or None if the pid isn't resolvable.
 
-    Prefers /proc (Linux, no deps); falls back to psutil when installed so
-    non-/proc hosts (e.g. macOS dev machines) still get a reuse-safe start time.
+    Prefers /proc (Linux, no import cost); falls back to psutil (a declared
+    dependency) on non-/proc hosts (e.g. macOS dev machines) so they still get a
+    reuse-safe start time.
     """
     ticks = _proc_start_ticks(pid)
     btime = _boot_time()
     if ticks is not None and btime is not None:
         return btime + ticks / _HZ
-    try:  # optional — only used where /proc is unavailable
+    try:  # /proc unavailable (non-Linux) — psutil is declared in pyproject
         import psutil
         return psutil.Process(pid).create_time()
     except Exception:
