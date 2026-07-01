@@ -1574,6 +1574,209 @@ class ResearchPipeline:
             },
         }
 
+    # ------------------------------------------------------------------
+    # Cross-repo integration scan (FR 33561994, Phase 1 — report only)
+    # ------------------------------------------------------------------
+
+    def _repo_capability_gaps(self, repos: Optional[List[str]] = None) -> Dict[str, set]:
+        """Per-repo set of *gap* concepts (planned/exploring capabilities).
+
+        A gap is a capability the project tracks as ``planned`` or ``exploring``
+        (not ``exists``). Drives the COMPLEMENTARITY signal: repo A implements
+        what repo B lists here. Keyed by normalized concept for matching.
+        """
+        from researcher.cross_repo_scan import normalize_concept
+
+        want = set(repos) if repos else None
+        gaps: Dict[str, set] = {}
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            tags = entry.tags or []
+            if "capability" not in tags:
+                continue
+            meta = entry.metadata or {}
+            status = meta.get("capability_status", "")
+            if status not in {"planned", "exploring"}:
+                continue
+            target = meta.get("target", "")
+            if not target or (want is not None and target not in want):
+                continue
+            # concept metadata field, else the capability title
+            concept = str(meta.get("concept") or entry.title or "").strip()
+            if not concept:
+                continue
+            gaps.setdefault(target, set()).add(normalize_concept(concept))
+        return gaps
+
+    def _latent_corpus_concepts(
+        self,
+        footprints: Dict[str, Dict[str, float]],
+        repos: List[str],
+        threshold: float,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Corpus concepts that no target repo uses above threshold.
+
+        Uses the concept graph + corpus: every distilled concept is a candidate;
+        keep the ones whose max score across target repos is below threshold but
+        which appear in the corpus (i.e. researcher has evidence for them). The
+        LATENT classifier filters infra + already-used; here we just surface the
+        raw pool with corpus provenance (source paper ids).
+        """
+        from researcher.cross_repo_scan import normalize_concept
+
+        repo_set = set(repos)
+        latent: List[Dict[str, Any]] = []
+        for concept, repo_scores in footprints.items():
+            in_repo_max = max(
+                (s for r, s in repo_scores.items() if r in repo_set),
+                default=0.0,
+            )
+            if in_repo_max >= threshold:
+                continue
+            # corpus relevance: the best score this concept holds for ANY target
+            # (paper/project) — evidence the corpus considers it worth adopting.
+            corpus_max = max(repo_scores.values(), default=0.0)
+            if corpus_max < threshold:
+                continue
+            # provenance: papers whose distilled triples mention this concept
+            sources = self._concept_source_papers(concept)
+            latent.append({
+                "concept": concept,
+                "score": corpus_max,
+                "sources": sources,
+            })
+        latent.sort(key=lambda d: -d["score"])
+        return latent[:limit]
+
+    def _concept_source_papers(self, concept: str, limit: int = 5) -> List[str]:
+        """Paper/source ids whose triples reference ``concept`` (corpus provenance)."""
+        sources: List[str] = []
+        seen = set()
+        try:
+            triples = self.triples.get(min_confidence=0.3, limit=5000)
+        except Exception:
+            return sources
+        target = concept.lower()
+        for t in triples:
+            if concept in (t.subject, t.object) or target in (
+                (t.subject or "").lower(),
+                (t.object or "").lower(),
+            ):
+                src = t.source or ""
+                if src and src not in seen:
+                    seen.add(src)
+                    sources.append(src)
+                    if len(sources) >= limit:
+                        break
+        return sources
+
+    def scan_cross_repo_integration(
+        self,
+        repos: Optional[List[str]] = None,
+        *,
+        threshold: float = 0.4,
+        already_filed: Optional[List[Dict[str, Any]]] = None,
+        dismissed: Optional[List[Dict[str, Any]]] = None,
+        max_findings: int = 50,
+        latent_limit: int = 20,
+    ) -> Dict[str, Any]:
+        """On-demand cross-repo integration-opportunity scan (report only).
+
+        Composes existing signals — ``build_project_scores`` (concept footprints),
+        capability gaps (planned/exploring), and latent corpus concepts — into a
+        classified, deduped, provenance-carrying report across >=2 registered
+        repos. NEVER files or promotes anything; developer intake is a separate
+        reviewed step.
+
+        Args:
+            repos: target repo/project names. Defaults to all registered repos.
+            threshold: min concept score for a repo to "implement" a concept.
+            already_filed / dismissed: dedup sources (list of dicts carrying
+                ``concept`` and optionally ``signal_class``/``repos`` or a
+                ``dedup_key``). Callers supply these from developer's FR store /
+                a dismissed-candidates record via the bus.
+            max_findings: cap on returned findings.
+            latent_limit: cap on latent-concept candidates considered.
+        """
+        from khonliang_researcher import build_project_scores
+
+        from researcher.cross_repo_scan import (
+            build_report,
+            classify_cross_repo_findings,
+        )
+
+        # Resolve target repos.
+        if repos:
+            target_repos = list(repos)
+        else:
+            target_repos = [
+                r.get("project")
+                for r in self.list_evidence_sources()
+                if r.get("project")
+            ]
+            # de-dup while preserving order
+            seen: set = set()
+            target_repos = [
+                r for r in target_repos if not (r in seen or seen.add(r))
+            ]
+
+        if len(target_repos) < 2:
+            return {
+                "repos": target_repos,
+                "finding_count": 0,
+                "by_class": {},
+                "findings": [],
+                "auto_filed": False,
+                "error": "need >=2 registered repos to scan for integration opportunities",
+            }
+
+        # Per-repo concept footprints: {concept: {repo: score}}.
+        footprints = build_project_scores(self.knowledge, self.triples)
+
+        gaps = self._repo_capability_gaps(target_repos)
+        latent = self._latent_corpus_concepts(
+            footprints, target_repos, threshold, latent_limit
+        )
+
+        # Dedup gap note: if the caller supplied no dedup sources, flag it so the
+        # report is honest that repeated runs can't yet self-suppress.
+        dedup_gap_note = ""
+        if not already_filed and not dismissed:
+            dedup_gap_note = (
+                "no already-filed/dismissed candidates supplied; findings are not "
+                "deduped against developer's FR store this run"
+            )
+
+        findings = classify_cross_repo_findings(
+            footprints,
+            gaps=gaps,
+            latent=latent,
+            already_filed=already_filed,
+            dismissed=dismissed,
+            repos=target_repos,
+            threshold=threshold,
+            max_findings=max_findings,
+        )
+
+        report = build_report(
+            findings, repos=target_repos, dedup_gap_note=dedup_gap_note
+        )
+        self.digest.record(
+            summary=(
+                f"Cross-repo scan: {report['finding_count']} candidates across "
+                f"{len(target_repos)} repos (nothing filed)"
+            ),
+            source="pipeline",
+            audience="research",
+            tags=["cross-repo-scan"],
+            metadata={
+                "repos": target_repos,
+                "by_class": report["by_class"],
+                "auto_filed": False,
+            },
+        )
+        return report
+
     _README_CLAIMS_PROMPT = """\
 Extract capability claims from the following README. List only concrete, specific \
 features that this project claims to implement. Do not list generic descriptions. \
