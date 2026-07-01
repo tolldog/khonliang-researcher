@@ -424,6 +424,25 @@ def test_pipeline_threshold_floor_never_exceeds_default(monkeypatch):
     assert seen["min_score"] == pytest.approx(0.3)
 
 
+def test_pipeline_dedups_explicit_duplicate_repo_args(monkeypatch):
+    # repos="x,x" must NOT pass the >=2 guard as a bogus single-repo scan
+    # (codex P3).
+    pipe = _make_pipeline(
+        footprints={},
+        gaps_entries=[],
+        triples=[],
+        evidence_sources=[{"project": "x"}],
+    )
+    monkeypatch.setattr(
+        "khonliang_researcher.build_project_scores",
+        lambda knowledge, triples, **kw: {},
+    )
+    report = pipe.scan_cross_repo_integration(repos=["x", "x"])
+    assert report["repos"] == ["x"]
+    assert "error" in report
+    assert report["finding_count"] == 0
+
+
 def test_pipeline_requires_two_repos(monkeypatch):
     pipe = _make_pipeline(
         footprints={},

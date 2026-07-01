@@ -1836,6 +1836,8 @@ Most tools accept detail="compact|brief|full":
         repos: str = "",
         threshold: float = 0.4,
         max_findings: int = 50,
+        already_filed: str = "",
+        dismissed: str = "",
         detail: str = "brief",
     ) -> str:
         """Cross-repo integration-opportunity scan. detail: compact|brief|full.
@@ -1849,16 +1851,43 @@ Most tools accept detail="compact|brief|full":
 
         Generic infra concepts (HTTP, logging, config, serialization) are
         filtered as noise. Findings carry provenance (repos, concepts, corpus
-        sources) and dedup against prior/dismissed candidates. ``repos`` is a
-        comma-separated project list; empty scans all registered repos.
+        sources). ``repos`` is a comma-separated project list; empty scans all
+        registered repos.
+
+        DEDUP: pass ``already_filed`` / ``dismissed`` as JSON arrays of
+        ``{concept, signal_class?, repos?}`` (or ``{dedup_key}``) — matching
+        candidates are suppressed so repeated runs don't re-surface the same
+        idea. Researcher has no outbound path to developer's FR store, so the
+        CALLER (e.g. developer, which reads its own FRs) supplies these; when
+        omitted the report flags that findings were not deduped this run.
         """
         from researcher.util import split_csv
+
+        def _parse_dedup(value: str, label: str):
+            if not value.strip():
+                return None
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return f"cross-repo scan: {label} must be a JSON array"
+            if not isinstance(parsed, list):
+                return f"cross-repo scan: {label} must be a JSON array"
+            return parsed
+
+        filed = _parse_dedup(already_filed, "already_filed")
+        if isinstance(filed, str):
+            return filed
+        dropped = _parse_dedup(dismissed, "dismissed")
+        if isinstance(dropped, str):
+            return dropped
 
         repo_list = split_csv(repos) or None
         report = pipeline.scan_cross_repo_integration(
             repos=repo_list,
             threshold=threshold,
             max_findings=max_findings,
+            already_filed=filed,
+            dismissed=dropped,
         )
 
         if report.get("error"):

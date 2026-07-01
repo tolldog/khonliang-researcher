@@ -1729,18 +1729,20 @@ class ResearchPipeline:
 
         # Resolve target repos.
         if repos:
-            target_repos = list(repos)
+            raw_repos = list(repos)
         else:
-            target_repos = [
+            raw_repos = [
                 r.get("project")
                 for r in self.list_evidence_sources()
                 if r.get("project")
             ]
-            # de-dup while preserving order
-            seen: set = set()
-            target_repos = [
-                r for r in target_repos if not (r in seen or seen.add(r))
-            ]
+        # De-dup while preserving order — for BOTH the explicit and discovered
+        # paths, so repos="researcher,researcher" can't pass the >=2 guard and
+        # produce a bogus single-repo "cross-repo" report (codex P3).
+        seen: set = set()
+        target_repos = [
+            r for r in raw_repos if not (r in seen or seen.add(r))
+        ]
 
         if len(target_repos) < 2:
             return {
