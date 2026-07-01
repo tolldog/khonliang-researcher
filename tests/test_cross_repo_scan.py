@@ -278,7 +278,7 @@ def test_pipeline_scan_end_to_end(monkeypatch):
 
     monkeypatch.setattr(
         "khonliang_researcher.build_project_scores",
-        lambda knowledge, triples: pipe._footprints,
+        lambda knowledge, triples, **kw: pipe._footprints,
     )
 
     report = pipe.scan_cross_repo_integration(
@@ -313,7 +313,7 @@ def test_pipeline_dedup_removes_filed_candidate(monkeypatch):
     )
     monkeypatch.setattr(
         "khonliang_researcher.build_project_scores",
-        lambda knowledge, triples: pipe._footprints,
+        lambda knowledge, triples, **kw: pipe._footprints,
     )
 
     dup = Finding(DUPLICATION, "consensus voting", ["khonliang", "researcher"], "")
@@ -346,7 +346,7 @@ def test_latent_excludes_scores_from_out_of_scope_repos(monkeypatch):
     )
     monkeypatch.setattr(
         "khonliang_researcher.build_project_scores",
-        lambda knowledge, triples: pipe._footprints,
+        lambda knowledge, triples, **kw: pipe._footprints,
     )
     report = pipe.scan_cross_repo_integration(repos=["repo_a", "repo_b"])
     latent_concepts = {
@@ -372,12 +372,56 @@ def test_latent_provenance_includes_all_multi_source_tokens(monkeypatch):
     )
     monkeypatch.setattr(
         "khonliang_researcher.build_project_scores",
-        lambda knowledge, triples: pipe._footprints,
+        lambda knowledge, triples, **kw: pipe._footprints,
     )
     report = pipe.scan_cross_repo_integration(repos=["repo_a", "repo_b"])
     latent = [f for f in report["findings"] if f["signal_class"] == LATENT_CONCEPT]
     assert latent
     assert set(latent[0]["corpus_sources"]) == {"paper:primary", "paper:secondary"}
+
+
+def test_pipeline_passes_low_threshold_to_footprint_builder(monkeypatch):
+    # A threshold below build_project_scores' 0.3 default must be forwarded as
+    # min_score so [threshold, 0.3) concepts aren't silently dropped (codex P2).
+    seen = {}
+
+    def _fake_scores(knowledge, triples, min_score=0.3, **kw):
+        seen["min_score"] = min_score
+        return {"low concept": {"repo_a": 0.25, "repo_b": 0.25}}
+
+    pipe = _make_pipeline(
+        footprints={},
+        gaps_entries=[],
+        triples=[],
+        evidence_sources=[{"project": "repo_a"}, {"project": "repo_b"}],
+    )
+    monkeypatch.setattr("khonliang_researcher.build_project_scores", _fake_scores)
+
+    report = pipe.scan_cross_repo_integration(
+        repos=["repo_a", "repo_b"], threshold=0.2
+    )
+    assert seen["min_score"] == pytest.approx(0.2)
+    # the sub-0.3 duplication is now visible
+    assert any(f["concept"] == "low concept" for f in report["findings"])
+
+
+def test_pipeline_threshold_floor_never_exceeds_default(monkeypatch):
+    seen = {}
+
+    def _fake_scores(knowledge, triples, min_score=0.3, **kw):
+        seen["min_score"] = min_score
+        return {}
+
+    pipe = _make_pipeline(
+        footprints={},
+        gaps_entries=[],
+        triples=[],
+        evidence_sources=[{"project": "a"}, {"project": "b"}],
+    )
+    monkeypatch.setattr("khonliang_researcher.build_project_scores", _fake_scores)
+    pipe.scan_cross_repo_integration(repos=["a", "b"], threshold=0.6)
+    # threshold above default must not raise the floor (stays 0.3)
+    assert seen["min_score"] == pytest.approx(0.3)
 
 
 def test_pipeline_requires_two_repos(monkeypatch):

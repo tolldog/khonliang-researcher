@@ -1617,15 +1617,23 @@ class ResearchPipeline:
     ) -> List[Dict[str, Any]]:
         """Corpus concepts that no target repo uses above threshold.
 
-        Uses the concept graph + corpus: every distilled concept is a candidate;
-        keep the ones whose max score across target repos is below threshold but
-        which the CORPUS (not some other repo) considers relevant. Corpus
-        relevance is measured over non-repo targets only — a score on any
+        Candidate pool = the *scored footprint* concepts (from
+        ``build_project_scores``): concepts that have a qualifying corpus
+        assessment. Keep the ones whose max score across target repos is below
+        threshold but which the CORPUS (not some other repo) considers relevant.
+        Corpus relevance is measured over non-repo targets only — a score on any
         *registered repo* (target OR excluded from this scan) is repo relevance,
         not corpus evidence, so counting it would report a concept that only an
         excluded repo implements as a latent opportunity (codex P2). The LATENT
         classifier filters infra + already-used; here we surface the raw pool
         with corpus provenance (source paper ids).
+
+        SCOPE NOTE: this pool is bounded to scored footprint concepts. Concepts
+        that live only in triples from unassessed / sub-floor papers never enter
+        the footprint and so are invisible here; surfacing those corpus-only
+        ideas needs a separate triple-entity enumeration + relevance pass, left
+        to a follow-up (they are the weaker-evidence long tail, not the graded
+        corpus signal this Phase-1 report is grounded on).
         """
         repo_set = set(repos)
         # All registered repos are excluded from the corpus-evidence tally, not
@@ -1744,8 +1752,13 @@ class ResearchPipeline:
                 "error": "need >=2 registered repos to scan for integration opportunities",
             }
 
-        # Per-repo concept footprints: {concept: {repo: score}}.
-        footprints = build_project_scores(self.knowledge, self.triples)
+        # Per-repo concept footprints: {concept: {repo: score}}. Seed the score
+        # floor from the scan threshold so a caller lowering `threshold` below
+        # build_project_scores' 0.3 default still sees concepts in the
+        # [threshold, 0.3) band (codex P2); never raise it above the default.
+        footprints = build_project_scores(
+            self.knowledge, self.triples, min_score=min(threshold, 0.3)
+        )
 
         # Every registered repo (not just the in-scope ones) is excluded from
         # the corpus-evidence tally so a concept implemented only by an excluded
