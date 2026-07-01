@@ -289,8 +289,9 @@ async def test_distill_skip_sets_skipped_flag(tmp_path):
     _add(pipeline, "p1", EntryStatus.INGESTED)
     pipeline.locks.claim("p1")  # a live owner holds it
     result = await pipeline.distill("p1")
-    # Benign skip: success=True (not a failure) but skipped flags it did no work.
-    assert result.success is True and result.skipped is True
+    # A skip is neither success nor failure: success stays False (not a distill),
+    # skipped flags it for callers so they don't misreport it as an error.
+    assert result.success is False and result.skipped is True
 
 
 @pytest.mark.asyncio

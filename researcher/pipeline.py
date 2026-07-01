@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -704,12 +705,11 @@ class ResearchPipeline:
         # is on this paper — skip rather than double-distill (bug abfe679b).
         if not self.locks.claim(entry_id):
             logger.info("Distill skipped for %s — held by a live owner", entry_id)
-            # Benign: the paper IS being distilled (by a live sibling) and will
-            # finish or be recovered on that owner's crash. Mark success=True so
-            # the many callers that read `not success` as a hard failure (e.g.
-            # consume_research_request) don't misreport it; skipped=True lets a
-            # caller that cares tell this call did no work itself. (abfe679b)
-            result.success = True
+            # A skip is NOT a successful distill (no summary/triples produced) and
+            # NOT a failure. success stays False so distilled-counters
+            # (sum(r.success)) correctly exclude it; skipped=True lets the few
+            # failure-recording callers branch so they don't misreport it as an
+            # error. (abfe679b)
             result.skipped = True
             return result
 
@@ -894,17 +894,41 @@ class ResearchPipeline:
         if self.knowledge.get(summary_id):
             self.knowledge.remove(summary_id)
             removed["summary"] = 1
-        # Unbounded scan (limit=None): a paper's stale provenance could sit on any
-        # triple, including rows past a fixed page — must not be capped.
-        for t in self.triples.get(limit=None):
-            tokens = set(t.sources)
-            for src in (f"paper:{entry_id}", f"idea:{entry_id}"):
-                if src in tokens and self.triples.remove_source(
-                    t.subject, t.predicate, t.object, src
-                ):
-                    removed["triples"] += 1
-                    break
+        # Find exactly this paper's triples via a READ-ONLY query on the
+        # triple_sources side-table. TripleStore.get() is NOT read-only — it bumps
+        # access_count and commits per row — so scanning it here would rewrite the
+        # whole table and skew decay on every recovery. remove_source drops only
+        # our token, so a fact another source also asserts survives.
+        for subject, predicate, obj, src in self._triples_for_sources(
+            (f"paper:{entry_id}", f"idea:{entry_id}")
+        ):
+            if self.triples.remove_source(subject, predicate, obj, src):
+                removed["triples"] += 1
         return removed
+
+    def _triples_for_sources(self, sources) -> List[tuple]:
+        """Read-only ``(subject, predicate, object, source)`` rows whose source
+        token is one of ``sources`` — no ``access_count`` side-effect, indexed
+        join, not a full-table scan."""
+        sources = [s for s in sources if s]
+        if not sources:
+            return []
+        try:
+            conn = sqlite3.connect(f"file:{self.triples.db_path}?mode=ro", uri=True)
+        except sqlite3.OperationalError:
+            return []
+        try:
+            placeholders = ",".join("?" * len(sources))
+            return conn.execute(
+                "SELECT t.subject, t.predicate, t.object, ts.source "
+                "FROM triples t JOIN triple_sources ts ON ts.triple_id = t.id "
+                f"WHERE ts.source IN ({placeholders})",  # nosec B608 — placeholders only
+                sources,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # triple_sources absent (pre-migration) — nothing to clear
+        finally:
+            conn.close()
 
     async def distill_all_pending(self) -> List[DistillResult]:
         """Find and distill all papers that haven't been processed yet."""
@@ -2438,6 +2462,10 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
                             result = await self.distill(entry_id)
                             if result.success:
                                 distilled += 1
+                            elif getattr(result, "skipped", False):
+                                # Another live drainer is distilling it — benign,
+                                # not a failure (abfe679b).
+                                pass
                             else:
                                 failed.append(
                                     {
