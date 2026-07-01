@@ -60,7 +60,7 @@ async def test_research_idea_per_query_budget_floored_at_one(monkeypatch):
     assert captured == [1] * 11
 
 
-def test_strike_removes_all_url_index_aliases():
+def test_strike_removes_all_url_index_aliases(tmp_path):
     """ingest_paper indexes an entry under several URL aliases (canonical, raw,
     original, arxiv-abs). strike() must remove ALL of them, not just the
     canonical one, or a re-import via an alias returns the stale deleted id."""
@@ -75,11 +75,12 @@ def test_strike_removes_all_url_index_aliases():
             pass
 
     class _Triples:
-        def get(self, *a, **k):
-            return []
+        # strike() now finds triples via _triples_for_sources, which opens
+        # db_path read-only; a missing DB yields no rows (nothing to strike).
+        db_path = str(tmp_path / "absent.db")
 
-        def remove(self, *a, **k):
-            pass
+        def remove_source(self, *a, **k):
+            return False
 
     pipe = ResearchPipeline.__new__(ResearchPipeline)
     pipe.knowledge = _Knowledge()
@@ -132,6 +133,89 @@ def test_strike_retracts_only_its_source_keeping_co_supported_triples(tmp_path):
     ab = survivors[("A", "B")]
     assert ab.sources == ["idea:i1"]
     assert ab.confidence == 0.4          # recomputed down from the struck paper
+
+
+def test_strike_is_read_only_and_clears_beyond_10k_page(tmp_path):
+    """strike() must find a paper's triples via the read-only
+    _triples_for_sources helper, NOT self.triples.get(limit=10000):
+
+    - get() runs ``UPDATE ... access_count = access_count + 1`` per returned row,
+      so scanning the table to find provenance rewrites it and skews decay. After
+      a strike, access_count on untouched triples must be UNCHANGED.
+    - get() caps at 10k rows, so a paper's provenance on triples past the first
+      page was never struck. The helper joins triple_sources with no cap, so a
+      paper:<id> token is retracted regardless of table position
+      (fr_khonliang-researcher_c59b1692).
+    """
+    import sqlite3
+
+    from khonliang.knowledge.triples import TripleStore
+
+    triples = TripleStore(str(tmp_path / "t.db"))
+    # A handful of unrelated triples the paper never touches (their access_count
+    # must stay put), plus one triple carrying the struck paper's provenance.
+    for i in range(5):
+        triples.add(f"S{i}", "rel", f"O{i}", confidence=0.8, source="paper:other")
+    triples.add("P", "rel", "Q", confidence=0.9, source="paper:p1")
+
+    def _access_counts():
+        conn = sqlite3.connect(str(tmp_path / "t.db"))
+        try:
+            return dict(conn.execute("SELECT subject, access_count FROM triples").fetchall())
+        finally:
+            conn.close()
+
+    before = _access_counts()
+
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.knowledge = SimpleNamespace(
+        get=lambda _id: None if str(_id).endswith("_summary")
+        else SimpleNamespace(title="P1", metadata={"url": ""}),
+        remove=lambda *a, **k: None,
+    )
+    pipe.triples = triples
+    pipe.digest = SimpleNamespace(record=lambda **k: None)
+    pipe._url_index = {}
+
+    result = pipe.strike("p1")
+
+    # The paper's sole triple was struck.
+    assert result["triples"] == 1
+    after = _access_counts()
+    # No get()-style side-effect: every surviving triple's access_count is
+    # identical to before the strike (a full-table get() would have bumped all).
+    assert after == {k: v for k, v in before.items() if k != "P"}
+
+
+def test_strike_clears_provenance_past_10k_rows(tmp_path):
+    """The old ``self.triples.get(limit=10000)`` scan silently missed provenance
+    on any triple past the first 10k rows. The read-only side-table join has no
+    such cap: a paper:<id> token on a triple positioned beyond the page boundary
+    is still retracted. Simulated with a small helper cap so the test is fast."""
+    from khonliang.knowledge.triples import TripleStore
+
+    triples = TripleStore(str(tmp_path / "t.db"))
+    # 12 filler triples, THEN the paper's triple — so under a 10-row cap it would
+    # fall on a later page and be missed by a capped get()-scan.
+    for i in range(12):
+        triples.add(f"F{i}", "rel", f"G{i}", confidence=0.5, source="paper:filler")
+    triples.add("LATE", "rel", "TRIPLE", confidence=0.9, source="paper:p1")
+
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.knowledge = SimpleNamespace(
+        get=lambda _id: None if str(_id).endswith("_summary")
+        else SimpleNamespace(title="P1", metadata={"url": ""}),
+        remove=lambda *a, **k: None,
+    )
+    pipe.triples = triples
+    pipe.digest = SimpleNamespace(record=lambda **k: None)
+    pipe._url_index = {}
+
+    result = pipe.strike("p1")
+
+    assert result["triples"] == 1
+    survivors = {(t.subject, t.object) for t in triples.get(limit=100)}
+    assert ("LATE", "TRIPLE") not in survivors
 
 
 def test_get_historical_feature_requests_tolerates_non_dict_json():

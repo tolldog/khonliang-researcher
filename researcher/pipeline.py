@@ -968,17 +968,23 @@ class ResearchPipeline:
         # ``paper:<id>`` and ideas/blogs tag ``idea:<id>``. ``remove_source``
         # drops only our token and deletes the triple solely when no other
         # contributor remains, so a fact another paper/blog also asserts
-        # survives the strike (bug_khonliang-researcher_a905176b). A triple
-        # only gets struck once even if both tokens somehow match.
-        all_triples = self.triples.get(limit=10000)
-        for t in all_triples:
-            tokens = set(t.sources)
-            for src in (f"paper:{entry_id}", f"idea:{entry_id}"):
-                if src in tokens and self.triples.remove_source(
-                    t.subject, t.predicate, t.object, src
-                ):
-                    removed["triples"] += 1
-                    break
+        # survives the strike (bug_khonliang-researcher_a905176b).
+        #
+        # Find this entry's triples via the READ-ONLY ``_triples_for_sources``
+        # helper rather than ``self.triples.get(limit=10000)``: ``get()`` bumps
+        # access_count and commits per row (rewriting the table + skewing decay)
+        # and caps at 10k, so provenance on triples past the first page was never
+        # struck (fr_khonliang-researcher_c59b1692). Counts are unchanged: the
+        # helper may yield a triple once per token, but ``remove_source`` returns
+        # True only when it DELETES the triple (its last source), so a both-token
+        # triple increments the count exactly once — same as the old break-on-
+        # first loop and as ``_clear_distillation_artifacts`` (the PR #62 recovery
+        # path). Only the finding mechanism changes.
+        for subject, predicate, obj, src in self._triples_for_sources(
+            (f"paper:{entry_id}", f"idea:{entry_id}")
+        ):
+            if self.triples.remove_source(subject, predicate, obj, src):
+                removed["triples"] += 1
 
         # Remove the paper itself
         self.knowledge.remove(entry_id)
