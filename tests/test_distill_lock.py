@@ -278,7 +278,7 @@ async def test_distill_skips_when_live_locked(tmp_path):
 
     result = await pipeline.distill("p1")
 
-    assert result.success is False
+    assert result.skipped is True  # benign skip (success stays truthy)
     assert called == []  # never distilled — skipped
     assert pipeline.knowledge.get("p1").status == EntryStatus.INGESTED  # untouched
 
@@ -289,7 +289,8 @@ async def test_distill_skip_sets_skipped_flag(tmp_path):
     _add(pipeline, "p1", EntryStatus.INGESTED)
     pipeline.locks.claim("p1")  # a live owner holds it
     result = await pipeline.distill("p1")
-    assert result.success is False and result.skipped is True
+    # Benign skip: success=True (not a failure) but skipped flags it did no work.
+    assert result.success is True and result.skipped is True
 
 
 @pytest.mark.asyncio

@@ -704,7 +704,13 @@ class ResearchPipeline:
         # is on this paper — skip rather than double-distill (bug abfe679b).
         if not self.locks.claim(entry_id):
             logger.info("Distill skipped for %s — held by a live owner", entry_id)
-            result.skipped = True  # contention, not a failure
+            # Benign: the paper IS being distilled (by a live sibling) and will
+            # finish or be recovered on that owner's crash. Mark success=True so
+            # the many callers that read `not success` as a hard failure (e.g.
+            # consume_research_request) don't misreport it; skipped=True lets a
+            # caller that cares tell this call did no work itself. (abfe679b)
+            result.success = True
+            result.skipped = True
             return result
 
         self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)
