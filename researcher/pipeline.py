@@ -750,6 +750,9 @@ class ResearchPipeline:
             # leaves PROCESSING — reclaimed via the lock when the dead owner is
             # noticed.
             logger.warning("Distillation failed for %s", entry_id, exc_info=True)
+            # A mid-_store crash may have persisted partial summary/triples;
+            # clear them so a FAILED row leaves no stale artifacts behind.
+            self._clear_distillation_artifacts(entry_id)
             self.knowledge.set_status(entry_id, EntryStatus.FAILED)
             return result
         finally:
@@ -864,7 +867,9 @@ class ResearchPipeline:
         if self.knowledge.get(summary_id):
             self.knowledge.remove(summary_id)
             removed["summary"] = 1
-        for t in self.triples.get(limit=10000):
+        # Unbounded scan (limit=None): a paper's stale provenance could sit on any
+        # triple, including rows past a fixed page — must not be capped.
+        for t in self.triples.get(limit=None):
             tokens = set(t.sources)
             for src in (f"paper:{entry_id}", f"idea:{entry_id}"):
                 if src in tokens and self.triples.remove_source(

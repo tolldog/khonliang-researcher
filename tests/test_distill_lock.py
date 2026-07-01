@@ -202,6 +202,29 @@ async def test_distill_releases_lock_on_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_distill_failure_clears_partial_artifacts(tmp_path):
+    # codex: a crash inside _store_distillation (partial writes) then FAILED must
+    # not strand stale artifacts — recovery only touches PROCESSING rows.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.summarizer = SimpleNamespace(handle=_ok_summary)
+    pipeline.extractor = SimpleNamespace(handle=_ok_extract)
+
+    def store_boom(entry, result):
+        pipeline.triples.add("A", "relates_to", "B", confidence=0.7,
+                             source=f"paper:{entry.id}")  # partial write
+        raise RuntimeError("store crashed mid-way")
+    pipeline._store_distillation = store_boom
+
+    result = await pipeline.distill("p1")
+
+    assert result.success is False
+    assert pipeline.knowledge.get("p1").status == EntryStatus.FAILED
+    assert [t for t in pipeline.triples.get(limit=None) if "paper:p1" in t.sources] == []
+    assert pipeline.locks.is_locked_live("p1") is False  # lock still released
+
+
+@pytest.mark.asyncio
 async def test_distill_skips_when_live_locked(tmp_path):
     pipeline = create_pipeline(_make_config(tmp_path))
     _add(pipeline, "p1", EntryStatus.INGESTED)
