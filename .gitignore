@@ -18,3 +18,6 @@ config.yaml
 
 # Real, machine-specific deploy manifest (khonliang-deploy); commit deploy.yaml.example only.
 deploy.yaml
+
+# Claude Code local session state (settings + agent worktrees) — machine-local
+.claude/
