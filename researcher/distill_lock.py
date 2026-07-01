@@ -26,7 +26,7 @@ import logging
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -87,9 +87,12 @@ def owner_token_for(pid: int) -> Optional[str]:
     start = _start_epoch(pid)
     if start is None:
         return None
-    # Sub-second (%f) precision matters: a PID reused within the same second must
-    # NOT produce the same token as the dead owner, or its stale lock looks live.
-    stamp = datetime.fromtimestamp(start).strftime("%Y%m%d-%H%M%S.%f")
+    # UTC so the token is stable across DST / timezone reconfiguration while a
+    # long-lived worker runs — otherwise the same live PID would reformat to a
+    # different token and its lock could be wrongly stolen. Sub-second (%f)
+    # precision guards against same-second PID reuse producing the dead owner's
+    # token.
+    stamp = datetime.fromtimestamp(start, tz=timezone.utc).strftime("%Y%m%d-%H%M%S.%f")
     return f"{stamp}_{pid}"
 
 

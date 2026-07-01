@@ -74,9 +74,16 @@ class DistillWorker(BaseQueueWorker):
 
         result = await self.pipeline.distill(entry.id)
         if getattr(result, "skipped", False):
-            # A live owner holds the lock — contention, not a failure. Report
-            # success so this doesn't burn the item's retry budget (a later
-            # crash of that owner requeues the paper and we must still take it).
+            # A live owner claimed the paper in the tiny window between get_next
+            # (which already filters live-locked papers) and distill's claim.
+            # It's neither a success nor a failure, but BaseQueueWorker.process_item
+            # is bool-only and run_batch consumes the batch slot regardless, so
+            # the sole lever is the stat. Report success (True): the paper IS
+            # being distilled (by the sibling) and will finish or be recovered on
+            # that owner's crash — returning False would spuriously fail it and
+            # burn its retry budget. Residual: a rare contention skip counts as
+            # "processed" in stats; a precise fix needs a BaseQueueWorker skip
+            # return type (follow-up).
             logger.info("  SKIPPED (locked by another drainer): %s", entry.title[:60])
             return True
         if result.success:
