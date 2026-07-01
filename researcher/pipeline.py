@@ -844,16 +844,33 @@ class ResearchPipeline:
         owner (dead-owner lock, or — defensively — no lock at all, e.g. a crash
         between claim and the PROCESSING write, or pre-lock data).
         """
-        self.locks.reclaim_dead()  # drop dead-owner lock rows first
+        # Sweep any stray dead-owner lock rows (atomic, owner-predicated) — e.g.
+        # a lock left behind if a release ever failed. The per-paper claim below
+        # is the real recovery gate; this is cheap hygiene.
+        self.locks.reclaim_dead()
         count = 0
         for entry in self.knowledge.get_by_status(EntryStatus.PROCESSING, tier=Tier.IMPORTED):
-            if not self.locks.is_locked_live(entry.id):
-                # The crashed run may have persisted PARTIAL artifacts (some
-                # paper:<id> triples / a summary) before dying mid-_store. Clear
-                # them so the retry starts clean and stale facts don't accumulate.
+            # Use the atomic claim itself as the gate: it succeeds only if no
+            # LIVE owner holds the paper (a dead owner's lock is stolen). Holding
+            # the claim means no other drainer can take the paper while we
+            # requeue it, so recovery can't race a concurrent distill (codex).
+            if not self.locks.claim(entry.id):
+                continue
+            try:
+                # Re-read under the claim: the previous owner may have FINISHED
+                # (DISTILLED) and released between our PROCESSING scan and the
+                # claim — in that case leave it alone, don't scrub a good result.
+                fresh = self.knowledge.get(entry.id)
+                if fresh is None or fresh.status != EntryStatus.PROCESSING:
+                    continue
+                # Genuine orphan. A crash mid-_store may have persisted PARTIAL
+                # artifacts (some paper:<id> triples / a summary); clear them so
+                # the retry starts clean and stale facts don't accumulate.
                 self._clear_distillation_artifacts(entry.id)
                 self.knowledge.set_status(entry.id, EntryStatus.INGESTED)
                 count += 1
+            finally:
+                self.locks.release(entry.id)
         if count:
             logger.info("Recovered %d orphaned PROCESSING paper(s) -> INGESTED", count)
         return count

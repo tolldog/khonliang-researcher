@@ -87,7 +87,9 @@ def owner_token_for(pid: int) -> Optional[str]:
     start = _start_epoch(pid)
     if start is None:
         return None
-    stamp = datetime.fromtimestamp(start).strftime("%Y%m%d-%H%M%S")
+    # Sub-second (%f) precision matters: a PID reused within the same second must
+    # NOT produce the same token as the dead owner, or its stale lock looks live.
+    stamp = datetime.fromtimestamp(start).strftime("%Y%m%d-%H%M%S.%f")
     return f"{stamp}_{pid}"
 
 

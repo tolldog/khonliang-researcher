@@ -56,6 +56,12 @@ def test_owner_token_is_date_pid():
     assert "-" in tok.rsplit("_", 1)[0]  # a date-time stamp precedes the pid
 
 
+def test_owner_token_has_subsecond_precision_and_is_deterministic():
+    tok = owner_token_for(os.getpid())
+    assert "." in tok.rsplit("_", 1)[0]  # microseconds present (same-second reuse safe)
+    assert owner_token_for(os.getpid()) == tok  # stable for the same process
+
+
 def test_claim_release_roundtrip(tmp_path):
     store = DistillLockStore(str(tmp_path / "k.db"))
     assert store.claim("p1") is True
@@ -140,6 +146,26 @@ def test_recover_clear_preserves_co_sourced_triples(tmp_path):
     survivors = pipeline.triples.get(subject="A")
     assert len(survivors) == 1
     assert survivors[0].sources == ["paper:keep"]  # orphan token gone, other kept
+
+
+def test_recover_skips_paper_finished_after_scan(tmp_path, monkeypatch):
+    # codex P1: if the owner FINISHED (DISTILLED + released) between the
+    # PROCESSING scan and our claim, the re-read under the claim must leave it
+    # alone — not scrub the good result back to INGESTED.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.DISTILLED)  # already done, lock released
+    pipeline.triples.add("A", "relates_to", "B", confidence=0.9, source="paper:p1")
+
+    real = pipeline.knowledge.get_by_status
+    def fake(status, tier=None):
+        if status == EntryStatus.PROCESSING:
+            return [pipeline.knowledge.get("p1")]  # simulate it was PROCESSING at scan
+        return real(status, tier=tier)
+    monkeypatch.setattr(pipeline.knowledge, "get_by_status", fake)
+
+    assert pipeline.recover_stalled_processing() == 0
+    assert pipeline.knowledge.get("p1").status == EntryStatus.DISTILLED  # untouched
+    assert [t for t in pipeline.triples.get(limit=None) if "paper:p1" in t.sources]  # preserved
 
 
 def test_recover_leaves_live_locked_processing(tmp_path):
