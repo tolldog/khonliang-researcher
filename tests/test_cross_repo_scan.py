@@ -74,6 +74,21 @@ def test_complementarity_off_real_gap_signal():
     assert sorted(f.repos) == ["developer", "researcher"]
 
 
+def test_complementarity_names_strongest_provider():
+    # Two repos implement the concept; the finding must name the strongest one
+    # (highest score), not the alphabetical first (codex P2).
+    footprints = {
+        "triple provenance": {"alpha": 0.42, "zeta": 0.9, "gappy": 0.05},
+    }
+    gaps = {"gappy": {normalize_concept("triple provenance")}}
+    out = classify_cross_repo_findings(
+        footprints, gaps=gaps, repos=["alpha", "zeta", "gappy"]
+    )
+    comp = [f for f in out if f.signal_class == COMPLEMENTARITY]
+    assert comp and comp[0].detail["provider"] == "zeta"
+    assert comp[0].score == pytest.approx(0.9)
+
+
 def test_score_asymmetry_without_gap_is_not_complementarity():
     # researcher implements it, developer doesn't — but developer does NOT
     # list it as a gap. Must NOT manufacture complementarity from a score diff.
@@ -177,10 +192,12 @@ def test_build_report_marks_nothing_filed():
 # --------------------------------------------------------- pipeline wiring ----
 
 class _StubTriple:
-    def __init__(self, subject, obj, source):
+    def __init__(self, subject, obj, source, sources=None):
         self.subject = subject
         self.object = obj
         self.source = source
+        # multi-source provenance; primary token is `source`
+        self.sources = sources if sources is not None else ([source] if source else [])
 
 
 class _StubTriples:
@@ -308,6 +325,59 @@ def test_pipeline_dedup_removes_filed_candidate(monkeypatch):
     assert report["auto_filed"] is False
     # dedup source supplied -> no dedup gap note
     assert "dedup_gap" not in report
+
+
+def test_latent_excludes_scores_from_out_of_scope_repos(monkeypatch):
+    # A concept implemented ONLY by an excluded registered repo (repo_c) must
+    # NOT be reported as latent for a repo_a,repo_b subset scan (codex P2).
+    footprints = {
+        "repo_c only concept": {"repo_c": 0.9, "repo_a": 0.0, "repo_b": 0.0},
+        # a genuine latent concept: corpus (paper target) rates it, no repo uses it
+        "genuine latent": {"paper_target": 0.85, "repo_a": 0.0, "repo_b": 0.0},
+    }
+    evidence_sources = [
+        {"project": "repo_a"}, {"project": "repo_b"}, {"project": "repo_c"},
+    ]
+    pipe = _make_pipeline(
+        footprints=footprints,
+        gaps_entries=[],
+        triples=[_StubTriple("genuine latent", "x", "paper:g1")],
+        evidence_sources=evidence_sources,
+    )
+    monkeypatch.setattr(
+        "khonliang_researcher.build_project_scores",
+        lambda knowledge, triples: pipe._footprints,
+    )
+    report = pipe.scan_cross_repo_integration(repos=["repo_a", "repo_b"])
+    latent_concepts = {
+        f["concept"] for f in report["findings"]
+        if f["signal_class"] == LATENT_CONCEPT
+    }
+    assert "repo_c only concept" not in latent_concepts
+    assert "genuine latent" in latent_concepts
+
+
+def test_latent_provenance_includes_all_multi_source_tokens(monkeypatch):
+    footprints = {"genuine latent": {"paper_target": 0.85, "repo_a": 0.0, "repo_b": 0.0}}
+    # triple whose PRIMARY source differs from a co-source token; both must surface
+    triple = _StubTriple(
+        "genuine latent", "x", "paper:primary",
+        sources=["paper:primary", "paper:secondary"],
+    )
+    pipe = _make_pipeline(
+        footprints=footprints,
+        gaps_entries=[],
+        triples=[triple],
+        evidence_sources=[{"project": "repo_a"}, {"project": "repo_b"}],
+    )
+    monkeypatch.setattr(
+        "khonliang_researcher.build_project_scores",
+        lambda knowledge, triples: pipe._footprints,
+    )
+    report = pipe.scan_cross_repo_integration(repos=["repo_a", "repo_b"])
+    latent = [f for f in report["findings"] if f["signal_class"] == LATENT_CONCEPT]
+    assert latent
+    assert set(latent[0]["corpus_sources"]) == {"paper:primary", "paper:secondary"}
 
 
 def test_pipeline_requires_two_repos(monkeypatch):

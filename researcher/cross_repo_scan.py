@@ -290,7 +290,10 @@ def classify_cross_repo_findings(
                 continue  # already implements it, not a gap for this repo
             if norm not in {normalize_concept(g) for g in gap_concepts}:
                 continue
-            provider = implementers[0]
+            # Name the strongest implementer as the provider (highest footprint
+            # score), not an arbitrary alphabetical first — a weaker repo would
+            # misattribute the finding and its score (codex P2).
+            provider = max(implementers, key=lambda r: repo_scores[r])
             findings.append(
                 Finding(
                     signal_class=COMPLEMENTARITY,

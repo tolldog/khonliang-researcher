@@ -1613,18 +1613,24 @@ class ResearchPipeline:
         repos: List[str],
         threshold: float,
         limit: int,
+        repo_names: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """Corpus concepts that no target repo uses above threshold.
 
         Uses the concept graph + corpus: every distilled concept is a candidate;
         keep the ones whose max score across target repos is below threshold but
-        which appear in the corpus (i.e. researcher has evidence for them). The
-        LATENT classifier filters infra + already-used; here we just surface the
-        raw pool with corpus provenance (source paper ids).
+        which the CORPUS (not some other repo) considers relevant. Corpus
+        relevance is measured over non-repo targets only — a score on any
+        *registered repo* (target OR excluded from this scan) is repo relevance,
+        not corpus evidence, so counting it would report a concept that only an
+        excluded repo implements as a latent opportunity (codex P2). The LATENT
+        classifier filters infra + already-used; here we surface the raw pool
+        with corpus provenance (source paper ids).
         """
-        from researcher.cross_repo_scan import normalize_concept
-
         repo_set = set(repos)
+        # All registered repos are excluded from the corpus-evidence tally, not
+        # just the ones in scope for this run.
+        all_repos = set(repo_names) if repo_names is not None else repo_set
         latent: List[Dict[str, Any]] = []
         for concept, repo_scores in footprints.items():
             in_repo_max = max(
@@ -1633,9 +1639,13 @@ class ResearchPipeline:
             )
             if in_repo_max >= threshold:
                 continue
-            # corpus relevance: the best score this concept holds for ANY target
-            # (paper/project) — evidence the corpus considers it worth adopting.
-            corpus_max = max(repo_scores.values(), default=0.0)
+            # corpus relevance: best score among NON-repo targets (papers /
+            # research projects) — evidence the corpus considers it worth
+            # adopting, independent of any repo's footprint.
+            corpus_max = max(
+                (s for tgt, s in repo_scores.items() if tgt not in all_repos),
+                default=0.0,
+            )
             if corpus_max < threshold:
                 continue
             # provenance: papers whose distilled triples mention this concept
@@ -1662,13 +1672,17 @@ class ResearchPipeline:
                 (t.subject or "").lower(),
                 (t.object or "").lower(),
             ):
-                src = t.source or ""
-                if src and src not in seen:
-                    seen.add(src)
-                    sources.append(src)
-                    if len(sources) >= limit:
-                        break
-        return sources
+                # Co-sourced triples carry every contributor in ``sources``;
+                # ``source`` is only the primary token (bug a905176b handled
+                # multi-source provenance the same way). Emit all of them so
+                # the report's corpus provenance is complete.
+                for src in (getattr(t, "sources", None) or ([t.source] if t.source else [])):
+                    if src and src not in seen:
+                        seen.add(src)
+                        sources.append(src)
+                if len(sources) >= limit:
+                    break
+        return sources[:limit]
 
     def scan_cross_repo_integration(
         self,
@@ -1733,9 +1747,20 @@ class ResearchPipeline:
         # Per-repo concept footprints: {concept: {repo: score}}.
         footprints = build_project_scores(self.knowledge, self.triples)
 
+        # Every registered repo (not just the in-scope ones) is excluded from
+        # the corpus-evidence tally so a concept implemented only by an excluded
+        # repo isn't reported as latent for the scanned subset (codex P2).
+        all_repo_names = {
+            r.get("project")
+            for r in self.list_evidence_sources()
+            if r.get("project")
+        }
+        all_repo_names.update(target_repos)
+
         gaps = self._repo_capability_gaps(target_repos)
         latent = self._latent_corpus_concepts(
-            footprints, target_repos, threshold, latent_limit
+            footprints, target_repos, threshold, latent_limit,
+            repo_names=all_repo_names,
         )
 
         # Dedup gap note: if the caller supplied no dedup sources, flag it so the
