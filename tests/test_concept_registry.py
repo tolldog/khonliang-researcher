@@ -108,6 +108,10 @@ async def test_index_returns_concepts_with_descriptions(tmp_path):
     assert "improved_by MAGRPO" in grpo.description or "MAGRPO" in grpo.description
     # one-liner stays short
     assert len(grpo.description) <= 121
+    # docs=N metadata path is live (node.document_count populated by the lib
+    # graph builder; rebuts the codex P3 field-name concern which pointed at the
+    # local researcher/graph.py ConceptNode.paper_count, NOT the imported lib).
+    assert any(e.meta.get("documents") for e in entries)
 
 
 @pytest.mark.asyncio

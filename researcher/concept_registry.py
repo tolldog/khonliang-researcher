@@ -76,9 +76,11 @@ class ConceptGraphAdapter:
         min_confidence: edge-confidence floor for graph construction.
         max_branches:   per-node branch cap when walking connected concepts
                         (mirrors ``trace_chain`` semantics).
-        search_scope:   KnowledgeStore scope for section retrieval — keep aligned
-                        with the flat baseline (``get_paper_context`` uses
-                        ``"research"``).
+        search_scope:   KnowledgeStore scope for section retrieval. Defaults to
+                        ``None`` = search all scopes, so concepts that entered the
+                        graph from non-research sources (``scan:``/``idea:``
+                        triples with ``capability`` knowledge) still expand to
+                        real sections instead of ``(no sections)``.
     """
 
     def __init__(
@@ -88,7 +90,7 @@ class ConceptGraphAdapter:
         *,
         min_confidence: float = 0.5,
         max_branches: int = 3,
-        search_scope: Optional[str] = "research",
+        search_scope: Optional[str] = None,
     ) -> None:
         self.knowledge = knowledge
         self.triples = triples
@@ -109,6 +111,11 @@ class ConceptGraphAdapter:
     async def catalog(
         self, scope: Optional[str] = None, limit: Optional[int] = None
     ) -> List[IndexEntry]:
+        # ``scope`` is accepted for Protocol conformance but inert here: the
+        # composed lib ``build_concept_graph`` builds nodes from all triples
+        # (``source_prefix`` only gates document counts, not the node set), so
+        # there is nothing to scope-filter without scope-aware graph construction
+        # in the lib. Deferred to an FR phase.
         graph = self._graph()
         nodes = list(graph.values())
         # Most-connected concepts first so a soft limit keeps the salient ones.
@@ -212,7 +219,7 @@ def build_concept_registry(
     max_branches: int = 3,
     max_index: int = 200,
     max_depth: int = 3,
-    search_scope: Optional[str] = "research",
+    search_scope: Optional[str] = None,
 ) -> DescribedRegistry:
     """Wire a ``DescribedRegistry`` over the concept graph."""
     adapter = ConceptGraphAdapter(

@@ -1006,7 +1006,7 @@ Most tools accept detail="compact|brief|full":
         return trace_chain(graph, concept, max_depth=depth, max_branches=branches)
 
     @mcp.tool()
-    async def concept_index(scope: str = "", limit: int = 40) -> str:
+    async def concept_index(limit: int = 40) -> str:
         """Cheap concept catalog — first call of the two-call retrieval contract.
 
         Returns a token-small list of concepts + one-line descriptions (drawn
@@ -1016,9 +1016,7 @@ Most tools accept detail="compact|brief|full":
 
         Format: ``id | description | docs=N conn=N`` (one line per concept).
         """
-        entries = await pipeline.concept_index(
-            scope=scope or None, limit=limit
-        )
+        entries = await pipeline.concept_index(limit=limit)
         if not entries:
             return "No concepts. Distill some papers first."
         lines = []

@@ -2236,7 +2236,7 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         )
 
     async def concept_index(
-        self, scope: Optional[str] = None, limit: Optional[int] = None
+        self, limit: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """Cheap concept catalog: [{id, description, meta?}].
 
@@ -2244,9 +2244,15 @@ Respond with JSON only. The "claims" array must contain capabilities found in th
         scans this, picks the closest concept(s), then issues one batched
         ``concept_expand``. Descriptions are synthesized from each concept's own
         graph relations.
+
+        The index is graph-wide by design in this first cut: the composed lib
+        ``build_concept_graph`` builds nodes from all triples (``source_prefix``
+        only gates document counts, not the node set), so a scope filter would be
+        inert here. Scope-aware indexing needs scope-aware graph construction in
+        the lib — deferred to an FR phase.
         """
         registry = self._concept_registry()
-        entries = await registry.index(scope=scope, limit=limit)
+        entries = await registry.index(limit=limit)
         return [e.to_dict() for e in entries]
 
     async def concept_expand(
