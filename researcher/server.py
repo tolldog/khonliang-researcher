@@ -1893,6 +1893,124 @@ Most tools accept detail="compact|brief|full":
         """Alias for list_repos with evidence-source terminology."""
         return list_repos(owned_locally=owned_locally)
 
+    @mcp.tool()
+    def scan_cross_repo_integration(
+        repos: str = "",
+        threshold: float = 0.4,
+        max_findings: int = 50,
+        already_filed: str = "",
+        dismissed: str = "",
+        corpus_floor: float = 0.3,
+        detail: str = "brief",
+    ) -> str:
+        """Cross-repo integration-opportunity scan. detail: compact|brief|full.
+
+        Classifies integration candidates across >=2 registered repos into
+        THREE signal classes and returns a REPORT — nothing is filed/promoted
+        (developer intake is a separate reviewed step):
+          - duplication    : >=2 repos implement the same concept -> shared-lib
+          - complementarity : repo A implements what repo B lists as a gap
+          - latent-concept  : a corpus concept no repo uses but both should
+
+        Generic infra concepts (HTTP, logging, config, serialization) are
+        filtered as noise. Findings carry provenance (repos, concepts, corpus
+        sources). ``repos`` is a comma-separated project list; empty scans all
+        registered repos. ``threshold`` gates repo IMPLEMENTATION; latent
+        concepts use the independent ``corpus_floor`` (min triple confidence),
+        so raising ``threshold`` doesn't drop otherwise-valid latent findings.
+
+        DEDUP: pass ``already_filed`` / ``dismissed`` as JSON arrays of
+        ``{concept, signal_class?, repos?}`` (or ``{dedup_key}``) — matching
+        candidates are suppressed so repeated runs don't re-surface the same
+        idea. Researcher has no outbound path to developer's FR store, so the
+        CALLER (e.g. developer, which reads its own FRs) supplies these; when
+        omitted the report flags that findings were not deduped this run.
+        """
+        from researcher.util import split_csv
+
+        def _parse_dedup(value: str, label: str):
+            if not value.strip():
+                return None
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return f"cross-repo scan: {label} must be a JSON array"
+            if not isinstance(parsed, list):
+                return f"cross-repo scan: {label} must be a JSON array"
+            return parsed
+
+        filed = _parse_dedup(already_filed, "already_filed")
+        if isinstance(filed, str):
+            return filed
+        dropped = _parse_dedup(dismissed, "dismissed")
+        if isinstance(dropped, str):
+            return dropped
+
+        repo_list = split_csv(repos) or None
+        report = pipeline.scan_cross_repo_integration(
+            repos=repo_list,
+            threshold=threshold,
+            max_findings=max_findings,
+            already_filed=filed,
+            dismissed=dropped,
+            corpus_floor=corpus_floor,
+        )
+
+        if report.get("error"):
+            return f"cross-repo scan: {report['error']}"
+
+        findings = report["findings"]
+        by_class = report["by_class"]
+        repos_scanned = report["repos"]
+
+        def _class_line():
+            return " ".join(
+                f"{k}:{v}" for k, v in by_class.items() if v
+            ) or "none"
+
+        def compact():
+            lines = [
+                f"repos={','.join(repos_scanned)}|findings={report['finding_count']}|{_class_line()}|auto_filed=false"
+            ]
+            for f in findings[:15]:
+                lines.append(
+                    f"{f['signal_class']}|{_compact_field(f['concept'], 40)}|{','.join(f['repos'])}"
+                )
+            return "\n".join(lines)
+
+        def brief():
+            lines = [
+                f"Cross-repo scan: {report['finding_count']} candidates across "
+                f"{len(repos_scanned)} repos ({_class_line()}). Nothing filed."
+            ]
+            if report.get("dedup_gap"):
+                lines.append(f"note: {report['dedup_gap']}")
+            for f in findings:
+                lines.append(
+                    f"[{f['signal_class']}] {f['concept']} — {', '.join(f['repos'])}"
+                )
+            return "\n".join(lines)
+
+        def full():
+            lines = [
+                f"# Cross-repo integration scan ({report['finding_count']} candidates)",
+                f"repos: {', '.join(repos_scanned)}",
+                f"classes: {_class_line()} | auto_filed: false",
+            ]
+            if report.get("dedup_gap"):
+                lines.append(f"dedup gap: {report['dedup_gap']}")
+            lines.append("")
+            for f in findings:
+                lines.append(f"## [{f['signal_class']}] {f['concept']} (score {f['score']})")
+                lines.append(f"- repos: {', '.join(f['repos'])}")
+                lines.append(f"- {f['summary']}")
+                if f.get("corpus_sources"):
+                    lines.append(f"- corpus sources: {', '.join(f['corpus_sources'])}")
+                lines.append("")
+            return "\n".join(lines)
+
+        return format_response(compact, brief, full, detail)
+
     # ------------------------------------------------------------------
     # RR-8: Per-Project Landscape Reports
     # ------------------------------------------------------------------
