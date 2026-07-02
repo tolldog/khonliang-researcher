@@ -11,6 +11,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -48,6 +49,16 @@ CREATE TABLE IF NOT EXISTS ingest_watcher_dedupe (
 
 
 class IngestWatcherStore:
+    """SQLite persistence for the ingest watcher registry + dedupe state.
+
+    Each connection is explicitly closed (``closing``): sqlite3's
+    connection context manager only commits/rolls back, it does NOT
+    close, and the poll loop calls these methods every cycle — an
+    unclosed connection per poll exhausts the process fd limit (same
+    leak as bug_khonliang-developer_be840d83 in the PR watcher this
+    store was modeled on).
+    """
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._init_schema()
@@ -58,11 +69,11 @@ class IngestWatcherStore:
         return conn
 
     def _init_schema(self) -> None:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             conn.executescript(_SCHEMA)
 
     def register_watcher(self, watcher_id: str, interval_s: int, started_at: float) -> None:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO ingest_watcher_registry
@@ -73,7 +84,7 @@ class IngestWatcherStore:
             )
 
     def touch(self, watcher_id: str, at: float, *, active_count: int) -> None:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             conn.execute(
                 """
                 UPDATE ingest_watcher_registry
@@ -84,7 +95,7 @@ class IngestWatcherStore:
             )
 
     def get_last_active_count(self, watcher_id: str) -> int:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             row = conn.execute(
                 "SELECT last_active_count FROM ingest_watcher_registry WHERE watcher_id = ?",
                 (watcher_id,),
@@ -92,7 +103,7 @@ class IngestWatcherStore:
         return int(row["last_active_count"]) if row else 0
 
     def list_watchers(self) -> list[dict[str, Any]]:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             rows = conn.execute(
                 "SELECT * FROM ingest_watcher_registry ORDER BY started_at ASC"
             ).fetchall()
@@ -113,7 +124,7 @@ class IngestWatcherStore:
         Returns True if a registry row existed and was deleted, False if no
         such watcher was registered (in which case nothing was removed).
         """
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             cursor = conn.execute(
                 "DELETE FROM ingest_watcher_registry WHERE watcher_id = ?",
                 (watcher_id,),
@@ -132,7 +143,7 @@ class IngestWatcherStore:
         transition_kind: str,
         dedupe_id: str,
     ) -> bool:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             row = conn.execute(
                 """
                 SELECT 1 FROM ingest_watcher_dedupe
@@ -151,7 +162,7 @@ class IngestWatcherStore:
         dedupe_id: str,
         at: float,
     ) -> None:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO ingest_watcher_dedupe

@@ -346,3 +346,54 @@ async def test_queue_drained_same_second_produces_distinct_dedupe_ids(tmp_path):
         "Same-second drains must produce distinct dedupe_ids so neither is "
         "silently deduped away."
     )
+
+
+# ---------------------------------------------------------------------------
+# Store connection hygiene (same leak class as bug_khonliang-developer_be840d83)
+# ---------------------------------------------------------------------------
+
+
+def test_store_closes_every_connection(tmp_path, monkeypatch):
+    """Every IngestWatcherStore method must close its SQLite connection.
+
+    sqlite3's connection context manager commits/rolls back but never
+    closes; the watcher poll loop calls these methods every cycle, so an
+    unclosed connection per call exhausts the agent's fd limit and every
+    new-connection DB operation starts failing with "unable to open
+    database file" (observed live on developer-primary's PR watcher,
+    bug_khonliang-developer_be840d83 — this store shares the pattern).
+    """
+    import sqlite3 as _sqlite3
+
+    class TrackingConnection(_sqlite3.Connection):
+        instances: list = []
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            TrackingConnection.instances.append(self)
+            self.was_closed = False
+
+        def close(self):
+            self.was_closed = True
+            super().close()
+
+    real_connect = _sqlite3.connect
+    monkeypatch.setattr(
+        "researcher.ingest_watcher.sqlite3.connect",
+        lambda path, *a, **kw: real_connect(
+            path, *a, factory=TrackingConnection, **kw
+        ),
+    )
+
+    store = IngestWatcherStore(str(tmp_path / "watcher.db"))
+    store.register_watcher("w1", 60, 100.0)
+    store.touch("w1", 200.0, active_count=3)
+    store.get_last_active_count("w1")
+    store.list_watchers()
+    store.was_emitted("w1", "entry1", "distilled", "d1")
+    store.mark_emitted("w1", "entry1", "distilled", "d1", 300.0)
+    store.remove_watcher("w1")
+
+    assert TrackingConnection.instances, "tracking hook never engaged"
+    leaked = [c for c in TrackingConnection.instances if not c.was_closed]
+    assert not leaked, f"{len(leaked)} connection(s) left open"
