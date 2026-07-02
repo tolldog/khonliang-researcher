@@ -53,6 +53,14 @@ DEFAULT_SIMILARITY_THRESHOLD = 0.55
 # current researcher corpus) without making brief_on visibly slow.
 DEFAULT_CANDIDATE_POOL_CAP = 100
 
+# Abort stage 2 after this many CONSECUTIVE candidate-embed failures. Each
+# failed embed can burn a full client timeout (~30s in RelevanceScorer),
+# so grinding through a 100-candidate pool against a degraded embedder
+# would hang brief_on for tens of minutes — the exact opposite of the
+# "clean short-circuit" this module promises. Three in a row is service
+# trouble, not a bad candidate.
+MAX_CONSECUTIVE_EMBED_FAILURES = 3
+
 
 @dataclass
 class EmbeddingHit:
@@ -219,13 +227,39 @@ async def second_stage_embedding_hits(
         return [], True
 
     scored: List[EmbeddingHit] = []
+    consecutive_failures = 0
+    embedded_any = False
     for entry in candidates:
         emb = await _embed_or_none(pipeline, _entry_embedding_text(entry))
         if not emb:
+            # Fail fast on a run of embed failures: each one may have burned
+            # a full client timeout, and a degraded embedder won't recover
+            # mid-loop. Treat it as the service being unavailable.
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_EMBED_FAILURES:
+                logger.info(
+                    "brief_on embedding fallback: %d consecutive candidate-embed "
+                    "failures, short-circuiting to first-stage results",
+                    consecutive_failures,
+                )
+                return [], True
             continue
+        consecutive_failures = 0
+        embedded_any = True
         sim = cosine_similarity(query_embedding, emb)
         if sim >= threshold:
             scored.append(EmbeddingHit(entry=entry, similarity=sim))
+
+    if not embedded_any:
+        # Every candidate embed failed (without ever hitting the consecutive
+        # cap, e.g. a tiny pool): stage 2 scored NOTHING, which is a service
+        # outage, not a legitimate "all below threshold" empty result — the
+        # diagnostics must distinguish the two.
+        logger.info(
+            "brief_on embedding fallback: no candidate could be embedded, "
+            "short-circuiting to first-stage results"
+        )
+        return [], True
 
     scored.sort(key=lambda h: h.similarity, reverse=True)
     return scored[:needed], False

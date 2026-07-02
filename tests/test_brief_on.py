@@ -84,8 +84,10 @@ class _FakeRelevance:
 
     def __init__(self, embeddings: dict[str, list[float]] | None = None):
         self._embeddings = embeddings or {}
+        self.embed_calls: list[str] = []
 
     async def _embed(self, text: str):
+        self.embed_calls.append(text)
         return self._embeddings.get(text)
 
 
@@ -471,6 +473,48 @@ def test_brief_on_fallback_short_circuits_when_embed_unavailable(call_brief_on):
     assert diag["embedding_hits"] == 0
     assert diag["embedding_short_circuit"] is True
     assert out["source_ids"] == ["aaa"]
+
+
+def test_brief_on_fallback_fails_fast_on_degraded_embedder(call_brief_on):
+    """A flaky embedder (query embeds, candidates don't) must abort quickly.
+
+    Each failed candidate embed can burn a full client timeout, so the
+    fallback caps CONSECUTIVE failures at 3 instead of grinding through
+    the whole candidate pool — and reports an honest short-circuit
+    (codex P1/P2 on this branch).
+    """
+    a = _entry("aaa", "stage 1 hit")
+    flaky = [_entry(f"c{i}", f"cand {i}", content=f"body {i}") for i in range(10)]
+    pipeline = _FakePipeline(
+        {"alpha beta": [a], "beta": flaky},
+        # ONLY the query embedding is available — every candidate fails.
+        embeddings={"alpha beta": [1.0, 0.0]},
+    )
+
+    out = call_brief_on(pipeline, topic="alpha beta", top_k=5)
+    diag = out["retrieval_diagnostics"]
+    assert diag["embedding_hits"] == 0
+    assert diag["embedding_short_circuit"] is True, diag
+    # Bounded: 1 query embed + at most MAX_CONSECUTIVE (3) candidate attempts,
+    # NOT one per pool candidate.
+    assert len(pipeline.relevance.embed_calls) <= 4, pipeline.relevance.embed_calls
+
+
+def test_brief_on_fallback_tiny_pool_all_fail_is_short_circuit(call_brief_on):
+    """A small pool (< failure cap) where every embed fails is still an
+    outage, not a legitimate 'all below threshold' empty result."""
+    a = _entry("aaa", "stage 1 hit")
+    c1 = _entry("c1", "cand 1", content="body 1")
+    c2 = _entry("c2", "cand 2", content="body 2")
+    pipeline = _FakePipeline(
+        {"alpha beta": [a], "beta": [c1, c2]},
+        embeddings={"alpha beta": [1.0, 0.0]},
+    )
+
+    out = call_brief_on(pipeline, topic="alpha beta", top_k=5)
+    diag = out["retrieval_diagnostics"]
+    assert diag["embedding_hits"] == 0
+    assert diag["embedding_short_circuit"] is True, diag
 
 
 def test_brief_on_fallback_below_threshold_not_merged(call_brief_on):
