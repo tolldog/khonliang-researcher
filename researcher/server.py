@@ -1534,7 +1534,7 @@ Most tools accept detail="compact|brief|full":
         return format_response(compact, brief, full, detail)
 
     @mcp.tool()
-    def brief_on(
+    async def brief_on(
         topic: str,
         in_context_of: str = "",
         project: str = "",
@@ -1548,6 +1548,15 @@ Most tools accept detail="compact|brief|full":
         multi-query retrieval (topic / topic+context / context) and then
         bundles per-paper summaries under the detail-level budget.
 
+        Retrieval is two-stage. Stage 1 is SQL FTS via
+        ``pipeline.search`` with multi-query expansion. Stage 2, which
+        fires only when the stage-1 union is smaller than ``top_k``,
+        reuses the pipeline's existing Ollama embedder to rank a
+        broader candidate pool by cosine similarity and merges hits
+        above a confidence threshold. If the embedding pipeline is
+        unavailable the call short-circuits cleanly and returns the
+        stage-1 result unchanged.
+
         Does not spin up a new distillation pipeline — it reuses whatever
         summary ``distill_paper`` already produced for each selected
         entry, falling back to the entry's own content head if no
@@ -1555,7 +1564,9 @@ Most tools accept detail="compact|brief|full":
 
         Returns JSON:
           {brief, source_ids, retrieval_diagnostics: {queries_run,
-           total_hits, top_k_chosen, per_query_hits}}
+           total_hits, top_k_chosen, per_query_hits,
+           fts_hits, embedding_hits, union_size, embedding_short_circuit,
+           source_by_id}}
 
         detail: compact (TL;DR + bare id list), brief (TL;DR + one-line
         per source, target <=2000 chars), full (per-source paragraph).
@@ -1571,6 +1582,11 @@ Most tools accept detail="compact|brief|full":
                     "total_hits": 0,
                     "top_k_chosen": 0,
                     "per_query_hits": {},
+                    "fts_hits": 0,
+                    "embedding_hits": 0,
+                    "union_size": 0,
+                    "embedding_short_circuit": False,
+                    "source_by_id": {},
                 },
             })
 
@@ -1587,6 +1603,8 @@ Most tools accept detail="compact|brief|full":
         entries_by_id: dict[str, Any] = {}
         rank_reciprocal_sum: dict[str, float] = {}
         query_hit_counts: dict[str, int] = {}
+        source_by_id: dict[str, str] = {}
+        embedding_similarity_by_id: dict[str, float] = {}
 
         # Per-query fetch limit must be at least top_k so the final union
         # can plausibly fill the caller's requested size even when many
@@ -1609,6 +1627,38 @@ Most tools accept detail="compact|brief|full":
                     rank_reciprocal_sum.get(entry.id, 0.0) + 1.0 / (rank + 1)
                 )
                 query_hit_counts[entry.id] = query_hit_counts.get(entry.id, 0) + 1
+                source_by_id.setdefault(entry.id, "fts")
+
+        fts_hits = len(entries_by_id)
+        top_k = max(1, int(top_k))
+
+        # 2. Optional second-stage embedding fallback. Fires only when
+        #    stage 1 under-fills top_k. ``project`` scoping is stage-1
+        #    only (out of scope per FR fr_researcher_c4df6fc5).
+        embedding_hits_count = 0
+        embedding_short_circuit = False
+        if fts_hits < top_k and not project:
+            from researcher.embedding_fallback import second_stage_embedding_hits
+
+            hits, short_circuited = await second_stage_embedding_hits(
+                pipeline,
+                topic=topic,
+                context=ctx,
+                exclude_ids=entries_by_id.keys(),
+                needed=top_k - fts_hits,
+            )
+            embedding_short_circuit = short_circuited
+            for hit in hits:
+                entry = hit.entry
+                entries_by_id[entry.id] = entry
+                source_by_id[entry.id] = "embedding"
+                embedding_similarity_by_id[entry.id] = hit.similarity
+                # Rank signals: embedding hits get query_hit_count=0 so
+                # they always sort after FTS hits with any query match,
+                # but among themselves they're ordered by similarity.
+                query_hit_counts.setdefault(entry.id, 0)
+                rank_reciprocal_sum[entry.id] = hit.similarity
+                embedding_hits_count += 1
 
         total_hits = len(entries_by_id)
 
@@ -1625,19 +1675,25 @@ Most tools accept detail="compact|brief|full":
                     "total_hits": 0,
                     "top_k_chosen": 0,
                     "per_query_hits": {q: len(ids) for q, ids in hits_per_query.items()},
+                    "fts_hits": 0,
+                    "embedding_hits": 0,
+                    "union_size": 0,
+                    "embedding_short_circuit": embedding_short_circuit,
+                    "source_by_id": {},
                 },
             })
 
-        # 2. Rank: (query_hit_count desc, reciprocal sum desc). Entries
-        #    hit by both topic and context get strict preference.
+        # 3. Rank: (query_hit_count desc, reciprocal sum desc). Entries
+        #    hit by both topic and context get strict preference; any
+        #    FTS hit outranks every embedding-only hit (which has
+        #    query_hit_count == 0).
         def _score(eid: str) -> tuple[int, float]:
             return (query_hit_counts[eid], rank_reciprocal_sum[eid])
 
         ranked_ids = sorted(entries_by_id.keys(), key=_score, reverse=True)
-        top_k = max(1, int(top_k))
         chosen_ids = ranked_ids[:top_k]
 
-        # 3. For each chosen entry, load its already-distilled summary if
+        # 4. For each chosen entry, load its already-distilled summary if
         #    one exists — reusing distill_paper's output keeps the
         #    "10x-outlier survives unchanged" distill invariant intact.
         #    Fall back to the entry's own content head when no summary
@@ -1670,7 +1726,7 @@ Most tools accept detail="compact|brief|full":
                 "key_claim": truncate(key_claim, 220),
             })
 
-        # 4. Bundle under the detail budget. No new LLM synth call —
+        # 5. Bundle under the detail budget. No new LLM synth call —
         #    brief_on is intentionally a cheap retrieval+reuse primitive,
         #    distinct from synthesize_topic which does run a synth LLM.
         header = f"{topic}"
@@ -1703,6 +1759,16 @@ Most tools accept detail="compact|brief|full":
 
         brief_text = format_response(compact, brief, full, detail)
 
+        # Emit source_by_id only for entries actually in chosen_ids —
+        # the diagnostic surfaces which rows fell to embedding fallback
+        # without bloating into a full pool dump.
+        chosen_sources = {eid: source_by_id.get(eid, "fts") for eid in chosen_ids}
+        chosen_similarities = {
+            eid: round(embedding_similarity_by_id[eid], 4)
+            for eid in chosen_ids
+            if eid in embedding_similarity_by_id
+        }
+
         return json.dumps({
             "brief": brief_text,
             "source_ids": chosen_ids,
@@ -1711,6 +1777,12 @@ Most tools accept detail="compact|brief|full":
                 "total_hits": total_hits,
                 "top_k_chosen": len(chosen_ids),
                 "per_query_hits": {q: len(ids) for q, ids in hits_per_query.items()},
+                "fts_hits": fts_hits,
+                "embedding_hits": embedding_hits_count,
+                "union_size": total_hits,
+                "embedding_short_circuit": embedding_short_circuit,
+                "source_by_id": chosen_sources,
+                "embedding_similarities": chosen_similarities,
             },
         })
 
