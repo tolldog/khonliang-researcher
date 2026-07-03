@@ -1296,9 +1296,19 @@ def main():
     )
 
     if args.command in ("install", "uninstall"):
-        # Use BaseAgent's CLI handling for install/uninstall
-        # (lightweight — doesn't build the full pipeline)
-        BaseAgent.from_cli([
+        # Lightweight CLI handling — doesn't build the full pipeline.
+        # The runtime agent is a dynamic ``from_mcp`` subclass with no
+        # importable class, so give the install path a stub carrying
+        # the right identity: ``from_cli`` is a classmethod that
+        # constructs ``cls(...)``, and calling it on BaseAgent directly
+        # registers module_name="agent" / agent_type="base" with the
+        # bus — a launch spec that can't start
+        # (bug_developer_agent_main_install_uses_base_class_4bb0a5cf).
+        class _ResearcherInstallStub(BaseAgent):
+            agent_type = "researcher"
+            module_name = "researcher.agent"
+
+        _ResearcherInstallStub.from_cli([
             args.command,
             "--id", args.id,
             "--bus", args.bus,
