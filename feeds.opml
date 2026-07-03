@@ -24,6 +24,7 @@
       <outline text="Simon Willison Weblog" type="rss" xmlUrl="https://simonwillison.net/atom/everything/" htmlUrl="https://simonwillison.net/" />
       <outline text="LlamaIndex Blog" type="rss" xmlUrl="https://www.llamaindex.ai/blog/rss.xml" htmlUrl="https://www.llamaindex.ai/blog" />
       <outline text="Microsoft DevBlogs AI" type="rss" xmlUrl="https://devblogs.microsoft.com/feed/" htmlUrl="https://devblogs.microsoft.com/" />
+      <outline text="MathWorks AI/Deep Learning Blog" type="rss" xmlUrl="https://blogs.mathworks.com/deep-learning/feed/" htmlUrl="https://blogs.mathworks.com/deep-learning" />
     </outline>
 
     <outline text="GitHub releases + activity">
