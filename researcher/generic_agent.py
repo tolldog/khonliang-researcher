@@ -48,8 +48,11 @@ def main():
     )
 
     if args.command in ("install", "uninstall"):
-        from khonliang_bus import BaseAgent
-        BaseAgent.from_cli([
+        # Dispatch through the subclass: from_cli constructs cls(...),
+        # and calling it on BaseAgent registers module_name="agent" /
+        # agent_type="base" — a launch spec that can't start
+        # (bug_developer_agent_main_install_uses_base_class_4bb0a5cf).
+        GenericResearcher.from_cli([
             args.command,
             "--id", args.id,
             "--bus", args.bus,
