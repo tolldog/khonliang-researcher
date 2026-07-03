@@ -305,9 +305,10 @@ def browse_feeds(ctx, query, feeds, ingest):
 
     pipeline = _get_pipeline(ctx)
     feed_list = [f.strip() for f in feeds.split(",") if f.strip()] or None
+    db_path = str(pipeline.config.get("db_path", "data/researcher.db"))
 
     async def _browse():
-        entries = await fetch_all_feeds(feed_list)
+        entries = await fetch_all_feeds(feed_list, db_path=db_path)
 
         if query:
             keywords = query.lower().split()

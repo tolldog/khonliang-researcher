@@ -241,10 +241,41 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
+def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
+    """Load enabled feeds from the persistent registry, seeding it from
+    DEFAULT_FEEDS on first use (fr_researcher_b8b5c008). Falls back to
+    DEFAULT_FEEDS directly if the store can't be opened (e.g. read-only
+    filesystem in a test sandbox) so callers never see zero feeds.
+    """
+    from researcher.feed_store import FeedStore
+
+    try:
+        store = FeedStore(db_path)
+        store.seed_if_empty(DEFAULT_FEEDS)
+        rows = store.list_feeds(enabled_only=True)
+    except Exception:
+        logger.warning("feed store unavailable at %s; falling back to DEFAULT_FEEDS", db_path, exc_info=True)
+        return DEFAULT_FEEDS
+    if not rows:
+        return DEFAULT_FEEDS
+    return {
+        row["metadata"].get("seed_slug") or row["feed_id"]: FeedConfig(
+            name=row["name"], url=row["url"], source=row["source"],
+        )
+        for row in rows
+    }
+
+
 class RSSEngine(BaseEngine):
     """Search engine that fetches and searches RSS/Atom feeds.
 
-    Loads feeds from OPML file if available, falls back to DEFAULT_FEEDS.
+    Feeds default to the in-code DEFAULT_FEEDS unless a caller explicitly
+    opts into the persistent feed registry (``feed_store.FeedStore``) by
+    passing ``db_path`` — this engine has no business guessing a real
+    database path (and every caller that constructs one with no args, e.g.
+    a test, must not silently open/seed whatever file happens to sit at a
+    default relative path in the working directory).  ``feeds``/``opml_path``
+    take priority over ``db_path`` when given.
     """
 
     name = "rss"
@@ -252,12 +283,19 @@ class RSSEngine(BaseEngine):
     rate_limit = 1.0
     timeout = 15.0
 
-    def __init__(self, feeds: Optional[Dict[str, FeedConfig]] = None, opml_path: Optional[str] = None):
+    def __init__(
+        self,
+        feeds: Optional[Dict[str, FeedConfig]] = None,
+        opml_path: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ):
         super().__init__()
         if feeds:
             self.feeds = feeds
         elif opml_path:
             self.feeds = load_opml(opml_path) or DEFAULT_FEEDS
+        elif db_path:
+            self.feeds = _load_feeds_from_store(db_path)
         else:
             self.feeds = DEFAULT_FEEDS
         self._cache: List[EngineResult] = []
@@ -340,12 +378,18 @@ class RSSEngine(BaseEngine):
 async def fetch_all_feeds(
     feeds: Optional[List[str]] = None,
     opml_path: Optional[str] = None,
+    db_path: Optional[str] = None,
 ) -> List[EngineResult]:
     """Fetch and return all entries from configured RSS feeds.
 
     Args:
         feeds: Optional list of feed names to fetch (default: all)
-        opml_path: Optional path to OPML file (default: feeds.opml)
+        opml_path: Optional path to OPML file (default: feeds.opml).
+            Takes priority over the persistent feed registry when given.
+        db_path: Feed registry DB path. Only pass this when the caller
+            has a real, configured path (e.g. from ``pipeline.config``) —
+            omitting it (the default) uses DEFAULT_FEEDS rather than
+            guessing a path relative to the working directory.
 
     Returns:
         All feed entries as EngineResults.
@@ -356,7 +400,7 @@ async def fetch_all_feeds(
         if default_opml.exists():
             opml_path = str(default_opml)
 
-    engine = RSSEngine(opml_path=opml_path)
+    engine = RSSEngine(opml_path=opml_path, db_path=db_path)
     await engine._refresh_cache(feeds)
     return engine._cache
 

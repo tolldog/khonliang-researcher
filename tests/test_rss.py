@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from researcher.rss import RSSEngine, _parse_feed
+from researcher.rss import DEFAULT_FEEDS, RSSEngine, _parse_feed
 
 
 # ---------------------------------------------------------------------------
@@ -97,3 +97,45 @@ def test_load_opml_disambiguates_colliding_keys(tmp_path):
     urls = sorted(fc.url for fc in feeds.values())
     assert urls == ["http://a/feed", "http://b/feed"]
     assert len(feeds) == 2
+
+
+# ---------------------------------------------------------------------------
+# Persistent feed registry wiring (fr_researcher_b8b5c008) — must never touch
+# a real path by default; only opts in when a caller passes db_path.
+# ---------------------------------------------------------------------------
+
+
+def test_rssengine_defaults_to_default_feeds_without_db_path():
+    # No feeds/opml_path/db_path given: must use DEFAULT_FEEDS directly and
+    # never construct a FeedStore (which would create/seed a file at
+    # whatever the default path happened to be — see bug filed after this
+    # FR accidentally seeded the live production data/researcher.db during
+    # a test run).
+    engine = RSSEngine()
+    assert engine.feeds == DEFAULT_FEEDS
+
+
+def test_rssengine_loads_and_seeds_from_explicit_db_path(tmp_path):
+    db_path = str(tmp_path / "feeds.db")
+    engine = RSSEngine(db_path=db_path)
+    assert len(engine.feeds) == len(DEFAULT_FEEDS)
+    assert set(engine.feeds) == set(DEFAULT_FEEDS)
+
+    # A feed registered after the seed is picked up by a fresh engine
+    # reading the same store (runtime add, no restart needed).
+    from researcher.feed_store import FeedStore
+
+    FeedStore(db_path).register_feed(name="New Blog", url="https://new.example/rss.xml", source="new")
+    engine2 = RSSEngine(db_path=db_path)
+    assert len(engine2.feeds) == len(DEFAULT_FEEDS) + 1
+    assert "new" in {cfg.source for cfg in engine2.feeds.values()}
+
+
+def test_rssengine_falls_back_to_default_feeds_on_unreadable_db_path(tmp_path):
+    # db_path pointing at a directory (not a file) can't be opened by
+    # sqlite3.connect; the loader must degrade to DEFAULT_FEEDS rather
+    # than raise or return zero feeds.
+    bad_path = tmp_path / "not_a_file"
+    bad_path.mkdir()
+    engine = RSSEngine(db_path=str(bad_path))
+    assert engine.feeds == DEFAULT_FEEDS

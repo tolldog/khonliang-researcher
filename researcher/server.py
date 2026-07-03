@@ -670,7 +670,8 @@ Most tools accept detail="compact|brief|full":
         from researcher.rss import fetch_all_feeds
 
         feed_list = [f.strip() for f in feeds.split(",") if f.strip()] or None
-        entries = await fetch_all_feeds(feed_list)
+        db_path = str(pipeline.config.get("db_path", "data/researcher.db"))
+        entries = await fetch_all_feeds(feed_list, db_path=db_path)
 
         if query:
             keywords = query.lower().split()
@@ -704,6 +705,97 @@ Most tools accept detail="compact|brief|full":
             lines.append(f"... +{len(entries) - 30} more")
 
         return "\n".join(lines)
+
+    def _feed_store():
+        from researcher.feed_store import FeedStore
+
+        db_path = str(pipeline.config.get("db_path", "data/researcher.db"))
+        return FeedStore(db_path)
+
+    def _parse_feed_metadata(metadata: str):
+        """Parse a caller-supplied JSON-object string, or {'error': ...} on failure."""
+        try:
+            parsed = json.loads(metadata)
+        except (TypeError, ValueError) as e:
+            return {"error": f"metadata must be valid JSON: {e}"}
+        if not isinstance(parsed, dict):
+            return {"error": "metadata must be a JSON object"}
+        return parsed
+
+    @mcp.tool()
+    def register_feed(name: str, url: str, source: str, metadata: str = "") -> str:
+        """Add a feed to the persistent registry (fr_researcher_b8b5c008).
+        No PR/restart needed — browse_feeds picks it up on the next call.
+        metadata is an optional JSON object string.
+        """
+        from researcher.feed_store import FeedError
+
+        meta = _parse_feed_metadata(metadata) if metadata else {}
+        if "error" in meta:
+            return f"error: {meta['error']}"
+        try:
+            feed = _feed_store().register_feed(name=name, url=url, source=source, metadata=meta)
+        except FeedError as e:
+            return f"error: {e}"
+        return f"registered {feed['feed_id']}: {feed['name']} ({feed['url']})"
+
+    @mcp.tool()
+    def list_feeds(enabled_only: bool = True) -> str:
+        """List feeds in the persistent registry."""
+        feeds = _feed_store().list_feeds(enabled_only=enabled_only)
+        if not feeds:
+            return "No feeds registered."
+        lines = [f"{len(feeds)} feed(s)"]
+        for f in feeds:
+            status = "enabled" if f["enabled"] else "disabled"
+            lines.append(f"{f['feed_id']} | {f['name']} | {f['source']} | {status} | {f['url']}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    def get_feed(feed_id: str) -> str:
+        """Look up a single feed by id."""
+        feed = _feed_store().get_feed(feed_id)
+        if feed is None:
+            return f"error: unknown feed_id {feed_id!r}"
+        status = "enabled" if feed["enabled"] else "disabled"
+        return f"{feed['feed_id']} | {feed['name']} | {feed['source']} | {status} | {feed['url']}"
+
+    @mcp.tool()
+    def update_feed(feed_id: str, name: str = "", url: str = "", source: str = "", metadata: str = "") -> str:
+        """Edit a feed's fields in place. Omitted args are left unchanged."""
+        fields: dict = {}
+        if name:
+            fields["name"] = name
+        if url:
+            fields["url"] = url
+        if source:
+            fields["source"] = source
+        if metadata:
+            meta = _parse_feed_metadata(metadata)
+            if "error" in meta:
+                return f"error: {meta['error']}"
+            fields["metadata"] = meta
+        if not fields:
+            return "error: no fields to update"
+        from researcher.feed_store import FeedError
+
+        try:
+            feed = _feed_store().update_feed(feed_id, **fields)
+        except FeedError as e:
+            return f"error: {e}"
+        if feed is None:
+            return f"error: unknown feed_id {feed_id!r}"
+        return f"updated {feed['feed_id']}: {feed['name']} ({feed['url']})"
+
+    @mcp.tool()
+    def disable_feed(feed_id: str) -> str:
+        """Soft-delete a feed (enabled=0). Preserves history; browse_feeds
+        and list_feeds(enabled_only=True) stop returning it.
+        """
+        ok = _feed_store().disable_feed(feed_id)
+        if not ok:
+            return f"error: unknown feed_id {feed_id!r}"
+        return f"disabled {feed_id}"
 
     @mcp.tool()
     def find_relevant(query: str, project: str = "", detail: str = "brief") -> str:
