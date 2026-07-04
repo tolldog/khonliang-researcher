@@ -129,19 +129,27 @@ class FeedStore:
         return cur.rowcount > 0
 
     def seed_if_empty(self, default_feeds: dict[str, Any]) -> int:
-        """One-time seed from the legacy DEFAULT_FEEDS dict. No-op if the
-        table already has rows (idempotent across restarts).
+        """Seed any DEFAULT_FEEDS entries not already present, by URL.
+
+        Deliberately NOT gated on "table is empty": if a caller registers a
+        custom feed before this ever runs, the table has 1 row but none of
+        the defaults yet — a whole-table-count gate would permanently skip
+        seeding the defaults from then on (Copilot P2 finding on PR #71).
+        Checking per-URL existence makes this safe to call unconditionally
+        and idempotently regardless of call order.
 
         ``default_feeds`` maps slug -> object with ``.name``/``.url``/``.source``
         attributes (``researcher.rss.FeedConfig``).
         """
+        now = time.time()
+        seeded = 0
         with closing(self._conn()) as conn, conn:
-            (count,) = conn.execute("SELECT COUNT(*) FROM feeds").fetchone()
-            if count > 0:
-                return 0
-            now = time.time()
-            seeded = 0
             for slug, cfg in default_feeds.items():
+                existing = conn.execute(
+                    "SELECT 1 FROM feeds WHERE url = ?", (cfg.url,)
+                ).fetchone()
+                if existing is not None:
+                    continue
                 feed_id = f"feed_{uuid.uuid4().hex[:12]}"
                 conn.execute(
                     """

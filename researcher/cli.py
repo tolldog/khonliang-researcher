@@ -305,7 +305,10 @@ def browse_feeds(ctx, query, feeds, ingest):
 
     pipeline = _get_pipeline(ctx)
     feed_list = [f.strip() for f in feeds.split(",") if f.strip()] or None
-    db_path = str(pipeline.config.get("db_path", "data/researcher.db"))
+    # No literal-path fallback: pipeline.config["db_path"] is always set by
+    # create_pipeline. Guessing a relative default here risks silently
+    # opening/seeding whatever file sits at that path in the cwd.
+    db_path = str(pipeline.config["db_path"])
 
     async def _browse():
         entries = await fetch_all_feeds(feed_list, db_path=db_path)

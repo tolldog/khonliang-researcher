@@ -14,7 +14,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from khonliang.knowledge.store import Tier, EntryStatus
 from khonliang.mcp import KhonliangMCPServer, compact_list, compact_entry, truncate, brief_or_full, format_response
@@ -157,6 +157,24 @@ def _filter_taxonomy(taxonomy: dict[str, Any], audience: str = "") -> tuple[list
             if rel.get("source") in selected_codes and rel.get("target") in selected_codes
         ],
     )
+
+
+def _parse_feed_metadata(metadata: str) -> tuple[Optional[dict], Optional[str]]:
+    """Parse a caller-supplied JSON-object string for the feed-registry tools.
+
+    Returns ``(parsed_dict, error_message)`` — exactly one is non-None. A
+    plain ``{"error": ...}`` sentinel dict would misfire on a legitimate
+    caller metadata payload that happens to have an "error" key (Copilot
+    finding on PR #71), so the parse-failure signal is carried out-of-band
+    instead.
+    """
+    try:
+        parsed = json.loads(metadata)
+    except (TypeError, ValueError) as e:
+        return None, f"metadata must be valid JSON: {e}"
+    if not isinstance(parsed, dict):
+        return None, "metadata must be a JSON object"
+    return parsed, None
 
 
 def _format_concept_taxonomy_limited(
@@ -670,8 +688,7 @@ Most tools accept detail="compact|brief|full":
         from researcher.rss import fetch_all_feeds
 
         feed_list = [f.strip() for f in feeds.split(",") if f.strip()] or None
-        db_path = str(pipeline.config.get("db_path", "data/researcher.db"))
-        entries = await fetch_all_feeds(feed_list, db_path=db_path)
+        entries = await fetch_all_feeds(feed_list, db_path=str(pipeline.config["db_path"]))
 
         if query:
             keywords = query.lower().split()
@@ -709,18 +726,12 @@ Most tools accept detail="compact|brief|full":
     def _feed_store():
         from researcher.feed_store import FeedStore
 
-        db_path = str(pipeline.config.get("db_path", "data/researcher.db"))
-        return FeedStore(db_path)
-
-    def _parse_feed_metadata(metadata: str):
-        """Parse a caller-supplied JSON-object string, or {'error': ...} on failure."""
-        try:
-            parsed = json.loads(metadata)
-        except (TypeError, ValueError) as e:
-            return {"error": f"metadata must be valid JSON: {e}"}
-        if not isinstance(parsed, dict):
-            return {"error": "metadata must be a JSON object"}
-        return parsed
+        # No literal-path fallback here: pipeline.config["db_path"] is always
+        # populated with a real, absolute path by create_pipeline. A missing
+        # key means this was constructed unusually and should fail loudly
+        # rather than silently opening/seeding a guessed relative path (the
+        # earlier live-prod-DB near-miss on this same FR).
+        return FeedStore(str(pipeline.config["db_path"]))
 
     @mcp.tool()
     def register_feed(name: str, url: str, source: str, metadata: str = "") -> str:
@@ -730,9 +741,11 @@ Most tools accept detail="compact|brief|full":
         """
         from researcher.feed_store import FeedError
 
-        meta = _parse_feed_metadata(metadata) if metadata else {}
-        if "error" in meta:
-            return f"error: {meta['error']}"
+        meta = {}
+        if metadata:
+            meta, err = _parse_feed_metadata(metadata)
+            if err:
+                return f"error: {err}"
         try:
             feed = _feed_store().register_feed(name=name, url=url, source=source, metadata=meta)
         except FeedError as e:
@@ -771,9 +784,9 @@ Most tools accept detail="compact|brief|full":
         if source:
             fields["source"] = source
         if metadata:
-            meta = _parse_feed_metadata(metadata)
-            if "error" in meta:
-                return f"error: {meta['error']}"
+            meta, err = _parse_feed_metadata(metadata)
+            if err:
+                return f"error: {err}"
             fields["metadata"] = meta
         if not fields:
             return "error: no fields to update"

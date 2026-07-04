@@ -11,6 +11,10 @@ import pytest
 from researcher.rss import DEFAULT_FEEDS, RSSEngine, _parse_feed
 
 
+async def _noop():
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Keyword search — empty query must not divide by zero
 # ---------------------------------------------------------------------------
@@ -139,3 +143,57 @@ def test_rssengine_falls_back_to_default_feeds_on_unreadable_db_path(tmp_path):
     bad_path.mkdir()
     engine = RSSEngine(db_path=str(bad_path))
     assert engine.feeds == DEFAULT_FEEDS
+
+
+def test_rssengine_disabling_all_feeds_yields_empty_not_defaults(tmp_path):
+    # Copilot finding on PR #71: an intentionally-empty enabled set (every
+    # feed disabled) must not be reinterpreted as "store unavailable" and
+    # silently repopulated with DEFAULT_FEEDS.
+    from researcher.feed_store import FeedStore
+
+    db_path = str(tmp_path / "feeds.db")
+    store = FeedStore(db_path)
+    store.seed_if_empty(DEFAULT_FEEDS)
+    for feed in store.list_feeds(enabled_only=False):
+        store.disable_feed(feed["feed_id"])
+
+    engine = RSSEngine(db_path=db_path)
+    assert engine.feeds == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_feeds_db_path_wins_over_implicit_opml_autodiscovery(tmp_path, monkeypatch):
+    # Copilot P1 finding on PR #71: this repo ships a checked-in feeds.opml.
+    # fetch_all_feeds's implicit auto-discovery of "feeds.opml" must not
+    # silently override an explicitly-passed db_path — that would mean
+    # register_feed additions never surface via browse_feeds when run from
+    # a directory containing feeds.opml (i.e. the repo root in production).
+    from researcher import rss as rss_module
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "feeds.opml").write_text(
+        '<?xml version="1.0"?><opml version="1.0"><body>'
+        '<outline text="Should Not Win" xmlUrl="http://opml-wins.example/feed"/>'
+        "</body></opml>"
+    )
+    db_path = str(tmp_path / "feeds.db")
+
+    captured = {}
+    orig_init = rss_module.RSSEngine.__init__
+
+    def _spy_init(self, feeds=None, opml_path=None, db_path=None):
+        captured["opml_path"] = opml_path
+        captured["db_path"] = db_path
+        return orig_init(self, feeds=feeds, opml_path=opml_path, db_path=db_path)
+
+    monkeypatch.setattr(rss_module.RSSEngine, "__init__", _spy_init)
+    # Skip the real network fetch — this test only cares which path
+    # RSSEngine was constructed with, not feed content.
+    monkeypatch.setattr(
+        rss_module.RSSEngine, "_refresh_cache", lambda self, feed_names=None: _noop()
+    )
+
+    await rss_module.fetch_all_feeds(db_path=db_path)
+
+    assert captured["opml_path"] is None
+    assert captured["db_path"] == db_path

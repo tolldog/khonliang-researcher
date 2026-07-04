@@ -105,3 +105,29 @@ def test_register_feed_requires_all_fields(tmp_path):
     store = FeedStore(str(tmp_path / "feeds.db"))
     with pytest.raises(FeedError):
         store.register_feed(name="", url="https://a.example/rss.xml", source="a")
+
+
+def test_seed_if_empty_still_seeds_after_a_prior_custom_register(tmp_path):
+    # Copilot P2 finding on PR #71: a whole-table-count gate on seeding
+    # means a custom register_feed call before the first seed permanently
+    # skips migrating DEFAULT_FEEDS. seed_if_empty must check per-URL
+    # existence, not "does the table have any rows at all".
+    store = FeedStore(str(tmp_path / "feeds.db"))
+    store.register_feed(name="Custom Blog", url="https://custom.example/rss.xml", source="custom")
+
+    seeded = store.seed_if_empty(DEFAULT_FEEDS)
+
+    assert seeded == len(DEFAULT_FEEDS)
+    all_feeds = store.list_feeds(enabled_only=False)
+    assert len(all_feeds) == len(DEFAULT_FEEDS) + 1
+    assert any(f["source"] == "custom" for f in all_feeds)
+    assert {f["source"] for f in all_feeds} >= {cfg.source for cfg in DEFAULT_FEEDS.values()}
+
+
+def test_seed_if_empty_does_not_overcount_already_seeded_urls(tmp_path):
+    # seed_if_empty must only count rows it actually inserted, not every
+    # DEFAULT_FEEDS entry it merely considered (Copilot finding on PR #71).
+    store = FeedStore(str(tmp_path / "feeds.db"))
+    store.seed_if_empty(DEFAULT_FEEDS)
+    recount = store.seed_if_empty(DEFAULT_FEEDS)
+    assert recount == 0

@@ -256,8 +256,11 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
     except Exception:
         logger.warning("feed store unavailable at %s; falling back to DEFAULT_FEEDS", db_path, exc_info=True)
         return DEFAULT_FEEDS
-    if not rows:
-        return DEFAULT_FEEDS
+    # An empty result here is a legitimate state (every feed disabled via
+    # disable_feed) and must NOT be reinterpreted as "store unavailable" —
+    # doing so would silently resurrect DEFAULT_FEEDS after a caller
+    # intentionally disabled everything. Only the exception path above
+    # falls back to DEFAULT_FEEDS.
     return {
         row["metadata"].get("seed_slug") or row["feed_id"]: FeedConfig(
             name=row["name"], url=row["url"], source=row["source"],
@@ -384,8 +387,8 @@ async def fetch_all_feeds(
 
     Args:
         feeds: Optional list of feed names to fetch (default: all)
-        opml_path: Optional path to OPML file (default: feeds.opml).
-            Takes priority over the persistent feed registry when given.
+        opml_path: Explicit path to an OPML file. Takes priority over
+            everything, including db_path, when given.
         db_path: Feed registry DB path. Only pass this when the caller
             has a real, configured path (e.g. from ``pipeline.config``) —
             omitting it (the default) uses DEFAULT_FEEDS rather than
@@ -394,7 +397,13 @@ async def fetch_all_feeds(
     Returns:
         All feed entries as EngineResults.
     """
-    if opml_path is None:
+    if opml_path is None and db_path is None:
+        # Implicit feeds.opml auto-discovery is only a convenience for the
+        # no-config, no-registry case. It must not run when a caller passed
+        # db_path — this repo ships a checked-in feeds.opml, and letting
+        # auto-discovery win here would silently defeat the persistent
+        # registry (register_feed additions never surfacing) any time this
+        # ran from the repo root (Copilot P1 finding on PR #71).
         from pathlib import Path
         default_opml = Path("feeds.opml")
         if default_opml.exists():
