@@ -723,15 +723,25 @@ Most tools accept detail="compact|brief|full":
 
         return "\n".join(lines)
 
-    def _feed_store():
-        from researcher.feed_store import FeedStore
+    _feed_store_cache: list = []
 
-        # No literal-path fallback here: pipeline.config["db_path"] is always
-        # populated with a real, absolute path by create_pipeline. A missing
-        # key means this was constructed unusually and should fail loudly
-        # rather than silently opening/seeding a guessed relative path (the
-        # earlier live-prod-DB near-miss on this same FR).
-        return FeedStore(str(pipeline.config["db_path"]))
+    def _feed_store():
+        # Cached across calls in this process — FeedStore.__init__ runs
+        # _init_schema() (CREATE TABLE/INDEX) and opens/closes a connection
+        # on every construction, which is unnecessary overhead for a
+        # register/list/get/update/disable sequence in the same process
+        # (Copilot finding on PR #71 round 5).
+        if not _feed_store_cache:
+            from researcher.feed_store import FeedStore
+
+            # No literal-path fallback here: pipeline.config["db_path"] is
+            # always populated with a real, absolute path by create_pipeline.
+            # A missing key means this was constructed unusually and should
+            # fail loudly rather than silently opening/seeding a guessed
+            # relative path (the earlier live-prod-DB near-miss on this
+            # same FR).
+            _feed_store_cache.append(FeedStore(str(pipeline.config["db_path"])))
+        return _feed_store_cache[0]
 
     @mcp.tool()
     def register_feed(name: str, url: str, source: str, metadata: str = "") -> str:

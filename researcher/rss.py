@@ -409,7 +409,13 @@ async def fetch_all_feeds(
     """Fetch and return all entries from configured RSS feeds.
 
     Args:
-        feeds: Optional list of feed names to fetch (default: all)
+        feeds: Optional list of feed identifiers to fetch (default: all).
+            These are the keys of the resulting ``RSSEngine.feeds`` dict —
+            the OPML/DEFAULT_FEEDS slug (e.g. "anthropic") for feeds loaded
+            from OPML or DEFAULT_FEEDS directly, or the seed slug / feed_id
+            for feeds loaded from the persistent registry (db_path given):
+            seeded defaults keep their slug, feeds added via register_feed
+            are addressed by their feed_id (see list_feeds).
         opml_path: Explicit path to an OPML file. Takes priority over
             everything, including db_path, when given.
         db_path: Feed registry DB path. Only pass this when the caller

@@ -36,6 +36,20 @@ class FeedError(Exception):
     """Raised for feed-registry validation failures (e.g. duplicate URL)."""
 
 
+def _dumps_metadata(metadata: dict[str, Any]) -> str:
+    """``json.dumps`` a metadata dict, converting failures to ``FeedError``.
+
+    A dict can be a dict of non-JSON-serializable values (a set, a custom
+    object, ...); letting that raise ``TypeError`` uncaught would bypass
+    the FeedError contract the server-side tools rely on (Copilot finding
+    on PR #71 round 5).
+    """
+    try:
+        return json.dumps(metadata)
+    except TypeError as e:
+        raise FeedError(f"metadata is not JSON-serializable: {e}") from e
+
+
 class FeedStore:
     """SQLite persistence for the feed registry.
 
@@ -78,7 +92,7 @@ class FeedStore:
                     INSERT INTO feeds (feed_id, name, url, source, enabled, created_at, updated_at, metadata)
                     VALUES (?, ?, ?, ?, 1, ?, ?, ?)
                     """,
-                    (feed_id, name, url, source, now, now, json.dumps(metadata or {})),
+                    (feed_id, name, url, source, now, now, _dumps_metadata(metadata or {})),
                 )
         except sqlite3.IntegrityError as e:
             # The pre-check SELECT can't close a race in concurrent/
@@ -121,7 +135,7 @@ class FeedStore:
                 # it would crash the server-side tool uncaught (Copilot
                 # finding on PR #71 round 4). Reject it as FeedError instead.
                 raise FeedError(f"metadata must be a dict, got {type(fields['metadata']).__name__}")
-            fields = {**fields, "metadata": json.dumps(fields["metadata"])}
+            fields = {**fields, "metadata": _dumps_metadata(fields["metadata"])}
         if "enabled" in fields:
             fields = {**fields, "enabled": 1 if fields["enabled"] else 0}
         set_clause = ", ".join(f"{k} = ?" for k in fields)

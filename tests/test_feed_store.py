@@ -114,6 +114,22 @@ def test_update_feed_rejects_non_dict_metadata(tmp_path):
         store.update_feed(feed["feed_id"], metadata=["not", "a", "dict"])
 
 
+def test_register_feed_rejects_non_json_serializable_metadata(tmp_path):
+    # A dict whose values aren't JSON-serializable would otherwise raise a
+    # raw TypeError from json.dumps, bypassing the FeedError contract the
+    # server-side tool relies on (Copilot finding on PR #71 round 5).
+    store = FeedStore(str(tmp_path / "feeds.db"))
+    with pytest.raises(FeedError, match="not JSON-serializable"):
+        store.register_feed(name="A Blog", url="https://a.example/rss.xml", source="a", metadata={"bad": {1, 2, 3}})
+
+
+def test_update_feed_rejects_non_json_serializable_metadata(tmp_path):
+    store = FeedStore(str(tmp_path / "feeds.db"))
+    feed = store.register_feed(name="A Blog", url="https://a.example/rss.xml", source="a")
+    with pytest.raises(FeedError, match="not JSON-serializable"):
+        store.update_feed(feed["feed_id"], metadata={"bad": {1, 2, 3}})
+
+
 def test_row_to_dict_normalizes_non_dict_metadata(tmp_path):
     # A row with valid-but-non-object JSON metadata ("[]") must not leak
     # through as a list — callers do row["metadata"].get(...) (Copilot
