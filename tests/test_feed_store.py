@@ -16,9 +16,9 @@ from researcher.rss import DEFAULT_FEEDS
 def test_seed_if_empty_populates_default_feeds(tmp_path):
     store = FeedStore(str(tmp_path / "feeds.db"))
     seeded = store.seed_if_empty(DEFAULT_FEEDS)
-    assert seeded == len(DEFAULT_FEEDS) == 11
+    assert seeded == len(DEFAULT_FEEDS)
     feeds = store.list_feeds(enabled_only=False)
-    assert len(feeds) == 11
+    assert len(feeds) == len(DEFAULT_FEEDS)
     assert {f["source"] for f in feeds} == {cfg.source for cfg in DEFAULT_FEEDS.values()}
 
 
@@ -26,9 +26,9 @@ def test_seed_if_empty_is_idempotent(tmp_path):
     store = FeedStore(str(tmp_path / "feeds.db"))
     first = store.seed_if_empty(DEFAULT_FEEDS)
     second = store.seed_if_empty(DEFAULT_FEEDS)
-    assert first == 11
+    assert first == len(DEFAULT_FEEDS)
     assert second == 0
-    assert len(store.list_feeds(enabled_only=False)) == 11
+    assert len(store.list_feeds(enabled_only=False)) == len(DEFAULT_FEEDS)
 
 
 def test_register_feed_rejects_duplicate_url(tmp_path):
@@ -87,6 +87,34 @@ def test_update_feed_edits_fields_in_place(tmp_path):
     assert updated["name"] == "A Blog (renamed)"
     assert updated["metadata"] == {"k": "v"}
     assert updated["url"] == "https://a.example/rss.xml"  # unspecified fields unchanged
+
+
+def test_update_feed_rejects_url_collision_as_feed_error(tmp_path):
+    # A raw sqlite3.IntegrityError from the unique url index must surface
+    # as FeedError, not an uncaught crash — the server-side update_feed
+    # tool only catches FeedError (Copilot finding on PR #71 round 2).
+    store = FeedStore(str(tmp_path / "feeds.db"))
+    store.register_feed(name="A Blog", url="https://a.example/rss.xml", source="a")
+    feed_b = store.register_feed(name="B Blog", url="https://b.example/rss.xml", source="b")
+
+    with pytest.raises(FeedError):
+        store.update_feed(feed_b["feed_id"], url="https://a.example/rss.xml")
+
+
+def test_row_to_dict_normalizes_non_dict_metadata(tmp_path):
+    # A row with valid-but-non-object JSON metadata ("[]") must not leak
+    # through as a list — callers do row["metadata"].get(...) (Copilot
+    # finding on PR #71 round 2).
+    db_path = str(tmp_path / "feeds.db")
+    store = FeedStore(db_path)
+    feed = store.register_feed(name="A Blog", url="https://a.example/rss.xml", source="a")
+
+    import sqlite3
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE feeds SET metadata = '[]' WHERE feed_id = ?", (feed["feed_id"],))
+
+    refetched = store.get_feed(feed["feed_id"])
+    assert refetched["metadata"] == {}
 
 
 def test_update_feed_rejects_unsupported_field(tmp_path):

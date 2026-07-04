@@ -110,13 +110,19 @@ class FeedStore:
             fields = {**fields, "enabled": 1 if fields["enabled"] else 0}
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [time.time(), feed_id]
-        with closing(self._conn()) as conn, conn:
-            cur = conn.execute(
-                f"UPDATE feeds SET {set_clause}, updated_at = ? WHERE feed_id = ?",
-                values,
-            )
-            if cur.rowcount == 0:
-                return None
+        try:
+            with closing(self._conn()) as conn, conn:
+                cur = conn.execute(
+                    f"UPDATE feeds SET {set_clause}, updated_at = ? WHERE feed_id = ?",
+                    values,
+                )
+                if cur.rowcount == 0:
+                    return None
+        except sqlite3.IntegrityError as e:
+            # e.g. updating url to one that collides with the unique index —
+            # surface as FeedError so the server-side tool's `except FeedError`
+            # returns a clean error envelope instead of an uncaught crash.
+            raise FeedError(f"update rejected: {e}") from e
         return self.get_feed(feed_id)
 
     def disable_feed(self, feed_id: str) -> bool:
@@ -151,7 +157,7 @@ class FeedStore:
                 if existing is not None:
                     continue
                 feed_id = f"feed_{uuid.uuid4().hex[:12]}"
-                conn.execute(
+                cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO feeds
                         (feed_id, name, url, source, enabled, created_at, updated_at, metadata)
@@ -159,7 +165,11 @@ class FeedStore:
                     """,
                     (feed_id, cfg.name, cfg.url, cfg.source, now, now, json.dumps({"seed_slug": slug})),
                 )
-                seeded += 1
+                # OR IGNORE can still no-op here (e.g. a same-transaction race
+                # on the unique url index) despite the pre-check SELECT above
+                # finding nothing — only count rows actually inserted.
+                if cur.rowcount > 0:
+                    seeded += 1
             return seeded
 
 
@@ -167,7 +177,10 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     d["enabled"] = bool(d["enabled"])
     try:
-        d["metadata"] = json.loads(d["metadata"])
+        parsed = json.loads(d["metadata"])
     except (TypeError, ValueError):
-        d["metadata"] = {}
+        parsed = {}
+    # Valid-but-non-object JSON ("[]", "null", "5") must not leak through —
+    # callers do row["metadata"].get(...) and a non-dict would crash there.
+    d["metadata"] = parsed if isinstance(parsed, dict) else {}
     return d
