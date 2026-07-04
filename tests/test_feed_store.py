@@ -101,6 +101,19 @@ def test_update_feed_rejects_url_collision_as_feed_error(tmp_path):
         store.update_feed(feed_b["feed_id"], url="https://a.example/rss.xml")
 
 
+def test_update_feed_rejects_non_dict_metadata(tmp_path):
+    # A non-dict metadata value (e.g. a list) would otherwise reach sqlite3
+    # as an unsupported bind parameter and raise sqlite3.ProgrammingError —
+    # a different exception class than the IntegrityError this method
+    # already converts, so it would crash uncaught (Copilot finding on
+    # PR #71 round 4).
+    store = FeedStore(str(tmp_path / "feeds.db"))
+    feed = store.register_feed(name="A Blog", url="https://a.example/rss.xml", source="a")
+
+    with pytest.raises(FeedError, match="must be a dict"):
+        store.update_feed(feed["feed_id"], metadata=["not", "a", "dict"])
+
+
 def test_row_to_dict_normalizes_non_dict_metadata(tmp_path):
     # A row with valid-but-non-object JSON metadata ("[]") must not leak
     # through as a list — callers do row["metadata"].get(...) (Copilot

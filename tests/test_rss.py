@@ -135,6 +135,31 @@ def test_rssengine_loads_and_seeds_from_explicit_db_path(tmp_path):
     assert "new" in {cfg.source for cfg in engine2.feeds.values()}
 
 
+def test_load_feeds_from_store_untrusted_seed_slug_does_not_collide(tmp_path):
+    # Copilot finding on PR #71 round 4: a custom feed whose caller-supplied
+    # metadata happens to set seed_slug to a real default's slug (e.g.
+    # "anthropic") must not displace that default in the returned dict —
+    # only a row whose url genuinely matches DEFAULT_FEEDS[slug].url may
+    # use the slug as its key.
+    from researcher.feed_store import FeedStore
+
+    db_path = str(tmp_path / "feeds.db")
+    store = FeedStore(db_path)
+    store.seed_if_empty(DEFAULT_FEEDS)
+    store.register_feed(
+        name="Impersonator",
+        url="https://impersonator.example/rss.xml",
+        source="impersonator",
+        metadata={"seed_slug": "anthropic"},
+    )
+
+    engine = RSSEngine(db_path=db_path)
+
+    assert engine.feeds["anthropic"].url == DEFAULT_FEEDS["anthropic"].url
+    assert any(cfg.source == "impersonator" for cfg in engine.feeds.values())
+    assert len(engine.feeds) == len(DEFAULT_FEEDS) + 1
+
+
 def test_rssengine_falls_back_to_default_feeds_on_unreadable_db_path(tmp_path):
     # db_path pointing at a directory (not a file) can't be opened by
     # sqlite3.connect; the loader must degrade to DEFAULT_FEEDS rather

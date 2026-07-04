@@ -112,7 +112,15 @@ class FeedStore:
             )
         if not fields:
             return self.get_feed(feed_id)
-        if "metadata" in fields and isinstance(fields["metadata"], dict):
+        if "metadata" in fields:
+            if not isinstance(fields["metadata"], dict):
+                # Anything else (list, int, ...) would reach sqlite3 as an
+                # unsupported bind parameter type and raise
+                # sqlite3.ProgrammingError — a different exception class
+                # than the IntegrityError this method already converts, so
+                # it would crash the server-side tool uncaught (Copilot
+                # finding on PR #71 round 4). Reject it as FeedError instead.
+                raise FeedError(f"metadata must be a dict, got {type(fields['metadata']).__name__}")
             fields = {**fields, "metadata": json.dumps(fields["metadata"])}
         if "enabled" in fields:
             fields = {**fields, "enabled": 1 if fields["enabled"] else 0}

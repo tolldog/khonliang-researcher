@@ -268,11 +268,28 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
     # intentionally disabled everything. Only the exception path above
     # falls back to DEFAULT_FEEDS.
     return {
-        row["metadata"].get("seed_slug") or row["feed_id"]: FeedConfig(
+        _feed_dict_key(row): FeedConfig(
             name=row["name"], url=row["url"], source=row["source"],
         )
         for row in rows
     }
+
+
+def _feed_dict_key(row: dict) -> str:
+    """Pick the dict key for a feed row: the seed slug for genuine seeded
+    defaults, ``feed_id`` for everything else.
+
+    ``metadata`` is caller-supplied for any feed registered via
+    ``register_feed`` — trusting a caller-set ``seed_slug`` verbatim would
+    let a custom feed collide with (and silently displace) a real default
+    feed's key, which callers use to filter by name (Copilot finding on
+    PR #71 round 4). Only trust it when the row's url actually matches
+    that DEFAULT_FEEDS slug's url, i.e. it really is the seeded row.
+    """
+    slug = row["metadata"].get("seed_slug")
+    if slug and slug in DEFAULT_FEEDS and DEFAULT_FEEDS[slug].url == row["url"]:
+        return slug
+    return row["feed_id"]
 
 
 class RSSEngine(BaseEngine):
