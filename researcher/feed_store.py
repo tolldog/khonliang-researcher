@@ -66,19 +66,27 @@ class FeedStore:
             raise FeedError("name, url, and source are all required")
         now = time.time()
         feed_id = f"feed_{uuid.uuid4().hex[:12]}"
-        with closing(self._conn()) as conn, conn:
-            existing = conn.execute(
-                "SELECT feed_id FROM feeds WHERE url = ?", (url,)
-            ).fetchone()
-            if existing is not None:
-                raise FeedError(f"a feed with url {url!r} already exists (feed_id={existing['feed_id']})")
-            conn.execute(
-                """
-                INSERT INTO feeds (feed_id, name, url, source, enabled, created_at, updated_at, metadata)
-                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-                """,
-                (feed_id, name, url, source, now, now, json.dumps(metadata or {})),
-            )
+        try:
+            with closing(self._conn()) as conn, conn:
+                existing = conn.execute(
+                    "SELECT feed_id FROM feeds WHERE url = ?", (url,)
+                ).fetchone()
+                if existing is not None:
+                    raise FeedError(f"a feed with url {url!r} already exists (feed_id={existing['feed_id']})")
+                conn.execute(
+                    """
+                    INSERT INTO feeds (feed_id, name, url, source, enabled, created_at, updated_at, metadata)
+                    VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (feed_id, name, url, source, now, now, json.dumps(metadata or {})),
+                )
+        except sqlite3.IntegrityError as e:
+            # The pre-check SELECT can't close a race in concurrent/
+            # multi-process use — a second writer can insert the same url
+            # between our SELECT and INSERT. Surface as FeedError so the
+            # server-side tool's `except FeedError` returns a clean error
+            # envelope instead of an uncaught crash.
+            raise FeedError(f"a feed with url {url!r} already exists: {e}") from e
         return self.get_feed(feed_id)
 
     def list_feeds(self, enabled_only: bool = True) -> list[dict[str, Any]]:

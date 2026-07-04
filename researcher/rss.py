@@ -247,13 +247,19 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
     DEFAULT_FEEDS directly if the store can't be opened (e.g. read-only
     filesystem in a test sandbox) so callers never see zero feeds.
     """
+    import sqlite3
+
     from researcher.feed_store import FeedStore
 
     try:
         store = FeedStore(db_path)
         store.seed_if_empty(DEFAULT_FEEDS)
         rows = store.list_feeds(enabled_only=True)
-    except Exception:
+    except (sqlite3.Error, OSError):
+        # Narrowed to database/filesystem-open failures only — a bare
+        # `except Exception` would also swallow programmer errors
+        # (KeyError/AttributeError from a schema mismatch, etc.) and mask
+        # real regressions behind a silent DEFAULT_FEEDS fallback.
         logger.warning("feed store unavailable at %s; falling back to DEFAULT_FEEDS", db_path, exc_info=True)
         return DEFAULT_FEEDS
     # An empty result here is a legitimate state (every feed disabled via
