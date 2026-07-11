@@ -4,6 +4,15 @@ from types import SimpleNamespace
 
 import pytest
 
+# khonliang-librarian-lib is an optional `[catalog]` extra (pyproject.toml),
+# not a hard dependency — researcher.self_catalog imports it defensively and
+# degrades to a no-op catalog when it's absent. This whole test file
+# exercises the REAL SelfCatalog (upsert/query round trips, etc.), so it
+# needs the extra installed; skip cleanly rather than failing a default
+# `pip install -e .` (no `.[catalog]`) environment, which is exactly the
+# environment this feature is supposed to tolerate gracefully.
+pytest.importorskip("librarian_lib")
+
 from researcher.self_catalog import (
     build_catalog_skills,
     build_self_catalog,

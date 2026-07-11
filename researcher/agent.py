@@ -757,7 +757,27 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 since="0.6.0",
             ),
         ]
+        # Skills whose handlers hard-depend on catalog_skills (built from
+        # pipeline.catalog) and return {"error": ...} for every call when
+        # it's None — i.e. self-cataloging is disabled (no db_path
+        # configured, or khonliang-librarian-lib isn't installed). Don't
+        # advertise them in that case: a client picking capabilities from
+        # register_skills() has no way to know these are dead until it
+        # actually calls one, and the skill list should reflect what the
+        # agent can actually do. catalog_fetch is deliberately NOT in this
+        # set — its handler reads pipeline.knowledge directly and works
+        # regardless of whether self-cataloging is enabled.
+        _catalog_dependent_skills = {
+            "catalog_query",
+            "catalog_search",
+            "catalog_stats",
+            "list_since",
+            "catalog_mark_stale",
+            "catalog_backfill",
+        }
         for skill in extras:
+            if skill.name in _catalog_dependent_skills and catalog_skills is None:
+                continue
             if skill.name not in names:
                 skills.append(skill)
         return skills

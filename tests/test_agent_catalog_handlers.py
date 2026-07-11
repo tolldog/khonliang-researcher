@@ -12,6 +12,14 @@ from typing import Any
 
 import pytest
 
+# khonliang-librarian-lib is an optional `[catalog]` extra (pyproject.toml),
+# not a hard dependency. Several tests here build a REAL SelfCatalog via
+# build_self_catalog() and upsert real IndexRecords into it, so this whole
+# file needs the extra installed — skip cleanly rather than failing a
+# default `pip install -e .` (no `.[catalog]`) environment, which is
+# exactly the environment this feature is supposed to tolerate gracefully.
+pytest.importorskip("librarian_lib")
+
 from researcher.self_catalog import build_self_catalog
 
 
