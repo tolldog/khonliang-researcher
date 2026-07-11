@@ -1,7 +1,12 @@
 # khonliang-researcher deploy manifest -- TEMPLATE for khonliang-deploy.
 #
-# researcher restarts TWO agents from one source: researcher-primary +
-# librarian-primary (librarian runs from the researcher install).
+# researcher restarts ONE agent: researcher-primary. librarian-primary used to
+# restart from this same install (librarian ran in-process here) -- it split
+# out to its own repo (fr_librarian_bc0a06d7) and now has its own deploy.yaml
+# in khonliang-librarian, unbundled here as part of fr_librarian_e78d9b10.
+# The old researcher.librarian_agent module still lives in this repo pending
+# its removal (separate researcher-side cleanup follow-up); it is no longer
+# deployed from here.
 #
 # Copy to deploy.yaml (gitignored, machine-specific) and edit the real values, then:
 #   khonliang-deploy --manifest deploy.yaml
@@ -17,9 +22,8 @@ venv:   /opt/khonliang/agents/researcher/.venv
 bus:    http://localhost:8788
 deploy_user: khonliang
 ref: main
-source_mode: git                                  # git (prod, pull origin) | local (dev tree as-is)
-agents: [researcher-primary, librarian-primary]   # both restarted after install
+source_mode: git                # git (prod, pull origin) | local (dev tree as-is)
+agents: [researcher-primary]    # librarian-primary unbundled -- see khonliang-librarian/deploy.yaml.example
 
-# Post-install smoke: importing the two agent modules proves the fresh code for
-# both restarted agents is present.
-verify_import: "import researcher.agent, researcher.librarian_agent"
+# Post-install smoke: importing the agent module proves the fresh code is present.
+verify_import: "import researcher.agent"

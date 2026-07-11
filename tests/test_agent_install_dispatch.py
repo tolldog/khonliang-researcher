@@ -3,8 +3,10 @@
 ``BaseAgent.from_cli`` is a classmethod that constructs ``cls(...)``;
 calling it on the base class registers module_name="agent" /
 agent_type="base" with the bus — a launch spec that can't start
-(bug_developer_agent_main_install_uses_base_class_4bb0a5cf). Mirrors
-test_librarian_agent_cli_install_uses_librarian_class.
+(bug_developer_agent_main_install_uses_base_class_4bb0a5cf). The
+librarian-side mirror of this test (formerly
+test_librarian_agent_cli_install_uses_librarian_class) now lives in the
+standalone khonliang-librarian repo (fr_librarian_bc0a06d7).
 """
 
 from __future__ import annotations

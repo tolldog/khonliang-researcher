@@ -17,6 +17,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
@@ -37,6 +38,7 @@ from khonliang_researcher import RelevanceScorer
 from researcher.roles import SummarizerRole, ExtractorRole, AssessorRole
 from researcher.distill_lock import DistillLockStore
 from researcher.search_engines import search_papers
+from researcher.self_catalog import build_self_catalog, idea_index_record, paper_index_record
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +353,12 @@ class ResearchPipeline:
             threshold=self.config.get("relevance_threshold", 0.3),
             blackboard=self.blackboard,
         )
+
+        # SelfCatalog sidecar (fr_researcher_bbe95f12): corpus entries publish
+        # index cards for the librarian to federate. Best-effort — a catalog
+        # failure must never break ingest/distill (see the try/excepts around
+        # every `_catalog_upsert_*` call site below).
+        self.catalog = build_self_catalog(self.config)
 
         # Research pool for threaded fetching. Thread the readability-fallback
         # config through so worker-mode URL ingestion matches ingest_paper.
@@ -817,6 +825,12 @@ class ResearchPipeline:
         # Mark original entry as distilled — the terminal, persisted state.
         self.knowledge.set_status(entry.id, EntryStatus.DISTILLED)
 
+        # Self-catalog: publish the abstract-tier index card now that a
+        # summary + per-project assessments exist. Best-effort — the paper
+        # is already durably DISTILLED above; a catalog hiccup must not
+        # surface as a distill failure.
+        self._catalog_upsert_paper(entry, result)
+
         # Digest is post-persist bookkeeping: the paper is already DISTILLED with
         # its summary/triples stored, so a digest failure must not surface as a
         # distillation failure (distill()'s guard would otherwise flip the row
@@ -836,6 +850,157 @@ class ResearchPipeline:
         except Exception:
             logger.warning("digest.record failed for %s (entry already distilled)",
                            entry.id, exc_info=True)
+
+    def _catalog_upsert_paper(self, entry: KnowledgeEntry, result: "DistillResult") -> None:
+        """Publish a distilled paper's index card to the SelfCatalog (best-effort).
+
+        ``getattr(self, "catalog", None)`` rather than ``self.catalog``: some
+        tests construct a ``ResearchPipeline`` via ``__new__`` (bypassing
+        ``__init__``) to exercise a single method in isolation, so the
+        attribute may not exist at all — that must degrade to a no-op, not
+        an AttributeError, same as a real pipeline with catalog disabled.
+
+        Clears any existing row for this ``entry.id`` first (via
+        ``_catalog_delete``) before upserting the new one: ``upsert``'s
+        primary key is ``(project, source, record_id)``, so a paper whose
+        highest-scoring project changed between distills (``distill_paper``
+        has no guard against re-running an already-DISTILLED entry) would
+        otherwise leave the OLD project's row behind as an orphaned
+        duplicate — corrupting ``catalog_query``/``catalog_stats`` counts
+        (codex P1).
+        """
+        catalog = getattr(self, "catalog", None)
+        if catalog is None:
+            return
+        try:
+            threshold = float(self.config.get("relevance_threshold", 0.3))
+            record = paper_index_record(entry, result, threshold, source=catalog.source)
+            if record is not None:
+                self._catalog_delete(entry.id)
+                catalog.upsert(record)
+        except Exception:
+            logger.warning("self_catalog upsert failed for paper %s", entry.id, exc_info=True)
+
+    def _catalog_upsert_idea(self, entry: KnowledgeEntry) -> None:
+        """Publish an ingested idea's index card to the SelfCatalog (best-effort).
+
+        See ``_catalog_upsert_paper`` for why this reads via ``getattr`` and
+        clears any existing row first (ideas always catalog under the same
+        fixed "research" project, so this is belt-and-suspenders today, but
+        keeps the two completion paths symmetric and safe against a future
+        idea-scoring change).
+        """
+        catalog = getattr(self, "catalog", None)
+        if catalog is None:
+            return
+        try:
+            record = idea_index_record(entry, source=catalog.source)
+            if record is not None:
+                self._catalog_delete(entry.id)
+                catalog.upsert(record)
+        except Exception:
+            logger.warning("self_catalog upsert failed for idea %s", entry.id, exc_info=True)
+
+    def _catalog_delete(self, entry_id: str) -> None:
+        """Remove ALL of an entry's index cards from the SelfCatalog (best-effort).
+
+        Called from ``strike()`` (a struck paper/idea leaves the corpus
+        entirely — its catalog card must not keep surfacing via
+        ``catalog_query``/``catalog_search`` even though ``catalog_fetch``
+        already reports it "not found") AND from ``_catalog_upsert_paper``
+        (clearing any prior row before writing the new one — see there for
+        why). ``SelfCatalog.delete`` needs the record's ``project``, which
+        isn't tracked anywhere else on the pipeline side — look it up via
+        an ``all_projects`` query on ``record_id`` first.
+
+        Deletes EVERY matching row, not just one: ``upsert``'s primary key
+        is ``(project, source, record_id)``, so a paper re-distilled after
+        its highest-scoring project changed (``distill_paper`` has no
+        status guard against re-running an already-DISTILLED entry) would
+        otherwise leave the OLD project's row behind as an orphaned
+        duplicate — ``catalog_query``/``catalog_stats`` would then
+        double-count that paper, and (pre-fix) ``strike()``'s `limit=1`
+        lookup only ever cleared one of the two rows (codex P1).
+        """
+        catalog = getattr(self, "catalog", None)
+        if catalog is None:
+            return
+        try:
+            found = catalog.query(
+                "", filters={"record_id": entry_id}, scope="all_projects", limit=100
+            )
+            rows = found.get("rows") or []
+            for row in rows:
+                catalog.delete(row["project"], entry_id)
+        except Exception:
+            logger.warning("self_catalog delete failed for %s", entry_id, exc_info=True)
+
+    def backfill_self_catalog(self) -> Dict[str, int]:
+        """One-time (idempotent) catalog backfill for a pre-existing corpus.
+
+        codex P1: the two `_catalog_upsert_*` completion-path hooks only
+        fire for FUTURE ingest/distill calls — on an upgrade against an
+        already-populated ``researcher.db``, every pre-existing paper/idea
+        would otherwise stay invisible to ``catalog_query``/``catalog_search``
+        (and to the startup ``register_source(record_count=...)``) until it
+        happened to be re-distilled or re-ingested.
+
+        Walks every Tier.IMPORTED entry once: a distilled paper's summary +
+        assessments are reconstructed from its stored ``<id>_summary``
+        sibling entry (the same data ``_store_distillation`` originally
+        wrote) into a `paper_index_record`; an idea gets an
+        `idea_index_record` directly. Already-cataloged entries (checked
+        via an ``all_projects`` ``record_id`` query) are skipped, so
+        re-running this after the corpus is caught up is cheap — safe to
+        call from an operator skill on demand, or repeatedly, rather than
+        unconditionally on every process start (this walks the WHOLE
+        knowledge store, and the production db this ran against during
+        development was 93MB — unbounded startup work against a live db
+        the deployed agent is also reading/writing is exactly the class of
+        near-miss this repo's own conventions warn about).
+        """
+        catalog = getattr(self, "catalog", None)
+        stats = {"papers": 0, "ideas": 0, "skipped": 0, "errors": 0}
+        if catalog is None:
+            return stats
+        threshold = float(self.config.get("relevance_threshold", 0.3))
+        for entry in self.knowledge.get_by_tier(Tier.IMPORTED):
+            try:
+                existing = catalog.query(
+                    "", filters={"record_id": entry.id}, scope="all_projects", limit=1
+                )
+                if existing.get("rows"):
+                    stats["skipped"] += 1
+                    continue
+                tags = entry.tags or []
+                record = None
+                if "paper" in tags:
+                    if entry.status != EntryStatus.DISTILLED:
+                        continue
+                    summary_entry = self.knowledge.get(f"{entry.id}_summary")
+                    if summary_entry is None:
+                        continue
+                    try:
+                        summary = json.loads(summary_entry.content)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    meta = summary_entry.metadata if isinstance(summary_entry.metadata, dict) else {}
+                    fake_result = SimpleNamespace(
+                        summary=summary, assessments=meta.get("assessments", {}) or {}
+                    )
+                    record = paper_index_record(entry, fake_result, threshold, source=catalog.source)
+                    if record is not None:
+                        stats["papers"] += 1
+                elif "idea" in tags:
+                    record = idea_index_record(entry, source=catalog.source)
+                    if record is not None:
+                        stats["ideas"] += 1
+                if record is not None:
+                    catalog.upsert(record)
+            except Exception:
+                logger.warning("self_catalog backfill failed for %s", entry.id, exc_info=True)
+                stats["errors"] += 1
+        return stats
 
     def recover_stalled_processing(self) -> int:
         """Requeue papers whose distiller died back to INGESTED so they retry.
@@ -990,6 +1155,11 @@ class ResearchPipeline:
         self.knowledge.remove(entry_id)
         removed["paper"] = True
 
+        # Self-catalog: drop the index card too, so a struck paper stops
+        # surfacing via catalog_query/catalog_search (best-effort — see
+        # _catalog_delete).
+        self._catalog_delete(entry_id)
+
         # Remove EVERY URL-index alias pointing at this entry, not just the
         # canonical metadata url. ingest_paper indexes an entry under several
         # keys (canonical url, raw url, original_url, arxiv-abs); deleting only
@@ -1079,6 +1249,10 @@ class ResearchPipeline:
         # ``idea_confidence_factor`` (see ``_extract_idea_triples``); the graph
         # already weights by confidence, so blogs rank below papers for free.
         triple_count = await self._extract_idea_triples(entry_id, text)
+
+        # Self-catalog: publish the idea's index card now that it's durably
+        # stored (best-effort — see _catalog_upsert_idea).
+        self._catalog_upsert_idea(entry)
 
         self.digest.record(
             summary=(
