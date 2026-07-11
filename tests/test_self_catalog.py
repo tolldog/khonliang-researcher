@@ -520,3 +520,32 @@ def test_catalog_delete_noop_when_record_absent(tmp_path):
     pipe = ResearchPipeline.__new__(ResearchPipeline)
     pipe.catalog = build_self_catalog({"db_path": str(tmp_path / "researcher.db")})
     pipe._catalog_delete("never-cataloged")  # must not raise
+
+
+def test_catalog_upsert_paper_replaces_stale_row_on_project_change(tmp_path):
+    """A re-distill that lands a different primary project must not leave a
+    duplicate row behind (codex P1): upsert()'s primary key includes
+    `project`, so writing under a new project without clearing the old
+    one first would double-count this paper in catalog_query/catalog_stats.
+    distill_paper has no guard against re-running an already-DISTILLED
+    entry, so this is reachable without any manual db surgery."""
+    from researcher.pipeline import ResearchPipeline
+
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.config = {"relevance_threshold": 0.3}
+    pipe.catalog = build_self_catalog({"db_path": str(tmp_path / "researcher.db")})
+
+    entry = _entry()
+    # First distill: khonliang wins.
+    pipe._catalog_upsert_paper(entry, _result())
+    assert pipe.catalog.query("khonliang")["count"] == 1
+
+    # Re-distill: genealogy wins this time (e.g. assessor variance, or a
+    # config change to relevance_threshold between runs).
+    result2 = _result(assessments={"khonliang": {"score": 0.1}, "genealogy": {"score": 0.9}})
+    pipe._catalog_upsert_paper(entry, result2)
+
+    # Old project's row is gone, not just superseded by a second one.
+    assert pipe.catalog.query("khonliang")["count"] == 0
+    assert pipe.catalog.query("genealogy")["count"] == 1
+    assert pipe.catalog.stats()["total"] == 1

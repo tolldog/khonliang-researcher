@@ -859,6 +859,15 @@ class ResearchPipeline:
         ``__init__``) to exercise a single method in isolation, so the
         attribute may not exist at all — that must degrade to a no-op, not
         an AttributeError, same as a real pipeline with catalog disabled.
+
+        Clears any existing row for this ``entry.id`` first (via
+        ``_catalog_delete``) before upserting the new one: ``upsert``'s
+        primary key is ``(project, source, record_id)``, so a paper whose
+        highest-scoring project changed between distills (``distill_paper``
+        has no guard against re-running an already-DISTILLED entry) would
+        otherwise leave the OLD project's row behind as an orphaned
+        duplicate — corrupting ``catalog_query``/``catalog_stats`` counts
+        (codex P1).
         """
         catalog = getattr(self, "catalog", None)
         if catalog is None:
@@ -867,6 +876,7 @@ class ResearchPipeline:
             threshold = float(self.config.get("relevance_threshold", 0.3))
             record = paper_index_record(entry, result, threshold, source=catalog.source)
             if record is not None:
+                self._catalog_delete(entry.id)
                 catalog.upsert(record)
         except Exception:
             logger.warning("self_catalog upsert failed for paper %s", entry.id, exc_info=True)
@@ -874,7 +884,11 @@ class ResearchPipeline:
     def _catalog_upsert_idea(self, entry: KnowledgeEntry) -> None:
         """Publish an ingested idea's index card to the SelfCatalog (best-effort).
 
-        See ``_catalog_upsert_paper`` for why this reads via ``getattr``.
+        See ``_catalog_upsert_paper`` for why this reads via ``getattr`` and
+        clears any existing row first (ideas always catalog under the same
+        fixed "research" project, so this is belt-and-suspenders today, but
+        keeps the two completion paths symmetric and safe against a future
+        idea-scoring change).
         """
         catalog = getattr(self, "catalog", None)
         if catalog is None:
@@ -882,36 +896,42 @@ class ResearchPipeline:
         try:
             record = idea_index_record(entry, source=catalog.source)
             if record is not None:
+                self._catalog_delete(entry.id)
                 catalog.upsert(record)
         except Exception:
             logger.warning("self_catalog upsert failed for idea %s", entry.id, exc_info=True)
 
     def _catalog_delete(self, entry_id: str) -> None:
-        """Remove an entry's index card from the SelfCatalog (best-effort).
+        """Remove ALL of an entry's index cards from the SelfCatalog (best-effort).
 
-        Called from ``strike()`` — a struck paper/idea leaves the corpus
-        entirely, so its catalog card must not keep surfacing via
-        ``catalog_query``/``catalog_search`` (codex P1: without this, a
-        strike left the federation surface serving a card for content that
-        no longer exists, even though ``catalog_fetch`` would already
-        report it "not found"). ``SelfCatalog.delete`` needs the record's
-        ``project``, which isn't tracked anywhere else on the pipeline side
-        — look it up via an ``all_projects`` query on ``record_id`` first
-        (a record either doesn't exist, in which case this is a no-op, or
-        exists under exactly one project, since `upsert` always overwrites
-        the same (project, source, record_id) primary key rather than
-        creating a second row under a different project).
+        Called from ``strike()`` (a struck paper/idea leaves the corpus
+        entirely — its catalog card must not keep surfacing via
+        ``catalog_query``/``catalog_search`` even though ``catalog_fetch``
+        already reports it "not found") AND from ``_catalog_upsert_paper``
+        (clearing any prior row before writing the new one — see there for
+        why). ``SelfCatalog.delete`` needs the record's ``project``, which
+        isn't tracked anywhere else on the pipeline side — look it up via
+        an ``all_projects`` query on ``record_id`` first.
+
+        Deletes EVERY matching row, not just one: ``upsert``'s primary key
+        is ``(project, source, record_id)``, so a paper re-distilled after
+        its highest-scoring project changed (``distill_paper`` has no
+        status guard against re-running an already-DISTILLED entry) would
+        otherwise leave the OLD project's row behind as an orphaned
+        duplicate — ``catalog_query``/``catalog_stats`` would then
+        double-count that paper, and (pre-fix) ``strike()``'s `limit=1`
+        lookup only ever cleared one of the two rows (codex P1).
         """
         catalog = getattr(self, "catalog", None)
         if catalog is None:
             return
         try:
             found = catalog.query(
-                "", filters={"record_id": entry_id}, scope="all_projects", limit=1
+                "", filters={"record_id": entry_id}, scope="all_projects", limit=100
             )
             rows = found.get("rows") or []
-            if rows:
-                catalog.delete(rows[0]["project"], entry_id)
+            for row in rows:
+                catalog.delete(row["project"], entry_id)
         except Exception:
             logger.warning("self_catalog delete failed for %s", entry_id, exc_info=True)
 
