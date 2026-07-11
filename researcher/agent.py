@@ -23,6 +23,7 @@ transport changes from stdio to bus HTTP.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -381,6 +382,24 @@ def create_researcher_agent(
     from researcher.server import create_research_server
 
     pipeline = create_pipeline(config_path)
+
+    # Re-derive the SelfCatalog's ownership from the REAL running bus
+    # agent_id, not whatever config["bus_agent_id"] happened to say (or its
+    # "researcher-primary" default). pipeline.py builds `self.catalog`
+    # before any agent_id exists — it's shared by both this bus-agent entry
+    # point and the transport-agnostic MCP-stdio one (researcher.server),
+    # neither of which pipeline.py itself knows about. Rebuilding here means
+    # a custom `--id` (a second, domain-scoped researcher instance) always
+    # wins: its catalog rows, and its later register_source call, are
+    # stamped/advertised under the id this process actually registers on
+    # the bus with — codex P1, a config drift (bus_agent_id != --id) would
+    # otherwise silently mis-stamp every row and let two instances
+    # overwrite each other's librarian registration.
+    if getattr(pipeline, "catalog", None) is not None:
+        from researcher.self_catalog import build_self_catalog
+
+        pipeline.catalog = build_self_catalog(pipeline.config, owner_agent=agent_id)
+
     mcp_server = create_research_server(pipeline)
 
     agent = BaseAgent.from_mcp(
@@ -460,6 +479,16 @@ def create_researcher_agent(
 def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     """Attach native bus handlers on top of the MCP bridge."""
     original_register_skills = agent.register_skills
+
+    # Built once (not None only when pipeline.catalog is initialized) and
+    # reused by every catalog_* handler below — CatalogSkills is a thin
+    # stateless wrapper over the same long-lived SelfCatalog instance.
+    from researcher.self_catalog import build_catalog_skills
+
+    # getattr, not pipeline.catalog: some tests wire a bare stub/SimpleNamespace
+    # pipeline through here with no catalog attribute at all — that must
+    # behave like catalog=None (self-catalog disabled), not AttributeError.
+    catalog_skills = build_catalog_skills(getattr(pipeline, "catalog", None))
 
     def register_skills(self):
         skills = list(original_register_skills())
@@ -628,8 +657,127 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 {"entry_id": {"type": "string", "required": True}},
                 since="0.5.0",
             ),
+            Skill(
+                "catalog_query",
+                "Structured query over researcher's own SelfCatalog index "
+                "cards (papers/ideas) — the librarian's federation surface, "
+                "callable directly too. project is mandatory (isolation is "
+                "load-bearing). filters match kind/record_id/schema_version/"
+                "embedding_status columns, updated_after/updated_before date "
+                "bounds, or facet keys. Returns {error: ...} when the "
+                "catalog is disabled (no db_path configured). "
+                "fr_researcher_bbe95f12.",
+                {
+                    "project": {"type": "string", "required": True},
+                    "filters": {"type": "object", "default": None},
+                    "jmespath_expr": {"type": "string", "default": None},
+                    "fields": {"type": "array", "default": None},
+                    "limit": {"type": "integer", "default": 100},
+                    "scope": {"type": "string", "default": "project"},
+                },
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_search",
+                "Similarity search over researcher's SelfCatalog index-card "
+                "text (title + abstract/summary tier — never full paper "
+                "bodies). Vector search requires a query_vector AND embedded "
+                "rows; otherwise falls back to text LIKE. fr_researcher_bbe95f12.",
+                {
+                    "project": {"type": "string", "required": True},
+                    "query_text": {"type": "string", "default": None},
+                    "limit": {"type": "integer", "default": 20},
+                    "query_vector": {"type": "string", "default": None},
+                },
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_stats",
+                "SelfCatalog health counters (by kind/status, spec versions, "
+                "embedding backlog), optionally scoped to one project. "
+                "fr_researcher_bbe95f12.",
+                {"project": {"type": "string", "default": None}},
+                since="0.6.0",
+            ),
+            Skill(
+                "list_since",
+                "SelfCatalog records updated after since_ts (epoch seconds), "
+                "oldest first — registered under this exact name (not "
+                "catalog_list_since) because the librarian's own federation "
+                "code calls every source's resync primitive as 'list_since' "
+                "(CatalogSkills.list_since). fr_researcher_bbe95f12.",
+                {
+                    "project": {"type": "string", "required": True},
+                    "since_ts": {"type": "number", "required": True},
+                    "limit": {"type": "integer", "default": 100},
+                },
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_fetch",
+                "Exact-id lookup for one corpus entry (paper or idea) by its "
+                "SelfCatalog record_id — this IS the entry's KnowledgeEntry "
+                "id. Distinct from paper_context/paper_digest (fuzzy, "
+                "multi-result search over the whole corpus): this is what "
+                "an IndexRecord's `ref` field points at for bounded, exact "
+                "expansion back to the record it describes. Returns "
+                "{error: 'not found'} for an unknown record_id. "
+                "fr_researcher_bbe95f12.",
+                {"record_id": {"type": "string", "required": True}},
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_mark_stale",
+                "Bulk-flag researcher's SelfCatalog rows for a project "
+                "pending re-embedding after a CatalogSpec version bump. Call "
+                "with the FULL new spec (not just its version) when the "
+                "ecosystem's library.catalog_spec_published event fires. "
+                "fr_researcher_bbe95f12.",
+                {
+                    "project": {"type": "string", "required": True},
+                    "spec": {"type": "object", "required": True},
+                },
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_backfill",
+                "One-time (idempotent) catalog backfill for corpus entries "
+                "that predate self-cataloging — the two completion-path "
+                "hooks (distill/ingest_idea) only publish index cards for "
+                "FUTURE ingests, so an upgrade against an already-populated "
+                "corpus needs this run once to make catalog_query/"
+                "catalog_search see the pre-existing dataset. Walks the "
+                "WHOLE knowledge store; NOT run automatically on agent "
+                "startup (unbounded work against a live, actively-written "
+                "db) — call manually post-deploy, or re-run any time "
+                "(already-cataloged entries are skipped, so it's cheap once "
+                "caught up). Returns {papers, ideas, skipped, errors}. "
+                "fr_researcher_bbe95f12.",
+                {},
+                since="0.6.0",
+            ),
         ]
+        # Skills whose handlers hard-depend on catalog_skills (built from
+        # pipeline.catalog) and return {"error": ...} for every call when
+        # it's None — i.e. self-cataloging is disabled (no db_path
+        # configured, or khonliang-librarian-lib isn't installed). Don't
+        # advertise them in that case: a client picking capabilities from
+        # register_skills() has no way to know these are dead until it
+        # actually calls one, and the skill list should reflect what the
+        # agent can actually do. catalog_fetch is deliberately NOT in this
+        # set — its handler reads pipeline.knowledge directly and works
+        # regardless of whether self-cataloging is enabled.
+        _catalog_dependent_skills = {
+            "catalog_query",
+            "catalog_search",
+            "catalog_stats",
+            "list_since",
+            "catalog_mark_stale",
+            "catalog_backfill",
+        }
         for skill in extras:
+            if skill.name in _catalog_dependent_skills and catalog_skills is None:
+                continue
             if skill.name not in names:
                 skills.append(skill)
         return skills
@@ -738,6 +886,101 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
 
     async def handle_distill_repo_docs(self, args):
         return await distill_repo_docs_handler(self, pipeline, args)
+
+    async def handle_catalog_query(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        project_raw = args.get("project", "")
+        if not isinstance(project_raw, str) or not project_raw.strip():
+            return {"error": "project is required"}
+        return catalog_skills.catalog_query(
+            project_raw.strip(),
+            filters=args.get("filters"),
+            jmespath_expr=args.get("jmespath_expr"),
+            fields=args.get("fields"),
+            limit=args.get("limit", 100),
+            scope=args.get("scope", "project"),
+        )
+
+    async def handle_catalog_search(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        project_raw = args.get("project", "")
+        if not isinstance(project_raw, str) or not project_raw.strip():
+            return {"error": "project is required"}
+        return catalog_skills.catalog_search(
+            project_raw.strip(),
+            args.get("query_text"),
+            limit=args.get("limit", 20),
+            query_vector=args.get("query_vector"),
+        )
+
+    async def handle_catalog_stats(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        return catalog_skills.catalog_stats(project=args.get("project"))
+
+    async def handle_list_since(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        project_raw = args.get("project", "")
+        if not isinstance(project_raw, str) or not project_raw.strip():
+            return {"error": "project is required"}
+        since_ts = args.get("since_ts")
+        if since_ts is None:
+            return {"error": "since_ts is required"}
+        try:
+            since_ts = float(since_ts)
+        except (TypeError, ValueError):
+            return {"error": "since_ts must be a number"}
+        return catalog_skills.list_since(
+            project_raw.strip(), since_ts, limit=args.get("limit", 100)
+        )
+
+    async def handle_catalog_mark_stale(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        project_raw = args.get("project", "")
+        if not isinstance(project_raw, str) or not project_raw.strip():
+            return {"error": "project is required"}
+        spec = args.get("spec")
+        if not isinstance(spec, dict):
+            return {"error": "spec must be an object (the full CatalogSpec)"}
+        return catalog_skills.catalog_mark_stale(project_raw.strip(), spec)
+
+    async def handle_catalog_fetch(self, args):
+        record_id_raw = args.get("record_id", "")
+        if not isinstance(record_id_raw, str) or not record_id_raw.strip():
+            return {"error": "record_id is required"}
+        record_id = record_id_raw.strip()
+        entry = pipeline.knowledge.get(record_id)
+        if entry is None:
+            return {"error": "not found", "record_id": record_id}
+        # Papers store their distilled summary under a sibling id
+        # (f"{entry.id}_summary", see pipeline._store_distillation) rather
+        # than on the entry itself — surface it alongside the raw entry so
+        # a `ref` follow (paper kind) gets the abstract-tier content the
+        # catalog card actually described, not just the entry's metadata.
+        summary_entry = pipeline.knowledge.get(f"{record_id}_summary")
+        summary = None
+        if summary_entry is not None:
+            try:
+                summary = json.loads(summary_entry.content)
+            except (json.JSONDecodeError, TypeError):
+                summary = None
+        return {
+            "record_id": record_id,
+            "title": entry.title,
+            "content": entry.content if summary is None else None,
+            "summary": summary,
+            "url": entry.metadata.get("url", ""),
+            "status": str(getattr(entry, "status", "")),
+        }
+
+    async def handle_catalog_backfill(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        return pipeline.backfill_self_catalog()
 
     def _get_job_store(self) -> IngestJobStore:
         store = getattr(self, "_ingest_job_store", None)
@@ -1097,6 +1340,57 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         # idle-polls when empty).
         self._start_distill_worker()
 
+        # Register as a knowledge source with the librarian (fr_researcher_
+        # bbe95f12). Best-effort: the librarian may not be up yet, or may
+        # never be deployed in a given environment — registration failure
+        # must not block the researcher agent's own startup. No retry loop
+        # here; re-registration is idempotent (register() upserts by
+        # source_id), so a later librarian-side rebuild/restart just needs
+        # this agent's own next restart (or a future re-register skill) to
+        # reconcile.
+        _catalog = getattr(pipeline, "catalog", None)
+        if _catalog is not None:
+            try:
+                from librarian_lib import CONTRACT_VERSION
+
+                # source_id == catalog.source (== the resolved owner_agent
+                # build_self_catalog derived it from, NOT necessarily
+                # self.agent_id — the two SHOULD match when config's
+                # bus_agent_id is set to this agent's real --id, but the
+                # registry entry must key off whatever `source` value this
+                # process's rows are actually stamped with). A static
+                # "researcher" source_id here would let a second
+                # researcher instance's registration silently overwrite the
+                # first's (register_source upserts by source_id), stranding
+                # the first instance's catalog rows with no reachable owner.
+                #
+                # system_tier (not a fixed `projects` list): researcher
+                # catalogs papers under whichever project scored highest
+                # per-entry, PLUS the generic "research" fallback bucket for
+                # entries with no project above threshold — a static list
+                # from config["projects"] would omit that fallback bucket
+                # and would also need updating every time a project is
+                # added, which register_source's own "projects" contract
+                # isn't meant to track.
+                await self.request(
+                    agent_type="librarian",
+                    operation="register_source",
+                    args={
+                        "source_id": _catalog.source,
+                        "kind": "corpus",
+                        "owner_agent": self.agent_id,
+                        "system_tier": True,
+                        "contract_version": CONTRACT_VERSION,
+                        "record_count": _catalog.stats().get("total"),
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "librarian register_source failed (librarian may be "
+                    "unavailable) — continuing without federation registration",
+                    exc_info=True,
+                )
+
         logger.info(
             "Agent %s started (%d skills, WebSocket)",
             self.agent_id,
@@ -1256,6 +1550,16 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["ingest_from_artifact"] = MethodType(handle_ingest_from_artifact, agent)
     agent._handlers["ingest_url_with_body"] = MethodType(handle_ingest_url_with_body, agent)
     agent._handlers["distill_repo_docs"] = MethodType(handle_distill_repo_docs, agent)
+    agent._handlers["catalog_query"] = MethodType(handle_catalog_query, agent)
+    agent._handlers["catalog_search"] = MethodType(handle_catalog_search, agent)
+    agent._handlers["catalog_stats"] = MethodType(handle_catalog_stats, agent)
+    # Registered as "list_since" (not "catalog_list_since") — the librarian's
+    # own federation code calls every registered source's resync primitive
+    # by this exact name (CatalogSkills.list_since).
+    agent._handlers["list_since"] = MethodType(handle_list_since, agent)
+    agent._handlers["catalog_mark_stale"] = MethodType(handle_catalog_mark_stale, agent)
+    agent._handlers["catalog_fetch"] = MethodType(handle_catalog_fetch, agent)
+    agent._handlers["catalog_backfill"] = MethodType(handle_catalog_backfill, agent)
     agent._handlers["ingest_github_async"] = MethodType(handle_ingest_github_async, agent)
     agent._handlers["ingest_file_async"] = MethodType(handle_ingest_file_async, agent)
     agent._handlers["ingest_idea_async"] = MethodType(handle_ingest_idea_async, agent)
