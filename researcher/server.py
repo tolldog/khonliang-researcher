@@ -733,6 +733,7 @@ Most tools accept detail="compact|brief|full":
         # (Copilot finding on PR #71 round 5).
         if not _feed_store_cache:
             from researcher.feed_store import FeedStore
+            from researcher.rss import DEFAULT_FEEDS
 
             # No literal-path fallback here: pipeline.config["db_path"] is
             # always populated with a real, absolute path by create_pipeline.
@@ -740,7 +741,14 @@ Most tools accept detail="compact|brief|full":
             # fail loudly rather than silently opening/seeding a guessed
             # relative path (the earlier live-prod-DB near-miss on this
             # same FR).
-            _feed_store_cache.append(FeedStore(str(pipeline.config["db_path"])))
+            store = FeedStore(str(pipeline.config["db_path"]))
+            # Seed on first use here too — otherwise a brand-new db_path
+            # leaves list_feeds/get_feed/update_feed/disable_feed operating
+            # on an empty registry until some unrelated call path like
+            # browse_feeds happens to trigger _load_feeds_from_store's own
+            # seeding first (codex finding on PR #71).
+            store.seed_if_empty(DEFAULT_FEEDS)
+            _feed_store_cache.append(store)
         return _feed_store_cache[0]
 
     @mcp.tool()
