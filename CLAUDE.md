@@ -41,7 +41,31 @@ FR lifecycle updates.
 - `researcher/relevance.py` — embedding-based relevance scoring
 - `researcher/fetcher.py` — paper/URL fetching with browser headers
 - `researcher/worker.py` — batch distillation worker
+- `researcher/librarian_client.py` — bus client for calling librarian-primary's skills (see Librarian below)
 - `config.yaml` — models, projects, thresholds
+
+## Librarian (bus service, not co-resident)
+
+librarian used to run in-process here (`researcher/librarian_agent.py`); it
+has split into its own repo/agent (`khonliang-librarian`, `librarian-primary`,
+fr_librarian_bc0a06d7). Researcher now only *consumes* librarian's 7 skills
+(classify_paper, taxonomy_report, rebuild_neighborhoods,
+suggest_missing_nodes, promote_investigation, identify_gaps, library_health)
+over the bus (fr_researcher_11e9524a):
+
+- `researcher/librarian_client.py` — thin wrapper over
+  `agent.request(agent_type="librarian", operation=..., args=...)` (same
+  pattern as `agent.py`'s `stage_payload`/`ingest_from_artifact` calling
+  `agent_type="store"`). Every call is best-effort: failures (timeout,
+  connection error, librarian not registered) return
+  `{"available": False, "reason": ...}` rather than raising — librarian
+  absence degrades quality, not function (optional-coordinator principle).
+- `researcher-primary`'s `ask_librarian` bus skill is a thin proxy over this
+  client for callers that only address researcher.
+- The `ingest.url_distilled` / `ingest.queue_drained` bus events researcher
+  publishes (`researcher/ingest_watcher.py`) remain the sanctioned
+  fire-and-forget path librarian's own watcher subscribes to — no blocking
+  call was added to the ingest hot path for this FR.
 
 ## Running
 
