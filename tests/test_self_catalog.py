@@ -68,7 +68,7 @@ def test_build_self_catalog_places_sidecar_next_to_main_db(tmp_path):
     db_path = tmp_path / "researcher.db"
     catalog = build_self_catalog({"db_path": str(db_path)})
     assert catalog is not None
-    assert catalog.db_path == str(tmp_path / "researcher.self_catalog.db")
+    assert catalog.db_path == str(tmp_path / "researcher.db.self_catalog.db")
     # source == owner_agent (both default to DEFAULT_SOURCE) so a registry
     # source_id maps 1:1 to the bus agent_id that owns this catalog file.
     assert catalog.source == "researcher-primary"
@@ -93,8 +93,17 @@ def test_build_self_catalog_sidecars_dont_collide_when_main_dbs_share_a_dir(tmp_
     cat_a = build_self_catalog({"db_path": str(tmp_path / "a.db")})
     cat_b = build_self_catalog({"db_path": str(tmp_path / "b.db")})
     assert cat_a.db_path != cat_b.db_path
-    assert cat_a.db_path == str(tmp_path / "a.self_catalog.db")
-    assert cat_b.db_path == str(tmp_path / "b.self_catalog.db")
+    assert cat_a.db_path == str(tmp_path / "a.db.self_catalog.db")
+    assert cat_b.db_path == str(tmp_path / "b.db.self_catalog.db")
+
+
+def test_build_self_catalog_sidecars_dont_collide_across_extensions(tmp_path):
+    # Two main dbs differing only by extension (same stem) must not share a
+    # sidecar either — `.stem` alone would collapse "researcher.db" and
+    # "researcher.sqlite3" onto the same catalog file (codex P2).
+    cat_db = build_self_catalog({"db_path": str(tmp_path / "researcher.db")})
+    cat_sqlite = build_self_catalog({"db_path": str(tmp_path / "researcher.sqlite3")})
+    assert cat_db.db_path != cat_sqlite.db_path
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +166,13 @@ def test_paper_index_record_shape_and_project_facet():
     assert record.facets["primary_project"] == "khonliang"
     assert record.facets["relevance_scores"] == {"khonliang": 0.8, "genealogy": 0.1}
     assert record.ref == {"skill": "catalog_fetch", "args": {"record_id": "paper123"}}
+    # Must be the CORE_FACETS "status" key (not a bespoke "distill_status")
+    # — SelfCatalog.stats()'s by_status breakdown and status-filtered
+    # catalog_query calls both read facets.status via json_extract; a
+    # different key name silently buckets every row under "unset" (codex
+    # P1).
+    assert record.facets["status"] == "distilled"
+    assert "distill_status" not in record.facets
 
 
 def test_paper_index_record_falls_back_to_research_project_below_threshold():
@@ -190,6 +206,8 @@ def test_idea_index_record_shape():
     assert record.record_id == "idea456"
     assert "An Idea" in record.text
     assert "some free-form idea text" in record.text
+    assert record.facets["status"] == "ingested"
+    assert "distill_status" not in record.facets
 
 
 def test_idea_index_record_none_for_empty_content():
@@ -266,6 +284,11 @@ def test_paper_record_round_trips_through_catalog_upsert_and_query(tmp_path):
 
     # Cross-project isolation: querying a different project sees nothing.
     assert catalog.query("genealogy")["count"] == 0
+
+    # catalog.stats()'s by_status breakdown reads facets.status via
+    # json_extract — a wrong facet key name would bucket this row under
+    # "unset" instead (codex P1 regression guard).
+    assert catalog.stats()["by_status"] == {"distilled": 1}
 
 
 def test_idea_record_round_trips_through_catalog_upsert_and_query(tmp_path):

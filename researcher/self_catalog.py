@@ -107,14 +107,19 @@ def build_self_catalog(
             "self_catalog: no db_path in config — catalog disabled (no-op)"
         )
         return None
-    # Named from the main db's own stem (not a fixed "self_catalog.db"):
-    # two researcher deployments that each keep a separate main db in the
-    # SAME directory (e.g. domain-scoped instances sharing a data/ dir)
-    # would otherwise silently share one sidecar file — their index cards,
-    # stats, and mark-stale operations would mix even though the main
-    # KnowledgeStores stay isolated.
+    # Named from the main db's own FULL basename — `.name`, not `.stem`
+    # (not a fixed "self_catalog.db" either): two researcher deployments
+    # that each keep a separate main db in the SAME directory (e.g.
+    # domain-scoped instances sharing a data/ dir) would otherwise
+    # silently share one sidecar file — their index cards, stats, and
+    # mark-stale operations would mix even though the main KnowledgeStores
+    # stay isolated. `.stem` alone isn't enough: two main dbs that differ
+    # only by extension (`researcher.db` / `researcher.sqlite3`) share the
+    # same stem and would still collide (codex P2) — `.name` includes the
+    # extension, so only two deployments pointed at the literal same
+    # db_path can ever share a sidecar.
     main_db = Path(db_path)
-    catalog_db_path = main_db.parent / f"{main_db.stem}.self_catalog.db"
+    catalog_db_path = main_db.parent / f"{main_db.name}.self_catalog.db"
     # source == owner_agent (one string, reused for both): SelfCatalog's
     # `source` is the label stamped on every row, and the librarian's
     # registry keys sources by a `source_id` that must map 1:1 to a bus
@@ -205,7 +210,13 @@ def paper_index_record(
         kind="paper",
         updated_at=time.time(),
         facets={
-            "distill_status": "distilled",
+            # "status" (not e.g. "distill_status") is the CORE_FACETS key
+            # librarian_lib.SelfCatalog.stats()'s by_status breakdown and
+            # any status-filtered catalog_query call actually read
+            # (json_extract(facets_json, '$.status')) — a different key
+            # name here would silently bucket every row under "unset" and
+            # never match a status filter (codex P1).
+            "status": "distilled",
             "primary_project": primary_project,
             "relevance_scores": scores,
             "ingest_date": entry.metadata.get("fetched_at") or entry.created_at,
@@ -250,7 +261,9 @@ def idea_index_record(entry: Any, source: str = DEFAULT_SOURCE) -> Optional[Inde
         kind="idea",
         updated_at=time.time(),
         facets={
-            "distill_status": "ingested",
+            # See paper_index_record — "status" is the contract key, not a
+            # bespoke "distill_status".
+            "status": "ingested",
             "source_type": entry.metadata.get("source_type", "freeform"),
             "text_truncated": truncated,
         },
