@@ -77,6 +77,13 @@ ingest_max_inflight: 128
 
 db_path: data/researcher.db
 
+# Optional: bus agent id stamped as the SelfCatalog's owner_agent descriptor
+# (fr_researcher_bbe95f12). Defaults to "researcher-primary" when unset —
+# only needs overriding if this instance registers under a different bus
+# agent_id. The catalog sidecar itself (self_catalog.db, next to db_path)
+# is always enabled once db_path is set; there is no separate on/off flag.
+# bus_agent_id: researcher-primary
+
 # Domain rules — optional. When set, these rules are appended to the
 # summarizer, extractor, and assessor system prompts so the distillation
 # LLMs evaluate papers through a domain-specific lens. Leave unset for

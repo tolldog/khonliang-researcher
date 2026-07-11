@@ -37,6 +37,7 @@ from khonliang_researcher import RelevanceScorer
 from researcher.roles import SummarizerRole, ExtractorRole, AssessorRole
 from researcher.distill_lock import DistillLockStore
 from researcher.search_engines import search_papers
+from researcher.self_catalog import build_self_catalog, idea_index_record, paper_index_record
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +352,12 @@ class ResearchPipeline:
             threshold=self.config.get("relevance_threshold", 0.3),
             blackboard=self.blackboard,
         )
+
+        # SelfCatalog sidecar (fr_researcher_bbe95f12): corpus entries publish
+        # index cards for the librarian to federate. Best-effort — a catalog
+        # failure must never break ingest/distill (see the try/excepts around
+        # every `_catalog_upsert_*` call site below).
+        self.catalog = build_self_catalog(self.config)
 
         # Research pool for threaded fetching. Thread the readability-fallback
         # config through so worker-mode URL ingestion matches ingest_paper.
@@ -817,6 +824,12 @@ class ResearchPipeline:
         # Mark original entry as distilled — the terminal, persisted state.
         self.knowledge.set_status(entry.id, EntryStatus.DISTILLED)
 
+        # Self-catalog: publish the abstract-tier index card now that a
+        # summary + per-project assessments exist. Best-effort — the paper
+        # is already durably DISTILLED above; a catalog hiccup must not
+        # surface as a distill failure.
+        self._catalog_upsert_paper(entry, result)
+
         # Digest is post-persist bookkeeping: the paper is already DISTILLED with
         # its summary/triples stored, so a digest failure must not surface as a
         # distillation failure (distill()'s guard would otherwise flip the row
@@ -836,6 +849,41 @@ class ResearchPipeline:
         except Exception:
             logger.warning("digest.record failed for %s (entry already distilled)",
                            entry.id, exc_info=True)
+
+    def _catalog_upsert_paper(self, entry: KnowledgeEntry, result: "DistillResult") -> None:
+        """Publish a distilled paper's index card to the SelfCatalog (best-effort).
+
+        ``getattr(self, "catalog", None)`` rather than ``self.catalog``: some
+        tests construct a ``ResearchPipeline`` via ``__new__`` (bypassing
+        ``__init__``) to exercise a single method in isolation, so the
+        attribute may not exist at all — that must degrade to a no-op, not
+        an AttributeError, same as a real pipeline with catalog disabled.
+        """
+        catalog = getattr(self, "catalog", None)
+        if catalog is None:
+            return
+        try:
+            threshold = float(self.config.get("relevance_threshold", 0.3))
+            record = paper_index_record(entry, result, threshold)
+            if record is not None:
+                catalog.upsert(record)
+        except Exception:
+            logger.warning("self_catalog upsert failed for paper %s", entry.id, exc_info=True)
+
+    def _catalog_upsert_idea(self, entry: KnowledgeEntry) -> None:
+        """Publish an ingested idea's index card to the SelfCatalog (best-effort).
+
+        See ``_catalog_upsert_paper`` for why this reads via ``getattr``.
+        """
+        catalog = getattr(self, "catalog", None)
+        if catalog is None:
+            return
+        try:
+            record = idea_index_record(entry)
+            if record is not None:
+                catalog.upsert(record)
+        except Exception:
+            logger.warning("self_catalog upsert failed for idea %s", entry.id, exc_info=True)
 
     def recover_stalled_processing(self) -> int:
         """Requeue papers whose distiller died back to INGESTED so they retry.
@@ -1079,6 +1127,10 @@ class ResearchPipeline:
         # ``idea_confidence_factor`` (see ``_extract_idea_triples``); the graph
         # already weights by confidence, so blogs rank below papers for free.
         triple_count = await self._extract_idea_triples(entry_id, text)
+
+        # Self-catalog: publish the idea's index card now that it's durably
+        # stored (best-effort — see _catalog_upsert_idea).
+        self._catalog_upsert_idea(entry)
 
         self.digest.record(
             summary=(

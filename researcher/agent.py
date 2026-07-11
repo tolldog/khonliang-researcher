@@ -461,6 +461,16 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     """Attach native bus handlers on top of the MCP bridge."""
     original_register_skills = agent.register_skills
 
+    # Built once (not None only when pipeline.catalog is initialized) and
+    # reused by every catalog_* handler below — CatalogSkills is a thin
+    # stateless wrapper over the same long-lived SelfCatalog instance.
+    from researcher.self_catalog import build_catalog_skills
+
+    # getattr, not pipeline.catalog: some tests wire a bare stub/SimpleNamespace
+    # pipeline through here with no catalog attribute at all — that must
+    # behave like catalog=None (self-catalog disabled), not AttributeError.
+    catalog_skills = build_catalog_skills(getattr(pipeline, "catalog", None))
+
     def register_skills(self):
         skills = list(original_register_skills())
         names = {skill.name for skill in skills}
@@ -628,6 +638,73 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 {"entry_id": {"type": "string", "required": True}},
                 since="0.5.0",
             ),
+            Skill(
+                "catalog_query",
+                "Structured query over researcher's own SelfCatalog index "
+                "cards (papers/ideas) — the librarian's federation surface, "
+                "callable directly too. project is mandatory (isolation is "
+                "load-bearing). filters match kind/record_id/schema_version/"
+                "embedding_status columns, updated_after/updated_before date "
+                "bounds, or facet keys. Returns {error: ...} when the "
+                "catalog is disabled (no db_path configured). "
+                "fr_researcher_bbe95f12.",
+                {
+                    "project": {"type": "string", "required": True},
+                    "filters": {"type": "object", "default": None},
+                    "jmespath_expr": {"type": "string", "default": None},
+                    "fields": {"type": "array", "default": None},
+                    "limit": {"type": "integer", "default": 100},
+                    "scope": {"type": "string", "default": "project"},
+                },
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_search",
+                "Similarity search over researcher's SelfCatalog index-card "
+                "text (title + abstract/summary tier — never full paper "
+                "bodies). Vector search requires a query_vector AND embedded "
+                "rows; otherwise falls back to text LIKE. fr_researcher_bbe95f12.",
+                {
+                    "project": {"type": "string", "required": True},
+                    "query_text": {"type": "string", "default": None},
+                    "limit": {"type": "integer", "default": 20},
+                    "query_vector": {"type": "string", "default": None},
+                },
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_stats",
+                "SelfCatalog health counters (by kind/status, spec versions, "
+                "embedding backlog), optionally scoped to one project. "
+                "fr_researcher_bbe95f12.",
+                {"project": {"type": "string", "default": None}},
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_list_since",
+                "SelfCatalog records updated after since_ts (epoch seconds), "
+                "oldest first — the librarian's incremental resync primitive. "
+                "fr_researcher_bbe95f12.",
+                {
+                    "project": {"type": "string", "required": True},
+                    "since_ts": {"type": "number", "required": True},
+                    "limit": {"type": "integer", "default": 100},
+                },
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_mark_stale",
+                "Bulk-flag researcher's SelfCatalog rows for a project "
+                "pending re-embedding after a CatalogSpec version bump. Call "
+                "with the FULL new spec (not just its version) when the "
+                "ecosystem's library.catalog_spec_published event fires. "
+                "fr_researcher_bbe95f12.",
+                {
+                    "project": {"type": "string", "required": True},
+                    "spec": {"type": "object", "required": True},
+                },
+                since="0.6.0",
+            ),
         ]
         for skill in extras:
             if skill.name not in names:
@@ -738,6 +815,67 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
 
     async def handle_distill_repo_docs(self, args):
         return await distill_repo_docs_handler(self, pipeline, args)
+
+    async def handle_catalog_query(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        project_raw = args.get("project", "")
+        if not isinstance(project_raw, str) or not project_raw.strip():
+            return {"error": "project is required"}
+        return catalog_skills.catalog_query(
+            project_raw.strip(),
+            filters=args.get("filters"),
+            jmespath_expr=args.get("jmespath_expr"),
+            fields=args.get("fields"),
+            limit=args.get("limit", 100),
+            scope=args.get("scope", "project"),
+        )
+
+    async def handle_catalog_search(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        project_raw = args.get("project", "")
+        if not isinstance(project_raw, str) or not project_raw.strip():
+            return {"error": "project is required"}
+        return catalog_skills.catalog_search(
+            project_raw.strip(),
+            args.get("query_text"),
+            limit=args.get("limit", 20),
+            query_vector=args.get("query_vector"),
+        )
+
+    async def handle_catalog_stats(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        return catalog_skills.catalog_stats(project=args.get("project"))
+
+    async def handle_catalog_list_since(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        project_raw = args.get("project", "")
+        if not isinstance(project_raw, str) or not project_raw.strip():
+            return {"error": "project is required"}
+        since_ts = args.get("since_ts")
+        if since_ts is None:
+            return {"error": "since_ts is required"}
+        try:
+            since_ts = float(since_ts)
+        except (TypeError, ValueError):
+            return {"error": "since_ts must be a number"}
+        return catalog_skills.list_since(
+            project_raw.strip(), since_ts, limit=args.get("limit", 100)
+        )
+
+    async def handle_catalog_mark_stale(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        project_raw = args.get("project", "")
+        if not isinstance(project_raw, str) or not project_raw.strip():
+            return {"error": "project is required"}
+        spec = args.get("spec")
+        if not isinstance(spec, dict):
+            return {"error": "spec must be an object (the full CatalogSpec)"}
+        return catalog_skills.catalog_mark_stale(project_raw.strip(), spec)
 
     def _get_job_store(self) -> IngestJobStore:
         store = getattr(self, "_ingest_job_store", None)
@@ -1097,6 +1235,44 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         # idle-polls when empty).
         self._start_distill_worker()
 
+        # Register as a knowledge source with the librarian (fr_researcher_
+        # bbe95f12). Best-effort: the librarian may not be up yet, or may
+        # never be deployed in a given environment — registration failure
+        # must not block the researcher agent's own startup. No retry loop
+        # here; re-registration is idempotent (register() upserts by
+        # source_id), so a later librarian-side rebuild/restart just needs
+        # this agent's own next restart (or a future re-register skill) to
+        # reconcile.
+        _catalog = getattr(pipeline, "catalog", None)
+        if _catalog is not None:
+            try:
+                # system_tier (not a fixed `projects` list): researcher
+                # catalogs papers under whichever project scored highest
+                # per-entry, PLUS the generic "research" fallback bucket for
+                # entries with no project above threshold — a static list
+                # from config["projects"] would omit that fallback bucket
+                # and would also need updating every time a project is
+                # added, which register_source's own "projects" contract
+                # isn't meant to track.
+                await self.request(
+                    agent_type="librarian",
+                    operation="register_source",
+                    args={
+                        "source_id": "researcher",
+                        "kind": "corpus",
+                        "owner_agent": self.agent_id,
+                        "system_tier": True,
+                        "contract_version": "1",
+                        "record_count": _catalog.stats().get("total"),
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "librarian register_source failed (librarian may be "
+                    "unavailable) — continuing without federation registration",
+                    exc_info=True,
+                )
+
         logger.info(
             "Agent %s started (%d skills, WebSocket)",
             self.agent_id,
@@ -1256,6 +1432,11 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["ingest_from_artifact"] = MethodType(handle_ingest_from_artifact, agent)
     agent._handlers["ingest_url_with_body"] = MethodType(handle_ingest_url_with_body, agent)
     agent._handlers["distill_repo_docs"] = MethodType(handle_distill_repo_docs, agent)
+    agent._handlers["catalog_query"] = MethodType(handle_catalog_query, agent)
+    agent._handlers["catalog_search"] = MethodType(handle_catalog_search, agent)
+    agent._handlers["catalog_stats"] = MethodType(handle_catalog_stats, agent)
+    agent._handlers["catalog_list_since"] = MethodType(handle_catalog_list_since, agent)
+    agent._handlers["catalog_mark_stale"] = MethodType(handle_catalog_mark_stale, agent)
     agent._handlers["ingest_github_async"] = MethodType(handle_ingest_github_async, agent)
     agent._handlers["ingest_file_async"] = MethodType(handle_ingest_file_async, agent)
     agent._handlers["ingest_idea_async"] = MethodType(handle_ingest_idea_async, agent)

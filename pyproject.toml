@@ -19,6 +19,7 @@ dependencies = [
     "markdownify>=0.12",
     "mcp>=1.0.0",
     "khonliang-bus-lib>=0.5.0",  # >=0.5.0 for Welcome / WelcomeEntryPoint exports
+    "khonliang-librarian-lib>=0.1.0",  # SelfCatalog knowledge-owner contract (fr_researcher_bbe95f12)
 ]
 
 [project.scripts]
