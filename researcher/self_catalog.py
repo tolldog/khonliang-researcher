@@ -37,9 +37,29 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from librarian_lib import CatalogSkills, IndexRecord, SelfCatalog
+# Imported defensively: khonliang-librarian-lib is a bare-name local-editable
+# dependency (no PyPI package) across this ecosystem's repos — a deploy that
+# hasn't yet run `pip install -e ../khonliang-librarian-lib` in the
+# production venv must not crash the whole pipeline import on restart. The
+# rest of this module (and its two pipeline.py call sites) already treats
+# the catalog as best-effort/optional; a missing library degrades the same
+# way an absent `db_path` does — catalog disabled, everything else works.
+try:
+    from librarian_lib import CatalogSkills, IndexRecord, SelfCatalog
+
+    _LIBRARIAN_LIB_AVAILABLE = True
+except ImportError:  # pragma: no cover — exercised only when the dep is absent
+    CatalogSkills = IndexRecord = SelfCatalog = None  # type: ignore[assignment,misc]
+    _LIBRARIAN_LIB_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+if not _LIBRARIAN_LIB_AVAILABLE:
+    logger.warning(
+        "khonliang-librarian-lib is not installed — self-catalog disabled "
+        "(no-op). Install it editable (`pip install -e "
+        "../khonliang-librarian-lib`) to enable corpus self-cataloging."
+    )
 
 #: Source id stamped on every record this catalog owns.
 CATALOG_SOURCE = "researcher"
@@ -53,6 +73,14 @@ FALLBACK_PROJECT = "research"
 #: with any change to the facet/text shape below.
 SCHEMA_VERSION = 1
 
+#: Cap on embedded idea text. Ideas ingested via ``ingest_from_artifact`` /
+#: ``stage_payload`` can carry up to the store's 20k-char fetch cap (blogs,
+#: staged artifacts) — well past "index card" size. The FR's "abstract
+#: tier, never full bodies" rule applies to papers explicitly, but the same
+#: reasoning holds for any embeddable catalog text, so long idea bodies are
+#: truncated rather than embedded whole.
+IDEA_TEXT_CAP = 2000
+
 
 def build_self_catalog(
     config: dict[str, Any], owner_agent: Optional[str] = None
@@ -63,8 +91,12 @@ def build_self_catalog(
     deliberate: guessing a relative default here risks writing into
     whatever the current process's cwd happens to be (the exact mistake
     that nearly seeded rows into the live production db). Callers that get
-    None back should skip cataloging, not fabricate a path.
+    None back should skip cataloging, not fabricate a path. Also returns
+    None (already logged at import time) when ``khonliang-librarian-lib``
+    itself isn't installed.
     """
+    if not _LIBRARIAN_LIB_AVAILABLE:
+        return None
     db_path = config.get("db_path")
     if not db_path:
         logger.warning(
@@ -164,12 +196,18 @@ def idea_index_record(entry: Any) -> Optional[IndexRecord]:
     project from — every idea catalogs under `FALLBACK_PROJECT`
     ("research"), the same generic scope `KnowledgeEntry` already gives
     un-scoped corpus entries. `text` is the idea body itself (not a
-    summary) — ideas are short informal notes, not full paper bodies, so
-    embedding the whole thing stays within the "abstract tier, not raw
-    corpus text" rule the FR sets for papers.
+    summary) — most ideas are short informal notes, but `ingest_idea` is
+    also the entry point for staged artifacts / blogs up to the store's
+    20k-char fetch cap, so the body is truncated to `IDEA_TEXT_CAP` rather
+    than embedded whole (same "index card, not full payload" reasoning the
+    FR applies to papers).
     """
     if not entry.content or not entry.content.strip():
         return None
+    body = entry.content.strip()
+    truncated = len(body) > IDEA_TEXT_CAP
+    if truncated:
+        body = body[:IDEA_TEXT_CAP]
     return IndexRecord(
         project=FALLBACK_PROJECT,
         source=CATALOG_SOURCE,
@@ -180,8 +218,9 @@ def idea_index_record(entry: Any) -> Optional[IndexRecord]:
         facets={
             "distill_status": "ingested",
             "source_type": entry.metadata.get("source_type", "freeform"),
+            "text_truncated": truncated,
         },
-        text=f"{entry.title}\n\n{entry.content}",
+        text=f"{entry.title}\n\n{body}",
         ref={"skill": "paper_context", "args": {"query": entry.title}},
     )
 

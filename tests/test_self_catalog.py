@@ -171,6 +171,40 @@ def test_idea_index_record_none_for_empty_content():
     assert idea_index_record(entry) is None
 
 
+def test_idea_index_record_marks_short_body_not_truncated():
+    entry = _entry(content="short body")
+    record = idea_index_record(entry)
+    assert record.facets["text_truncated"] is False
+
+
+def test_idea_index_record_truncates_long_body():
+    from researcher.self_catalog import IDEA_TEXT_CAP
+
+    long_body = "x" * (IDEA_TEXT_CAP + 5000)
+    entry = _entry(content=long_body)
+    record = idea_index_record(entry)
+    assert record.facets["text_truncated"] is True
+    # Body portion of the text is capped; the exact overhead from the
+    # title prefix doesn't matter, just that the full 20k-char blog body
+    # never lands in the catalog whole.
+    assert len(record.text) < len(long_body)
+
+
+# ---------------------------------------------------------------------------
+# Missing khonliang-librarian-lib must disable the catalog, not crash import
+# (deploy hazard: it's a bare-name local-editable dep, not on PyPI, so a
+# production venv that hasn't run the sibling `pip install -e` yet must not
+# take the whole pipeline down on restart).
+# ---------------------------------------------------------------------------
+
+
+def test_build_self_catalog_disabled_when_librarian_lib_unavailable(monkeypatch, tmp_path):
+    import researcher.self_catalog as sc
+
+    monkeypatch.setattr(sc, "_LIBRARIAN_LIB_AVAILABLE", False)
+    assert sc.build_self_catalog({"db_path": str(tmp_path / "researcher.db")}) is None
+
+
 # ---------------------------------------------------------------------------
 # build_catalog_skills
 # ---------------------------------------------------------------------------
