@@ -864,7 +864,7 @@ class ResearchPipeline:
             return
         try:
             threshold = float(self.config.get("relevance_threshold", 0.3))
-            record = paper_index_record(entry, result, threshold)
+            record = paper_index_record(entry, result, threshold, source=catalog.source)
             if record is not None:
                 catalog.upsert(record)
         except Exception:
@@ -879,7 +879,7 @@ class ResearchPipeline:
         if catalog is None:
             return
         try:
-            record = idea_index_record(entry)
+            record = idea_index_record(entry, source=catalog.source)
             if record is not None:
                 catalog.upsert(record)
         except Exception:

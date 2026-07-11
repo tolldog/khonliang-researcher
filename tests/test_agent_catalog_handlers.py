@@ -67,7 +67,7 @@ async def test_catalog_query_returns_upserted_records(tmp_path):
     catalog.upsert(
         IndexRecord(
             project="khonliang",
-            source="researcher",
+            source="researcher-primary",
             record_id="p1",
             schema_version=1,
             kind="paper",
@@ -91,7 +91,7 @@ async def test_catalog_search_text_fallback(tmp_path):
     catalog.upsert(
         IndexRecord(
             project="khonliang",
-            source="researcher",
+            source="researcher-primary",
             record_id="p1",
             schema_version=1,
             kind="paper",
@@ -115,16 +115,16 @@ async def test_catalog_stats(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_catalog_list_since_requires_since_ts(tmp_path):
+async def test_list_since_requires_since_ts(tmp_path):
     pipeline, catalog = _pipeline_with_catalog(tmp_path)
     agent = _build_fake_agent(pipeline)
-    handler = agent._handlers["catalog_list_since"]
+    handler = agent._handlers["list_since"]
     result = await handler({"project": "khonliang"})
     assert "error" in result
 
 
 @pytest.mark.asyncio
-async def test_catalog_list_since_returns_recent(tmp_path):
+async def test_list_since_returns_recent(tmp_path):
     pipeline, catalog = _pipeline_with_catalog(tmp_path)
     agent = _build_fake_agent(pipeline)
 
@@ -132,11 +132,11 @@ async def test_catalog_list_since_returns_recent(tmp_path):
 
     catalog.upsert(
         IndexRecord(
-            project="khonliang", source="researcher", record_id="p1",
+            project="khonliang", source="researcher-primary", record_id="p1",
             schema_version=1, kind="paper", text="t",
         )
     )
-    handler = agent._handlers["catalog_list_since"]
+    handler = agent._handlers["list_since"]
     result = await handler({"project": "khonliang", "since_ts": 0})
     assert result["count"] == 1
 
@@ -159,10 +159,67 @@ async def test_catalog_mark_stale_bulk_flags_rows(tmp_path):
 
     catalog.upsert(
         IndexRecord(
-            project="khonliang", source="researcher", record_id="p1",
+            project="khonliang", source="researcher-primary", record_id="p1",
             schema_version=1, kind="paper", text="t",
         )
     )
     handler = agent._handlers["catalog_mark_stale"]
     result = await handler({"project": "khonliang", "spec": {"version": 2}})
     assert result["updated"] == 1
+
+
+# ---------------------------------------------------------------------------
+# catalog_fetch: the exact-id lookup an IndexRecord's `ref` points at.
+# ---------------------------------------------------------------------------
+
+
+def _pipeline_with_knowledge(entries: dict) -> Any:
+    return SimpleNamespace(
+        config={},
+        knowledge=SimpleNamespace(get=lambda eid: entries.get(eid)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_catalog_fetch_requires_record_id():
+    agent = _build_fake_agent(_pipeline_with_knowledge({}))
+    handler = agent._handlers["catalog_fetch"]
+    result = await handler({})
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_catalog_fetch_not_found():
+    agent = _build_fake_agent(_pipeline_with_knowledge({}))
+    handler = agent._handlers["catalog_fetch"]
+    result = await handler({"record_id": "missing"})
+    assert result["error"] == "not found"
+
+
+@pytest.mark.asyncio
+async def test_catalog_fetch_returns_entry_and_summary():
+    import json as _json
+
+    paper = SimpleNamespace(
+        title="A Paper", content="raw body", metadata={"url": "https://x"}, status="distilled",
+    )
+    summary_entry = SimpleNamespace(content=_json.dumps({"abstract": "abs"}))
+    agent = _build_fake_agent(
+        _pipeline_with_knowledge({"p1": paper, "p1_summary": summary_entry})
+    )
+    handler = agent._handlers["catalog_fetch"]
+    result = await handler({"record_id": "p1"})
+    assert result["title"] == "A Paper"
+    assert result["summary"] == {"abstract": "abs"}
+    # Summary present → raw content isn't duplicated into the response.
+    assert result["content"] is None
+
+
+@pytest.mark.asyncio
+async def test_catalog_fetch_falls_back_to_content_without_summary():
+    idea = SimpleNamespace(title="An Idea", content="idea body", metadata={}, status="ingested")
+    agent = _build_fake_agent(_pipeline_with_knowledge({"idea1": idea}))
+    handler = agent._handlers["catalog_fetch"]
+    result = await handler({"record_id": "idea1"})
+    assert result["summary"] is None
+    assert result["content"] == "idea body"

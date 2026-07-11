@@ -45,11 +45,12 @@ from typing import Any, Optional
 # the catalog as best-effort/optional; a missing library degrades the same
 # way an absent `db_path` does — catalog disabled, everything else works.
 try:
-    from librarian_lib import CatalogSkills, IndexRecord, SelfCatalog
+    from librarian_lib import CONTRACT_VERSION, CatalogSkills, IndexRecord, SelfCatalog
 
     _LIBRARIAN_LIB_AVAILABLE = True
 except ImportError:  # pragma: no cover — exercised only when the dep is absent
     CatalogSkills = IndexRecord = SelfCatalog = None  # type: ignore[assignment,misc]
+    CONTRACT_VERSION = "0"  # never actually advertised: register_source is skipped when catalog is None
     _LIBRARIAN_LIB_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,11 @@ if not _LIBRARIAN_LIB_AVAILABLE:
         "../khonliang-librarian-lib`) to enable corpus self-cataloging."
     )
 
-#: Source id stamped on every record this catalog owns.
-CATALOG_SOURCE = "researcher"
+#: Default source/owner_agent when config carries neither. Also the
+#: default `source` argument for `paper_index_record`/`idea_index_record`
+#: when called directly (e.g. tests) without a live catalog to read
+#: `.source` from.
+DEFAULT_SOURCE = "researcher-primary"
 
 #: Fallback project facet for entries with no per-project score above
 #: threshold (or that aren't per-project-scored at all, e.g. ideas at
@@ -104,10 +108,23 @@ def build_self_catalog(
         )
         return None
     catalog_db_path = Path(db_path).parent / "self_catalog.db"
+    # source == owner_agent (one string, reused for both): SelfCatalog's
+    # `source` is the label stamped on every row, and the librarian's
+    # registry keys sources by a `source_id` that must map 1:1 to a bus
+    # agent_id for federated calls to route to the right process. Reusing
+    # the actual owner_agent value as `source` (instead of a fleet-wide
+    # constant like "researcher") keeps multiple researcher instances
+    # (e.g. domain-scoped deployments, each with its own bus agent_id and
+    # its own self_catalog.db) from colliding on one registry entry — a
+    # static "researcher" source_id would mean the second instance's
+    # register_source call silently overwrites the first's, making the
+    # first instance's rows permanently unroutable even though its sqlite
+    # file is untouched.
+    resolved_owner = owner_agent or config.get("bus_agent_id") or DEFAULT_SOURCE
     return SelfCatalog(
         db_path=str(catalog_db_path),
-        source=CATALOG_SOURCE,
-        owner_agent=owner_agent or config.get("bus_agent_id") or "researcher-primary",
+        source=resolved_owner,
+        owner_agent=resolved_owner,
     )
 
 
@@ -147,12 +164,16 @@ def paper_index_record(
     entry: Any,
     result: Any,
     relevance_threshold: float,
+    source: str = DEFAULT_SOURCE,
 ) -> Optional[IndexRecord]:
     """Build the post-distill index card for a paper (or None if nothing to catalog).
 
     Called at the `distill()` completion path once a paper has a summary +
     per-project assessments. Returns None when `result.summary` is empty
-    (a failed/skipped distill has nothing embeddable to catalog).
+    (a failed/skipped distill has nothing embeddable to catalog). `source`
+    must match the owning `SelfCatalog.source` exactly (`upsert()` rejects
+    a mismatch) — callers with a live catalog should pass `catalog.source`,
+    not rely on the default.
     """
     summary = getattr(result, "summary", None)
     if not summary:
@@ -171,7 +192,7 @@ def paper_index_record(
 
     return IndexRecord(
         project=project,
-        source=CATALOG_SOURCE,
+        source=source,
         record_id=entry.id,
         schema_version=SCHEMA_VERSION,
         kind="paper",
@@ -184,11 +205,16 @@ def paper_index_record(
             "source_url": entry.metadata.get("url", ""),
         },
         text=text,
-        ref={"skill": "paper_context", "args": {"query": entry.title}},
+        # catalog_fetch is an exact record_id lookup (researcher.agent's own
+        # new bus skill, backed by pipeline.knowledge.get) — NOT
+        # paper_context/paper_digest, which are fuzzy multi-result search
+        # surfaces that can resolve to the wrong entry on a duplicate or
+        # similar title. `ref` is meant to retrieve THIS exact record.
+        ref={"skill": "catalog_fetch", "args": {"record_id": entry.id}},
     )
 
 
-def idea_index_record(entry: Any) -> Optional[IndexRecord]:
+def idea_index_record(entry: Any, source: str = DEFAULT_SOURCE) -> Optional[IndexRecord]:
     """Build the ingest-time index card for a free-form idea/blog entry.
 
     Ideas aren't scored per-project the way papers are (`ingest_idea` has
@@ -200,7 +226,8 @@ def idea_index_record(entry: Any) -> Optional[IndexRecord]:
     also the entry point for staged artifacts / blogs up to the store's
     20k-char fetch cap, so the body is truncated to `IDEA_TEXT_CAP` rather
     than embedded whole (same "index card, not full payload" reasoning the
-    FR applies to papers).
+    FR applies to papers). `source` must match the owning
+    `SelfCatalog.source` exactly, same caveat as `paper_index_record`.
     """
     if not entry.content or not entry.content.strip():
         return None
@@ -210,7 +237,7 @@ def idea_index_record(entry: Any) -> Optional[IndexRecord]:
         body = body[:IDEA_TEXT_CAP]
     return IndexRecord(
         project=FALLBACK_PROJECT,
-        source=CATALOG_SOURCE,
+        source=source,
         record_id=entry.id,
         schema_version=SCHEMA_VERSION,
         kind="idea",
@@ -221,7 +248,7 @@ def idea_index_record(entry: Any) -> Optional[IndexRecord]:
             "text_truncated": truncated,
         },
         text=f"{entry.title}\n\n{body}",
-        ref={"skill": "paper_context", "args": {"query": entry.title}},
+        ref={"skill": "catalog_fetch", "args": {"record_id": entry.id}},
     )
 
 

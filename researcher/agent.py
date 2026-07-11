@@ -23,6 +23,7 @@ transport changes from stdio to bus HTTP.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -681,15 +682,30 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 since="0.6.0",
             ),
             Skill(
-                "catalog_list_since",
+                "list_since",
                 "SelfCatalog records updated after since_ts (epoch seconds), "
-                "oldest first — the librarian's incremental resync primitive. "
-                "fr_researcher_bbe95f12.",
+                "oldest first — registered under this exact name (not "
+                "catalog_list_since) because the librarian's own federation "
+                "code calls every source's resync primitive as 'list_since' "
+                "(CatalogSkills.list_since). fr_researcher_bbe95f12.",
                 {
                     "project": {"type": "string", "required": True},
                     "since_ts": {"type": "number", "required": True},
                     "limit": {"type": "integer", "default": 100},
                 },
+                since="0.6.0",
+            ),
+            Skill(
+                "catalog_fetch",
+                "Exact-id lookup for one corpus entry (paper or idea) by its "
+                "SelfCatalog record_id — this IS the entry's KnowledgeEntry "
+                "id. Distinct from paper_context/paper_digest (fuzzy, "
+                "multi-result search over the whole corpus): this is what "
+                "an IndexRecord's `ref` field points at for bounded, exact "
+                "expansion back to the record it describes. Returns "
+                "{error: 'not found'} for an unknown record_id. "
+                "fr_researcher_bbe95f12.",
+                {"record_id": {"type": "string", "required": True}},
                 since="0.6.0",
             ),
             Skill(
@@ -849,7 +865,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             return {"error": "self-catalog is disabled (no db_path configured)"}
         return catalog_skills.catalog_stats(project=args.get("project"))
 
-    async def handle_catalog_list_since(self, args):
+    async def handle_list_since(self, args):
         if catalog_skills is None:
             return {"error": "self-catalog is disabled (no db_path configured)"}
         project_raw = args.get("project", "")
@@ -876,6 +892,35 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         if not isinstance(spec, dict):
             return {"error": "spec must be an object (the full CatalogSpec)"}
         return catalog_skills.catalog_mark_stale(project_raw.strip(), spec)
+
+    async def handle_catalog_fetch(self, args):
+        record_id_raw = args.get("record_id", "")
+        if not isinstance(record_id_raw, str) or not record_id_raw.strip():
+            return {"error": "record_id is required"}
+        record_id = record_id_raw.strip()
+        entry = pipeline.knowledge.get(record_id)
+        if entry is None:
+            return {"error": "not found", "record_id": record_id}
+        # Papers store their distilled summary under a sibling id
+        # (f"{entry.id}_summary", see pipeline._store_distillation) rather
+        # than on the entry itself — surface it alongside the raw entry so
+        # a `ref` follow (paper kind) gets the abstract-tier content the
+        # catalog card actually described, not just the entry's metadata.
+        summary_entry = pipeline.knowledge.get(f"{record_id}_summary")
+        summary = None
+        if summary_entry is not None:
+            try:
+                summary = json.loads(summary_entry.content)
+            except (json.JSONDecodeError, TypeError):
+                summary = None
+        return {
+            "record_id": record_id,
+            "title": entry.title,
+            "content": entry.content if summary is None else None,
+            "summary": summary,
+            "url": entry.metadata.get("url", ""),
+            "status": str(getattr(entry, "status", "")),
+        }
 
     def _get_job_store(self) -> IngestJobStore:
         store = getattr(self, "_ingest_job_store", None)
@@ -1246,6 +1291,19 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
         _catalog = getattr(pipeline, "catalog", None)
         if _catalog is not None:
             try:
+                from librarian_lib import CONTRACT_VERSION
+
+                # source_id == catalog.source (== the resolved owner_agent
+                # build_self_catalog derived it from, NOT necessarily
+                # self.agent_id — the two SHOULD match when config's
+                # bus_agent_id is set to this agent's real --id, but the
+                # registry entry must key off whatever `source` value this
+                # process's rows are actually stamped with). A static
+                # "researcher" source_id here would let a second
+                # researcher instance's registration silently overwrite the
+                # first's (register_source upserts by source_id), stranding
+                # the first instance's catalog rows with no reachable owner.
+                #
                 # system_tier (not a fixed `projects` list): researcher
                 # catalogs papers under whichever project scored highest
                 # per-entry, PLUS the generic "research" fallback bucket for
@@ -1258,11 +1316,11 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                     agent_type="librarian",
                     operation="register_source",
                     args={
-                        "source_id": "researcher",
+                        "source_id": _catalog.source,
                         "kind": "corpus",
                         "owner_agent": self.agent_id,
                         "system_tier": True,
-                        "contract_version": "1",
+                        "contract_version": CONTRACT_VERSION,
                         "record_count": _catalog.stats().get("total"),
                     },
                 )
@@ -1435,8 +1493,12 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["catalog_query"] = MethodType(handle_catalog_query, agent)
     agent._handlers["catalog_search"] = MethodType(handle_catalog_search, agent)
     agent._handlers["catalog_stats"] = MethodType(handle_catalog_stats, agent)
-    agent._handlers["catalog_list_since"] = MethodType(handle_catalog_list_since, agent)
+    # Registered as "list_since" (not "catalog_list_since") — the librarian's
+    # own federation code calls every registered source's resync primitive
+    # by this exact name (CatalogSkills.list_since).
+    agent._handlers["list_since"] = MethodType(handle_list_since, agent)
     agent._handlers["catalog_mark_stale"] = MethodType(handle_catalog_mark_stale, agent)
+    agent._handlers["catalog_fetch"] = MethodType(handle_catalog_fetch, agent)
     agent._handlers["ingest_github_async"] = MethodType(handle_ingest_github_async, agent)
     agent._handlers["ingest_file_async"] = MethodType(handle_ingest_file_async, agent)
     agent._handlers["ingest_idea_async"] = MethodType(handle_ingest_idea_async, agent)

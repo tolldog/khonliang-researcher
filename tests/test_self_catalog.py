@@ -60,7 +60,10 @@ def test_build_self_catalog_places_sidecar_next_to_main_db(tmp_path):
     catalog = build_self_catalog({"db_path": str(db_path)})
     assert catalog is not None
     assert catalog.db_path == str(tmp_path / "self_catalog.db")
-    assert catalog.source == "researcher"
+    # source == owner_agent (both default to DEFAULT_SOURCE) so a registry
+    # source_id maps 1:1 to the bus agent_id that owns this catalog file.
+    assert catalog.source == "researcher-primary"
+    assert catalog.owner_agent == "researcher-primary"
 
 
 def test_build_self_catalog_owner_agent_override(tmp_path):
@@ -69,6 +72,7 @@ def test_build_self_catalog_owner_agent_override(tmp_path):
         {"db_path": str(db_path)}, owner_agent="researcher-secondary"
     )
     assert catalog.owner_agent == "researcher-secondary"
+    assert catalog.source == "researcher-secondary"
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +124,7 @@ def test_paper_index_record_shape_and_project_facet():
     record = paper_index_record(_entry(), _result(), 0.3)
     assert record is not None
     assert record.project == "khonliang"
-    assert record.source == "researcher"
+    assert record.source == "researcher-primary"
     assert record.record_id == "paper123"
     assert record.kind == "paper"
     assert record.schema_version == 1
@@ -130,7 +134,7 @@ def test_paper_index_record_shape_and_project_facet():
     assert "full raw body text" not in record.text
     assert record.facets["primary_project"] == "khonliang"
     assert record.facets["relevance_scores"] == {"khonliang": 0.8, "genealogy": 0.1}
-    assert record.ref == {"skill": "paper_context", "args": {"query": "A Great Paper"}}
+    assert record.ref == {"skill": "catalog_fetch", "args": {"record_id": "paper123"}}
 
 
 def test_paper_index_record_falls_back_to_research_project_below_threshold():
@@ -262,8 +266,9 @@ def test_idea_record_round_trips_through_catalog_upsert_and_query(tmp_path):
 
 
 class _FakeCatalog:
-    def __init__(self):
+    def __init__(self, source="researcher-primary"):
         self.upserted = []
+        self.source = source
 
     def upsert(self, record):
         self.upserted.append(record)
@@ -309,6 +314,8 @@ def test_catalog_upsert_paper_helper_swallows_catalog_exceptions():
     from researcher.pipeline import ResearchPipeline
 
     class _BoomCatalog:
+        source = "researcher-primary"
+
         def upsert(self, record):
             raise RuntimeError("boom")
 
