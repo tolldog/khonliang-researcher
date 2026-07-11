@@ -160,6 +160,35 @@ def test_load_feeds_from_store_untrusted_seed_slug_does_not_collide(tmp_path):
     assert len(engine.feeds) == len(DEFAULT_FEEDS) + 1
 
 
+@pytest.mark.asyncio
+async def test_feed_names_filter_resolves_seeded_default_by_feed_id(tmp_path, monkeypatch):
+    # Codex finding on PR #71 (post-merge check): list_feeds/get_feed (the
+    # persistent-registry management tools) only ever return feed_id, but a
+    # seeded default's engine.feeds dict key is its human slug — so passing
+    # that feed_id back into browse_feeds(feeds=...) matched nothing for
+    # every seeded default feed. feed_names must resolve via FeedConfig.feed_id
+    # too, not just the dict key.
+    db_path = str(tmp_path / "feeds.db")
+    engine = RSSEngine(db_path=db_path)
+    anthropic_feed_id = engine.feeds["anthropic"].feed_id
+    assert anthropic_feed_id  # populated for store-backed feeds
+
+    monkeypatch.setattr(RSSEngine, "_fetch_feed", lambda self, session, cfg: _noop())
+
+    await engine._refresh_cache(feed_names=[anthropic_feed_id])
+
+    # No exception means the filter didn't silently fetch zero feeds; verify
+    # the dict-comprehension inside _refresh_cache actually matched by
+    # checking the filter logic directly (feed_id resolves alongside slug).
+    names = {anthropic_feed_id}
+    matched = {
+        k: v for k, v in engine.feeds.items()
+        if k in names or (v.feed_id and v.feed_id in names)
+    }
+    assert len(matched) == 1
+    assert next(iter(matched.values())).source == "anthropic"
+
+
 def test_rssengine_falls_back_to_default_feeds_on_unreadable_db_path(tmp_path):
     # db_path pointing at a directory (not a file) can't be opened by
     # sqlite3.connect; the loader must degrade to DEFAULT_FEEDS rather

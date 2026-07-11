@@ -40,6 +40,11 @@ class FeedConfig:
     name: str
     url: str
     source: str  # tag for EngineResult.source
+    # Set only for feeds loaded from the persistent registry (feed_store.py)
+    # — lets browse_feeds's feeds= filter match on the id list_feeds/
+    # get_feed hand back, even for seeded defaults whose dict key is the
+    # human slug rather than feed_id (codex finding on PR #71).
+    feed_id: str = ""
 
 
 # Pre-configured feeds for AI research blogs
@@ -269,7 +274,7 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
     # falls back to DEFAULT_FEEDS.
     return {
         _feed_dict_key(row): FeedConfig(
-            name=row["name"], url=row["url"], source=row["source"],
+            name=row["name"], url=row["url"], source=row["source"], feed_id=row["feed_id"],
         )
         for row in rows
     }
@@ -364,7 +369,15 @@ class RSSEngine(BaseEngine):
         """Fetch all configured feeds and update cache."""
         feeds_to_fetch = self.feeds
         if feed_names:
-            feeds_to_fetch = {k: v for k, v in self.feeds.items() if k in feed_names}
+            names = set(feed_names)
+            # Match on the dict key (slug or feed_id, whichever this feed
+            # is keyed by) OR the feed's feed_id alias — a caller passing
+            # back the id list_feeds/get_feed returned must resolve even
+            # for a seeded default, whose dict key is the human slug.
+            feeds_to_fetch = {
+                k: v for k, v in self.feeds.items()
+                if k in names or (v.feed_id and v.feed_id in names)
+            }
 
         all_entries = []
         async with aiohttp.ClientSession(headers=_HEADERS) as session:
