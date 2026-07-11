@@ -381,3 +381,142 @@ async def test_ingest_idea_end_to_end_upserts_to_catalog():
 
 async def _as_async(value):
     return value
+
+
+# ---------------------------------------------------------------------------
+# backfill_self_catalog: pre-existing corpus entries that predate
+# self-cataloging (codex P1).
+# ---------------------------------------------------------------------------
+
+
+def _knowledge_stub(entries: dict):
+    from khonliang.knowledge.store import EntryStatus, Tier
+
+    class _Knowledge:
+        def get(self, eid):
+            return entries.get(eid)
+
+        def get_by_tier(self, tier):
+            return [e for e in entries.values() if getattr(e, "tier", Tier.IMPORTED) == tier]
+
+    return _Knowledge()
+
+
+def test_backfill_self_catalog_noop_without_catalog():
+    from researcher.pipeline import ResearchPipeline
+
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.catalog = None
+    pipe.config = {}
+    pipe.knowledge = _knowledge_stub({})
+    assert pipe.backfill_self_catalog() == {"papers": 0, "ideas": 0, "skipped": 0, "errors": 0}
+
+
+def test_backfill_self_catalog_publishes_pre_existing_papers_and_ideas(tmp_path):
+    import json as _json
+
+    from khonliang.knowledge.store import EntryStatus, Tier
+    from researcher.pipeline import ResearchPipeline
+
+    paper = SimpleNamespace(
+        id="p1", tier=Tier.IMPORTED, tags=["paper"], status=EntryStatus.DISTILLED,
+        title="A Paper", metadata={"url": "https://x"}, created_at=1700000000.0,
+    )
+    summary = SimpleNamespace(
+        tier=Tier.DERIVED,
+        content=_json.dumps({"abstract": "abs text", "keywords": []}),
+        metadata={"assessments": {"khonliang": {"score": 0.9}}},
+    )
+    idea = SimpleNamespace(
+        id="i1", tier=Tier.IMPORTED, tags=["idea"], status=EntryStatus.INGESTED,
+        title="An Idea", content="idea body", metadata={"source_type": "freeform"},
+    )
+    entries = {"p1": paper, "p1_summary": summary, "i1": idea}
+
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.config = {"relevance_threshold": 0.3}
+    pipe.knowledge = _knowledge_stub(entries)
+    pipe.catalog = build_self_catalog({"db_path": str(tmp_path / "researcher.db")})
+
+    stats = pipe.backfill_self_catalog()
+    assert stats == {"papers": 1, "ideas": 1, "skipped": 0, "errors": 0}
+
+    assert pipe.catalog.query("khonliang")["count"] == 1
+    assert pipe.catalog.query("research")["count"] == 1
+
+    # Re-running is idempotent: both entries are now skipped.
+    stats2 = pipe.backfill_self_catalog()
+    assert stats2 == {"papers": 0, "ideas": 0, "skipped": 2, "errors": 0}
+
+
+def test_backfill_self_catalog_skips_undistilled_papers(tmp_path):
+    from khonliang.knowledge.store import EntryStatus, Tier
+    from researcher.pipeline import ResearchPipeline
+
+    paper = SimpleNamespace(
+        id="p2", tier=Tier.IMPORTED, tags=["paper"], status=EntryStatus.INGESTED,
+        title="Not yet distilled", metadata={},
+    )
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.config = {}
+    pipe.knowledge = _knowledge_stub({"p2": paper})
+    pipe.catalog = build_self_catalog({"db_path": str(tmp_path / "researcher.db")})
+
+    stats = pipe.backfill_self_catalog()
+    assert stats == {"papers": 0, "ideas": 0, "skipped": 0, "errors": 0}
+    assert pipe.catalog.stats()["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# strike() drops the catalog card too (codex P1).
+# ---------------------------------------------------------------------------
+
+
+def test_strike_removes_catalog_card(tmp_path):
+    from researcher.pipeline import ResearchPipeline
+
+    entry = SimpleNamespace(title="Paper", metadata={"url": "https://canon"})
+
+    class _Knowledge:
+        def get(self, eid):
+            return None if str(eid).endswith("_summary") else entry
+
+        def remove(self, *a, **k):
+            pass
+
+    class _Triples:
+        db_path = str(tmp_path / "absent.db")
+
+        def remove_source(self, *a, **k):
+            return False
+
+    catalog = build_self_catalog({"db_path": str(tmp_path / "researcher.db")})
+    from librarian_lib import IndexRecord
+
+    catalog.upsert(
+        IndexRecord(
+            project="khonliang", source=catalog.source, record_id="e1",
+            schema_version=1, kind="paper", text="t",
+        )
+    )
+    assert catalog.query("khonliang")["count"] == 1
+
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.knowledge = _Knowledge()
+    pipe.triples = _Triples()
+    pipe.digest = SimpleNamespace(record=lambda **k: None)
+    pipe._url_index = {}
+    pipe.catalog = catalog
+
+    pipe.strike("e1")
+
+    assert catalog.query("khonliang")["count"] == 0
+
+
+def test_catalog_delete_noop_when_record_absent(tmp_path):
+    """Striking an entry that was never cataloged (or already removed) is a no-op."""
+    from researcher.pipeline import ResearchPipeline
+
+    pipe = ResearchPipeline.__new__(ResearchPipeline)
+    pipe.catalog = build_self_catalog({"db_path": str(tmp_path / "researcher.db")})
+    pipe._catalog_delete("never-cataloged")  # must not raise

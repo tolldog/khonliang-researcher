@@ -17,6 +17,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
@@ -885,6 +886,102 @@ class ResearchPipeline:
         except Exception:
             logger.warning("self_catalog upsert failed for idea %s", entry.id, exc_info=True)
 
+    def _catalog_delete(self, entry_id: str) -> None:
+        """Remove an entry's index card from the SelfCatalog (best-effort).
+
+        Called from ``strike()`` — a struck paper/idea leaves the corpus
+        entirely, so its catalog card must not keep surfacing via
+        ``catalog_query``/``catalog_search`` (codex P1: without this, a
+        strike left the federation surface serving a card for content that
+        no longer exists, even though ``catalog_fetch`` would already
+        report it "not found"). ``SelfCatalog.delete`` needs the record's
+        ``project``, which isn't tracked anywhere else on the pipeline side
+        — look it up via an ``all_projects`` query on ``record_id`` first
+        (a record either doesn't exist, in which case this is a no-op, or
+        exists under exactly one project, since `upsert` always overwrites
+        the same (project, source, record_id) primary key rather than
+        creating a second row under a different project).
+        """
+        catalog = getattr(self, "catalog", None)
+        if catalog is None:
+            return
+        try:
+            found = catalog.query(
+                "", filters={"record_id": entry_id}, scope="all_projects", limit=1
+            )
+            rows = found.get("rows") or []
+            if rows:
+                catalog.delete(rows[0]["project"], entry_id)
+        except Exception:
+            logger.warning("self_catalog delete failed for %s", entry_id, exc_info=True)
+
+    def backfill_self_catalog(self) -> Dict[str, int]:
+        """One-time (idempotent) catalog backfill for a pre-existing corpus.
+
+        codex P1: the two `_catalog_upsert_*` completion-path hooks only
+        fire for FUTURE ingest/distill calls — on an upgrade against an
+        already-populated ``researcher.db``, every pre-existing paper/idea
+        would otherwise stay invisible to ``catalog_query``/``catalog_search``
+        (and to the startup ``register_source(record_count=...)``) until it
+        happened to be re-distilled or re-ingested.
+
+        Walks every Tier.IMPORTED entry once: a distilled paper's summary +
+        assessments are reconstructed from its stored ``<id>_summary``
+        sibling entry (the same data ``_store_distillation`` originally
+        wrote) into a `paper_index_record`; an idea gets an
+        `idea_index_record` directly. Already-cataloged entries (checked
+        via an ``all_projects`` ``record_id`` query) are skipped, so
+        re-running this after the corpus is caught up is cheap — safe to
+        call from an operator skill on demand, or repeatedly, rather than
+        unconditionally on every process start (this walks the WHOLE
+        knowledge store, and the production db this ran against during
+        development was 93MB — unbounded startup work against a live db
+        the deployed agent is also reading/writing is exactly the class of
+        near-miss this repo's own conventions warn about).
+        """
+        catalog = getattr(self, "catalog", None)
+        stats = {"papers": 0, "ideas": 0, "skipped": 0, "errors": 0}
+        if catalog is None:
+            return stats
+        threshold = float(self.config.get("relevance_threshold", 0.3))
+        for entry in self.knowledge.get_by_tier(Tier.IMPORTED):
+            try:
+                existing = catalog.query(
+                    "", filters={"record_id": entry.id}, scope="all_projects", limit=1
+                )
+                if existing.get("rows"):
+                    stats["skipped"] += 1
+                    continue
+                tags = entry.tags or []
+                record = None
+                if "paper" in tags:
+                    if entry.status != EntryStatus.DISTILLED:
+                        continue
+                    summary_entry = self.knowledge.get(f"{entry.id}_summary")
+                    if summary_entry is None:
+                        continue
+                    try:
+                        summary = json.loads(summary_entry.content)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    meta = summary_entry.metadata if isinstance(summary_entry.metadata, dict) else {}
+                    fake_result = SimpleNamespace(
+                        summary=summary, assessments=meta.get("assessments", {}) or {}
+                    )
+                    record = paper_index_record(entry, fake_result, threshold, source=catalog.source)
+                    if record is not None:
+                        stats["papers"] += 1
+                elif "idea" in tags:
+                    record = idea_index_record(entry, source=catalog.source)
+                    if record is not None:
+                        stats["ideas"] += 1
+                if record is not None:
+                    catalog.upsert(record)
+            except Exception:
+                logger.warning("self_catalog backfill failed for %s", entry.id, exc_info=True)
+                stats["errors"] += 1
+        return stats
+
     def recover_stalled_processing(self) -> int:
         """Requeue papers whose distiller died back to INGESTED so they retry.
 
@@ -1037,6 +1134,11 @@ class ResearchPipeline:
         # Remove the paper itself
         self.knowledge.remove(entry_id)
         removed["paper"] = True
+
+        # Self-catalog: drop the index card too, so a struck paper stops
+        # surfacing via catalog_query/catalog_search (best-effort — see
+        # _catalog_delete).
+        self._catalog_delete(entry_id)
 
         # Remove EVERY URL-index alias pointing at this entry, not just the
         # canonical metadata url. ingest_paper indexes an entry under several

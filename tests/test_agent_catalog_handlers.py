@@ -282,3 +282,28 @@ def test_create_researcher_agent_skips_rebuild_when_catalog_disabled(monkeypatch
         config_path=str(tmp_path / "config.yaml"),
     )
     assert fake_pipeline.catalog is None
+
+
+# ---------------------------------------------------------------------------
+# catalog_backfill: the operator-triggered one-time backfill skill.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_catalog_backfill_disabled_when_no_catalog():
+    agent = _build_fake_agent(_pipeline_without_catalog())
+    handler = agent._handlers["catalog_backfill"]
+    result = await handler({})
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_catalog_backfill_delegates_to_pipeline(tmp_path):
+    pipeline, catalog = _pipeline_with_catalog(tmp_path)
+    pipeline.backfill_self_catalog = lambda: {
+        "papers": 2, "ideas": 1, "skipped": 0, "errors": 0,
+    }
+    agent = _build_fake_agent(pipeline)
+    handler = agent._handlers["catalog_backfill"]
+    result = await handler({})
+    assert result == {"papers": 2, "ideas": 1, "skipped": 0, "errors": 0}

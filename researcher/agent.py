@@ -739,6 +739,23 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 },
                 since="0.6.0",
             ),
+            Skill(
+                "catalog_backfill",
+                "One-time (idempotent) catalog backfill for corpus entries "
+                "that predate self-cataloging — the two completion-path "
+                "hooks (distill/ingest_idea) only publish index cards for "
+                "FUTURE ingests, so an upgrade against an already-populated "
+                "corpus needs this run once to make catalog_query/"
+                "catalog_search see the pre-existing dataset. Walks the "
+                "WHOLE knowledge store; NOT run automatically on agent "
+                "startup (unbounded work against a live, actively-written "
+                "db) — call manually post-deploy, or re-run any time "
+                "(already-cataloged entries are skipped, so it's cheap once "
+                "caught up). Returns {papers, ideas, skipped, errors}. "
+                "fr_researcher_bbe95f12.",
+                {},
+                since="0.6.0",
+            ),
         ]
         for skill in extras:
             if skill.name not in names:
@@ -939,6 +956,11 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
             "url": entry.metadata.get("url", ""),
             "status": str(getattr(entry, "status", "")),
         }
+
+    async def handle_catalog_backfill(self, args):
+        if catalog_skills is None:
+            return {"error": "self-catalog is disabled (no db_path configured)"}
+        return pipeline.backfill_self_catalog()
 
     def _get_job_store(self) -> IngestJobStore:
         store = getattr(self, "_ingest_job_store", None)
@@ -1517,6 +1539,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["list_since"] = MethodType(handle_list_since, agent)
     agent._handlers["catalog_mark_stale"] = MethodType(handle_catalog_mark_stale, agent)
     agent._handlers["catalog_fetch"] = MethodType(handle_catalog_fetch, agent)
+    agent._handlers["catalog_backfill"] = MethodType(handle_catalog_backfill, agent)
     agent._handlers["ingest_github_async"] = MethodType(handle_ingest_github_async, agent)
     agent._handlers["ingest_file_async"] = MethodType(handle_ingest_file_async, agent)
     agent._handlers["ingest_idea_async"] = MethodType(handle_ingest_idea_async, agent)
