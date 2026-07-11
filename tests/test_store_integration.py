@@ -251,9 +251,10 @@ async def test_stage_payload_passes_through_store_error_envelope():
 async def test_stage_payload_accepts_nested_artifact_id_shape():
     """Some artifact-create surfaces emit
     ``{"artifact": {"id": ...}}`` instead of the flat
-    ``{"id": ...}`` shape (see LibrarianAgent._artifact_id for
-    the same-repo precedent). Tolerate both so a future store
-    surface tweak doesn't break the integration.
+    ``{"id": ...}`` shape (see khonliang-librarian's
+    LibrarianAgent._artifact_id for the same precedent, now in
+    its own repo post fr_librarian_bc0a06d7). Tolerate both so a
+    future store surface tweak doesn't break the integration.
     """
     agent = _MockAgent(
         response={"result": {"artifact": {"id": "art_nested", "kind": "staged_payload"}}},
