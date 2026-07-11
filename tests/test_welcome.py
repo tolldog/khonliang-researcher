@@ -1,39 +1,14 @@
 """Tests for the cold-start welcome surface (fr_khonliang-bus-lib_6a82732c).
 
-Both researcher-primary (configured via instance attr in
-create_researcher_agent) and librarian-primary (class attr on
-LibrarianAgent) advertise editorial WELCOME content to ephemeral
-external LLM sessions. These tests pin the surface so future edits
-don't silently empty it.
+researcher-primary advertises editorial WELCOME content (configured via
+instance attr in create_researcher_agent) to ephemeral external LLM
+sessions. This test pins the surface so future edits don't silently empty
+it. librarian-primary's own WELCOME now lives in its standalone repo
+(khonliang-librarian, fr_librarian_bc0a06d7) with its own coverage — this
+repo no longer imports or tests it (fr_researcher_11e9524a).
 """
 
 from __future__ import annotations
-
-
-def test_librarian_welcome_is_populated():
-    """LibrarianAgent.WELCOME advertises a complete cold-start surface."""
-    # The researcher-lib pin now exports AmbiguityRecord et al.
-    # (bug_khonliang-researcher_2357735d), so this imports cleanly — a regression of
-    # the pin would surface as a hard import error here, which is what we want.
-    from researcher.librarian_agent import LibrarianAgent
-    from khonliang_bus import Welcome
-
-    w = LibrarianAgent.WELCOME
-    assert isinstance(w, Welcome), (
-        "WELCOME must be a Welcome instance — handle_welcome relies on "
-        "the dataclass shape and will raise TypeError for anything else."
-    )
-    assert w.role
-    assert w.mission
-    assert w.not_responsible_for, "boundaries must list at least one excluded responsibility"
-    assert w.delegates_to, "librarian must declare at least one downstream delegate"
-    assert w.entry_points
-    advertised = {ep.skill for ep in w.entry_points}
-    assert "taxonomy_report" in advertised
-    assert "library_health" in advertised
-    for ep in w.entry_points:
-        assert ep.skill, "entry-point skill name must not be empty"
-        assert ep.when_to_use, f"entry-point '{ep.skill}' missing when_to_use"
 
 
 def test_researcher_welcome_is_populated_after_create_agent(monkeypatch, tmp_path):

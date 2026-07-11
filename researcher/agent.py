@@ -172,9 +172,8 @@ async def stage_payload(agent: BaseAgent, args: dict) -> dict:
     # (``LocalArtifactStore.create`` returns this today, with
     # ``id`` at the top level) AND a nested
     # ``{"artifact": {"id": ...}}`` envelope (the bus's REST
-    # ``view_response`` shape; other callers in the
-    # researcher repo already treat both as valid — see
-    # ``LibrarianAgent._artifact_id``).
+    # ``view_response`` shape; khonliang-librarian's
+    # ``LibrarianAgent._artifact_id`` treats both as valid too).
     artifact_id = payload.get("id")
     if not artifact_id:
         nested = payload.get("artifact")
@@ -354,6 +353,43 @@ async def distill_repo_docs_handler(
         return {"error": str(exc)}
 
 
+async def ask_librarian(agent: BaseAgent, args: dict) -> dict:
+    """Bus-skill handler proxying to librarian-primary (fr_researcher_11e9524a).
+
+    Thin pass-through over ``researcher.librarian_client.call_librarian`` —
+    lets an external MCP/bus consumer that only knows about researcher-primary
+    reach librarian's classification/taxonomy/gap-finding skills without
+    needing to discover and address ``librarian-primary`` itself. ``args``
+    reads:
+
+    * ``operation`` (required, str): one of librarian's 7 skill names
+      (classify_paper, taxonomy_report, rebuild_neighborhoods,
+      suggest_missing_nodes, promote_investigation, identify_gaps,
+      library_health).
+    * ``librarian_args`` (dict, default {}): forwarded verbatim as that
+      skill's args.
+
+    Never raises: librarian being down, slow, or unregistered degrades to
+    ``{"available": False, "reason": ...}`` rather than failing the caller
+    (optional-coordinator principle — librarian absence degrades quality,
+    not function). Module-level so tests can call it with a mock agent.
+    """
+    from researcher.librarian_client import call_librarian
+
+    if not isinstance(args, dict):
+        return {"error": "args must be an object"}
+    operation_raw = args.get("operation", "")
+    if not isinstance(operation_raw, str):
+        return {"error": "operation must be a string"}
+    operation = operation_raw.strip()
+    if not operation:
+        return {"error": "operation is required"}
+    librarian_args = args.get("librarian_args", {})
+    if not isinstance(librarian_args, dict):
+        return {"error": "librarian_args must be an object"}
+    return await call_librarian(agent, operation, librarian_args)
+
+
 def _unwrap_request_envelope(result):
     """Pull ``result["result"]`` out of the bus request envelope.
 
@@ -437,7 +473,7 @@ def create_researcher_agent(
         ],
         delegates_to={
             "developer": "FR / spec / milestone lifecycle changes",
-            "librarian": "classification, taxonomy, neighborhoods, gaps",
+            "librarian": "classification, taxonomy, neighborhoods, gaps — standalone bus agent (librarian-primary); reach it directly, or via ask_librarian if you only address researcher",
             "store": "artifact-mediated large payloads (stage_payload / ingest_from_artifact)",
         },
         entry_points=[
@@ -460,6 +496,10 @@ def create_researcher_agent(
             WelcomeEntryPoint(
                 skill="distill_paper",
                 when_to_use="run LLM distillation on a stored paper — produces summary + triples + applicability",
+            ),
+            WelcomeEntryPoint(
+                skill="ask_librarian",
+                when_to_use="proxy a classify_paper/taxonomy_report/identify_gaps/etc. call to librarian-primary without addressing it directly; degrades to available:false rather than failing if librarian is down",
             ),
         ],
         guide_skill="research_guide",
@@ -658,6 +698,24 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 since="0.5.0",
             ),
             Skill(
+                "ask_librarian",
+                "Proxy a call to one of librarian-primary's 7 skills "
+                "(classify_paper, taxonomy_report, rebuild_neighborhoods, "
+                "suggest_missing_nodes, promote_investigation, "
+                "identify_gaps, library_health) over the bus, for callers "
+                "that only address researcher-primary. Routes through "
+                "agent_type='librarian'. Never fails the caller — if "
+                "librarian-primary is down, slow, or unreachable, returns "
+                "{available: false, reason} instead of raising "
+                "(optional-coordinator principle: librarian absence "
+                "degrades quality, not function). fr_researcher_11e9524a.",
+                {
+                    "operation": {"type": "string", "required": True},
+                    "librarian_args": {"type": "object", "default": {}},
+                },
+                since="0.6.0",
+            ),
+            Skill(
                 "catalog_query",
                 "Structured query over researcher's own SelfCatalog index "
                 "cards (papers/ideas) — the librarian's federation surface, "
@@ -831,6 +889,9 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
 
     async def handle_ingest_from_artifact(self, args):
         return await ingest_from_artifact(self, pipeline, args)
+
+    async def handle_ask_librarian(self, args):
+        return await ask_librarian(self, args)
 
     async def handle_ingest_url_with_body(self, args):
         # Strict isinstance validation like the sibling handlers — never
@@ -1548,6 +1609,7 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
     agent._handlers["stop_ingest_watcher"] = MethodType(handle_stop_ingest_watcher, agent)
     agent._handlers["stage_payload"] = MethodType(handle_stage_payload, agent)
     agent._handlers["ingest_from_artifact"] = MethodType(handle_ingest_from_artifact, agent)
+    agent._handlers["ask_librarian"] = MethodType(handle_ask_librarian, agent)
     agent._handlers["ingest_url_with_body"] = MethodType(handle_ingest_url_with_body, agent)
     agent._handlers["distill_repo_docs"] = MethodType(handle_distill_repo_docs, agent)
     agent._handlers["catalog_query"] = MethodType(handle_catalog_query, agent)
