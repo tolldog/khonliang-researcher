@@ -382,6 +382,24 @@ def create_researcher_agent(
     from researcher.server import create_research_server
 
     pipeline = create_pipeline(config_path)
+
+    # Re-derive the SelfCatalog's ownership from the REAL running bus
+    # agent_id, not whatever config["bus_agent_id"] happened to say (or its
+    # "researcher-primary" default). pipeline.py builds `self.catalog`
+    # before any agent_id exists — it's shared by both this bus-agent entry
+    # point and the transport-agnostic MCP-stdio one (researcher.server),
+    # neither of which pipeline.py itself knows about. Rebuilding here means
+    # a custom `--id` (a second, domain-scoped researcher instance) always
+    # wins: its catalog rows, and its later register_source call, are
+    # stamped/advertised under the id this process actually registers on
+    # the bus with — codex P1, a config drift (bus_agent_id != --id) would
+    # otherwise silently mis-stamp every row and let two instances
+    # overwrite each other's librarian registration.
+    if getattr(pipeline, "catalog", None) is not None:
+        from researcher.self_catalog import build_self_catalog
+
+        pipeline.catalog = build_self_catalog(pipeline.config, owner_agent=agent_id)
+
     mcp_server = create_research_server(pipeline)
 
     agent = BaseAgent.from_mcp(

@@ -107,7 +107,14 @@ def build_self_catalog(
             "self_catalog: no db_path in config — catalog disabled (no-op)"
         )
         return None
-    catalog_db_path = Path(db_path).parent / "self_catalog.db"
+    # Named from the main db's own stem (not a fixed "self_catalog.db"):
+    # two researcher deployments that each keep a separate main db in the
+    # SAME directory (e.g. domain-scoped instances sharing a data/ dir)
+    # would otherwise silently share one sidecar file — their index cards,
+    # stats, and mark-stale operations would mix even though the main
+    # KnowledgeStores stay isolated.
+    main_db = Path(db_path)
+    catalog_db_path = main_db.parent / f"{main_db.stem}.self_catalog.db"
     # source == owner_agent (one string, reused for both): SelfCatalog's
     # `source` is the label stamped on every row, and the librarian's
     # registry keys sources by a `source_id` that must map 1:1 to a bus

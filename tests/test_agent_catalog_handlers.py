@@ -223,3 +223,62 @@ async def test_catalog_fetch_falls_back_to_content_without_summary():
     result = await handler({"record_id": "idea1"})
     assert result["summary"] is None
     assert result["content"] == "idea body"
+
+
+# ---------------------------------------------------------------------------
+# create_researcher_agent rebuilds the catalog with the REAL bus agent_id
+# (codex P1: a config bus_agent_id that drifted from the actual --id, or was
+# never set at all, must not leave the catalog mis-stamped under the
+# "researcher-primary" default while the agent itself runs under a
+# different id).
+# ---------------------------------------------------------------------------
+
+
+def test_create_researcher_agent_rebuilds_catalog_with_runtime_agent_id(monkeypatch, tmp_path):
+    from researcher import agent as agent_mod
+
+    fake_pipeline = SimpleNamespace(config={"db_path": str(tmp_path / "researcher.db")}, catalog=object())
+    fake_server = object()
+    fake_agent = type("FakeAgent", (), {})()
+    fake_agent.register_skills = lambda: []
+    fake_agent.version = "0.0.0"
+
+    monkeypatch.setattr("researcher.pipeline.create_pipeline", lambda _p: fake_pipeline)
+    monkeypatch.setattr("researcher.server.create_research_server", lambda _pipe: fake_server)
+    monkeypatch.setattr(agent_mod.BaseAgent, "from_mcp", staticmethod(lambda *a, **kw: fake_agent))
+    monkeypatch.setattr(agent_mod, "_extend_with_native_handlers", lambda *a, **kw: None)
+
+    agent_mod.create_researcher_agent(
+        agent_id="researcher-secondary",
+        bus_url="http://localhost:9999",
+        config_path=str(tmp_path / "config.yaml"),
+    )
+
+    # A real SelfCatalog (not the placeholder object()) was rebuilt, stamped
+    # with the actual runtime agent_id — not "researcher-primary" — even
+    # though nothing in `fake_pipeline.config` set bus_agent_id.
+    assert fake_pipeline.catalog is not None
+    assert fake_pipeline.catalog.source == "researcher-secondary"
+    assert fake_pipeline.catalog.owner_agent == "researcher-secondary"
+
+
+def test_create_researcher_agent_skips_rebuild_when_catalog_disabled(monkeypatch, tmp_path):
+    """A pipeline with catalog=None (no db_path, or lib not installed) stays None."""
+    from researcher import agent as agent_mod
+
+    fake_pipeline = SimpleNamespace(config={}, catalog=None)
+    fake_agent = type("FakeAgent", (), {})()
+    fake_agent.register_skills = lambda: []
+    fake_agent.version = "0.0.0"
+
+    monkeypatch.setattr("researcher.pipeline.create_pipeline", lambda _p: fake_pipeline)
+    monkeypatch.setattr("researcher.server.create_research_server", lambda _pipe: object())
+    monkeypatch.setattr(agent_mod.BaseAgent, "from_mcp", staticmethod(lambda *a, **kw: fake_agent))
+    monkeypatch.setattr(agent_mod, "_extend_with_native_handlers", lambda *a, **kw: None)
+
+    agent_mod.create_researcher_agent(
+        agent_id="researcher-primary",
+        bus_url="http://localhost:9999",
+        config_path=str(tmp_path / "config.yaml"),
+    )
+    assert fake_pipeline.catalog is None

@@ -59,7 +59,7 @@ def test_build_self_catalog_places_sidecar_next_to_main_db(tmp_path):
     db_path = tmp_path / "researcher.db"
     catalog = build_self_catalog({"db_path": str(db_path)})
     assert catalog is not None
-    assert catalog.db_path == str(tmp_path / "self_catalog.db")
+    assert catalog.db_path == str(tmp_path / "researcher.self_catalog.db")
     # source == owner_agent (both default to DEFAULT_SOURCE) so a registry
     # source_id maps 1:1 to the bus agent_id that owns this catalog file.
     assert catalog.source == "researcher-primary"
@@ -73,6 +73,19 @@ def test_build_self_catalog_owner_agent_override(tmp_path):
     )
     assert catalog.owner_agent == "researcher-secondary"
     assert catalog.source == "researcher-secondary"
+
+
+def test_build_self_catalog_sidecars_dont_collide_when_main_dbs_share_a_dir(tmp_path):
+    # Two deployments keeping separate main dbs in the same directory (e.g.
+    # domain-scoped researcher instances sharing a data/ dir) must get
+    # separate sidecar files — a fixed "self_catalog.db" name would collapse
+    # both instances' index cards into one file even though their main
+    # KnowledgeStores stay isolated.
+    cat_a = build_self_catalog({"db_path": str(tmp_path / "a.db")})
+    cat_b = build_self_catalog({"db_path": str(tmp_path / "b.db")})
+    assert cat_a.db_path != cat_b.db_path
+    assert cat_a.db_path == str(tmp_path / "a.self_catalog.db")
+    assert cat_b.db_path == str(tmp_path / "b.self_catalog.db")
 
 
 # ---------------------------------------------------------------------------
