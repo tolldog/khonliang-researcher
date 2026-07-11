@@ -57,15 +57,52 @@ async def test_call_librarian_routes_to_agent_type_librarian():
 
 
 @pytest.mark.asyncio
-async def test_call_librarian_accepts_unwrapped_result_shape():
-    """Some ``request`` mocks / bus shapes return the raw handler result
-    (no ``{"result": ...}`` envelope) — tolerate both, like
-    ``_unwrap_request_envelope`` does for the store path."""
-    agent = _MockAgent(response={"detail": "brief", "groups": []})
+async def test_call_librarian_unwraps_the_bus_result_envelope():
+    """A successful dispatch always wraps the handler's return value as
+    {"result": ..., "trace_id": ...} (bus/server.py
+    :_dispatch_resolved_request) — call_librarian must unwrap it rather
+    than returning the trace_id/envelope noise to the caller."""
+    agent = _MockAgent(response={"result": {"detail": "brief", "groups": []}, "trace_id": "t-abc"})
 
     result = await librarian_client.call_librarian(agent, "taxonomy_report")
 
     assert result == {"available": True, "detail": "brief", "groups": []}
+
+
+# -- call_librarian: reached-but-rejected vs. genuinely unreachable -----------
+
+
+@pytest.mark.asyncio
+async def test_call_librarian_surfaces_domain_error_as_available_true():
+    """Librarian responding with its OWN validation/domain error (e.g. a
+    caller-side mistake like a missing paper_id) means librarian is UP —
+    available must stay True, with the rejection surfaced separately from
+    the availability signal (khonliang-researcher PR #75 review finding)."""
+    agent = _MockAgent(
+        response={"result": {"error": "paper_id is required"}, "trace_id": "t-1"},
+    )
+
+    result = await librarian_client.call_librarian(agent, "classify_paper", {})
+
+    assert result == {"available": True, "error": "paper_id is required"}
+
+
+@pytest.mark.asyncio
+async def test_call_librarian_treats_bare_top_level_error_as_unreachable():
+    """A bus-level dispatch failure (no healthy agent for the type, i.e.
+    librarian-primary isn't registered) comes back as a bare top-level
+    {"error": ..., "trace_id": ...} with NO "result" key — the request
+    never reached a librarian handler at all. That must degrade to
+    available: False, distinct from a domain error librarian itself
+    returned."""
+    agent = _MockAgent(response={"error": "no healthy agent found for librarian", "trace_id": "t-2"})
+
+    result = await librarian_client.call_librarian(agent, "identify_gaps")
+
+    assert result == {
+        "available": False,
+        "reason": "no healthy agent found for librarian",
+    }
 
 
 # -- call_librarian: graceful degradation -------------------------------------
@@ -95,28 +132,67 @@ async def test_call_librarian_swallows_transport_exceptions():
 
 
 @pytest.mark.asyncio
-async def test_call_librarian_treats_bus_error_envelope_as_unavailable():
-    """agent_type='librarian' with no agent registered (librarian-primary
-    down) surfaces as a bus-level error envelope, not an exception —
-    must still degrade gracefully rather than propagate the error."""
-    agent = _MockAgent(response={"result": {"error": "no agent registered for type librarian"}})
-
-    result = await librarian_client.call_librarian(agent, "identify_gaps")
-
-    assert result == {
-        "available": False,
-        "reason": "no agent registered for type librarian",
-    }
-
-
-@pytest.mark.asyncio
-async def test_call_librarian_rejects_unexpected_response_shape():
-    agent = _MockAgent(response={"result": "not a dict"})
+async def test_call_librarian_rejects_non_dict_top_level_response():
+    agent = _MockAgent(response="not a dict")
 
     result = await librarian_client.call_librarian(agent, "library_health")
 
     assert result["available"] is False
     assert "unexpected response shape" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_call_librarian_rejects_non_dict_result_payload():
+    agent = _MockAgent(response={"result": "not a dict", "trace_id": "t-3"})
+
+    result = await librarian_client.call_librarian(agent, "library_health")
+
+    assert result["available"] is False
+    assert "unexpected response shape" in result["reason"]
+
+
+# -- call_librarian: per-operation timeouts ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rebuild_neighborhoods_gets_a_longer_default_timeout():
+    """rebuild_neighborhoods is a corpus-wide scan, not an interactive
+    lookup — it must not inherit the 10s interactive default (that would
+    report a healthy-but-busy librarian as unavailable)."""
+    agent = _MockAgent(response={"result": {"snapshot_id": "libsnap_1"}, "trace_id": "t-4"})
+
+    await librarian_client.call_librarian(agent, "rebuild_neighborhoods")
+
+    assert agent.calls[0]["timeout"] == librarian_client.OPERATION_TIMEOUTS["rebuild_neighborhoods"]
+    assert agent.calls[0]["timeout"] > librarian_client.DEFAULT_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_identify_gaps_gets_a_longer_default_timeout():
+    agent = _MockAgent(response={"result": {"gaps": []}, "trace_id": "t-5"})
+
+    await librarian_client.call_librarian(agent, "identify_gaps")
+
+    assert agent.calls[0]["timeout"] == librarian_client.OPERATION_TIMEOUTS["identify_gaps"]
+    assert agent.calls[0]["timeout"] > librarian_client.DEFAULT_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_classify_paper_keeps_the_short_interactive_default():
+    agent = _MockAgent(response={"result": {}, "trace_id": "t-6"})
+
+    await librarian_client.call_librarian(agent, "classify_paper", {"paper_id": "p1"})
+
+    assert agent.calls[0]["timeout"] == librarian_client.DEFAULT_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_explicit_timeout_overrides_the_per_operation_default():
+    agent = _MockAgent(response={"result": {}, "trace_id": "t-7"})
+
+    await librarian_client.call_librarian(agent, "rebuild_neighborhoods", timeout=5.0)
+
+    assert agent.calls[0]["timeout"] == 5.0
 
 
 # -- convenience wrappers ------------------------------------------------------
@@ -147,6 +223,24 @@ async def test_library_health_wrapper_degrades_when_unreachable():
 
 
 # -- ask_librarian bus-skill handler -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ask_librarian_rejects_non_dict_args_without_crashing():
+    """A caller passing args=None (or any non-dict) must get the repo's
+    normal {"error": ...} envelope, not an AttributeError from args.get(...)
+    (khonliang-researcher PR #75 review finding)."""
+    agent = _MockAgent(response={"result": {}})
+
+    result = await ask_librarian(agent, None)
+
+    assert result == {"error": "args must be an object"}
+    assert agent.calls == []
+
+    result = await ask_librarian(agent, "not a dict")
+
+    assert result == {"error": "args must be an object"}
+    assert agent.calls == []
 
 
 @pytest.mark.asyncio

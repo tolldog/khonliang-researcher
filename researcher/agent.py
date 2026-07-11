@@ -375,6 +375,8 @@ async def ask_librarian(agent: BaseAgent, args: dict) -> dict:
     """
     from researcher.librarian_client import call_librarian
 
+    if not isinstance(args, dict):
+        return {"error": "args must be an object"}
     operation_raw = args.get("operation", "")
     if not isinstance(operation_raw, str):
         return {"error": "operation must be a string"}

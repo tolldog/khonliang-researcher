@@ -56,10 +56,14 @@ over the bus (fr_researcher_11e9524a):
 - `researcher/librarian_client.py` — thin wrapper over
   `agent.request(agent_type="librarian", operation=..., args=...)` (same
   pattern as `agent.py`'s `stage_payload`/`ingest_from_artifact` calling
-  `agent_type="store"`). Every call is best-effort: failures (timeout,
-  connection error, librarian not registered) return
-  `{"available": False, "reason": ...}` rather than raising — librarian
-  absence degrades quality, not function (optional-coordinator principle).
+  `agent_type="store"`). Unreachability (timeout, connection error,
+  librarian not registered) returns `{"available": False, "reason": ...}`
+  rather than raising — librarian absence degrades quality, not function
+  (optional-coordinator principle). A domain-level rejection from librarian
+  itself (bad args, unknown id) is distinct: `{"available": True, "error":
+  ...}` — librarian responded, it just rejected the request.
+  `rebuild_neighborhoods`/`identify_gaps` (corpus-wide scans) get a longer
+  per-operation timeout than the interactive skills' 10s default.
 - `researcher-primary`'s `ask_librarian` bus skill is a thin proxy over this
   client for callers that only address researcher.
 - The `ingest.url_distilled` / `ingest.queue_drained` bus events researcher
