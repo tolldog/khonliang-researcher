@@ -19,8 +19,24 @@ dependencies = [
     "markdownify>=0.12",
     "mcp>=1.0.0",
     "khonliang-bus-lib>=0.5.0",  # >=0.5.0 for Welcome / WelcomeEntryPoint exports
-    "khonliang-librarian-lib>=0.1.0",  # SelfCatalog knowledge-owner contract (fr_researcher_bbe95f12)
 ]
+
+# khonliang-librarian-lib (SelfCatalog knowledge-owner contract,
+# fr_researcher_bbe95f12) is deliberately an OPTIONAL extra, not a hard
+# dependency: unlike every entry above, researcher/self_catalog.py imports
+# it defensively (try/except ImportError) and degrades to "catalog
+# disabled" when it's absent. Putting it in `dependencies` instead would
+# defeat that: pip's dependency resolution fails before Python ever runs,
+# so the graceful-degradation code would never get a chance to execute —
+# and it's a bare-name local-editable dependency (no PyPI package, same as
+# khonliang-bus-lib above), so a bare `pip install .` in a fresh checkout
+# without the sibling repo present would then hard-fail installation
+# entirely instead of just running with self-cataloging turned off.
+# Enable it with `pip install -e ".[catalog]"` (after `pip install -e
+# ../khonliang-librarian-lib`, same sibling-checkout convention every
+# other khonliang-* dependency in this file already uses).
+[project.optional-dependencies]
+catalog = ["khonliang-librarian-lib>=0.1.0"]
 
 [project.scripts]
 khonliang-researcher = "researcher.cli:main"
