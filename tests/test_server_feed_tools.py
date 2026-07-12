@@ -78,3 +78,53 @@ async def test_list_feeds_and_load_feeds_from_store_use_the_same_seed_source(tmp
     result = await _call(mcp, "list_feeds")
     assert "Only In OPML" in result
     assert "1 feed(s)" in result
+
+
+@pytest.mark.asyncio
+async def test_browse_feeds_works_without_db_path_in_config(tmp_path, monkeypatch):
+    # codex finding on PR #71, round 5: browse_feeds unconditionally
+    # indexed pipeline.config["db_path"], so a pipeline/config shim with
+    # no db_path (RSS browsing itself doesn't need the knowledge DB --
+    # this repo already has such a shim in tests/test_brief_on.py's
+    # _FakePipeline) would get a KeyError before feed fetching even starts.
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"db_path: {tmp_path / 'test.db'}\n")
+
+    from researcher.pipeline import create_pipeline
+
+    pipeline = create_pipeline(str(config_path))
+    del pipeline.config["db_path"]  # simulate a config shim lacking it
+    mcp = create_research_server(pipeline)
+
+    from researcher import rss as rss_module
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(
+        rss_module.RSSEngine, "_refresh_cache", lambda self, feed_names=None: _noop()
+    )
+
+    # Must not raise KeyError; empty cache -> the "No posts" message.
+    result = await _call(mcp, "browse_feeds", {})
+    assert "No posts" in result
+
+
+@pytest.mark.asyncio
+async def test_enable_feed_reverses_disable_feed(mcp):
+    listing = await _call(mcp, "list_feeds")
+    feed_id = listing.split("\n")[1].split(" | ")[0]
+
+    await _call(mcp, "disable_feed", {"feed_id": feed_id})
+    assert feed_id not in await _call(mcp, "list_feeds")
+
+    result = await _call(mcp, "enable_feed", {"feed_id": feed_id})
+    assert "error" not in result
+    assert feed_id in await _call(mcp, "list_feeds")
+
+
+@pytest.mark.asyncio
+async def test_enable_feed_unknown_id(mcp):
+    result = await _call(mcp, "enable_feed", {"feed_id": "feed_doesnotexist"})
+    assert "error" in result

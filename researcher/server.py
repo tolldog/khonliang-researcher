@@ -688,7 +688,15 @@ Most tools accept detail="compact|brief|full":
         from researcher.rss import fetch_all_feeds
 
         feed_list = [f.strip() for f in feeds.split(",") if f.strip()] or None
-        entries = await fetch_all_feeds(feed_list, db_path=str(pipeline.config["db_path"]))
+        # .get, not bracket-index: browse_feeds must keep working for a
+        # pipeline/config shim that has no db_path (RSS browsing itself
+        # doesn't need the knowledge DB) -- fetch_all_feeds already treats
+        # db_path=None as "no persistent registry, use DEFAULT_FEEDS/
+        # implicit OPML" (codex finding on PR #71, round 5).
+        raw_db_path = pipeline.config.get("db_path")
+        entries = await fetch_all_feeds(
+            feed_list, db_path=str(raw_db_path) if raw_db_path else None,
+        )
 
         if query:
             keywords = query.lower().split()
@@ -826,12 +834,30 @@ Most tools accept detail="compact|brief|full":
     @mcp.tool()
     def disable_feed(feed_id: str) -> str:
         """Soft-delete a feed (enabled=0). Preserves history; browse_feeds
-        and list_feeds(enabled_only=True) stop returning it.
+        and list_feeds(enabled_only=True) stop returning it. Reversible
+        via enable_feed.
         """
         ok = _feed_store().disable_feed(feed_id)
         if not ok:
             return f"error: unknown feed_id {feed_id!r}"
         return f"disabled {feed_id}"
+
+    @mcp.tool()
+    def enable_feed(feed_id: str) -> str:
+        """Re-enable a feed previously disabled via disable_feed. Without
+        this, disabling was irreversible through the public tools -- the
+        row stays under the unique url index, so register_feed can't be
+        used to add it back either (codex finding on PR #71, round 5).
+        """
+        from researcher.feed_store import FeedError
+
+        try:
+            feed = _feed_store().update_feed(feed_id, enabled=True)
+        except FeedError as e:
+            return f"error: {e}"
+        if feed is None:
+            return f"error: unknown feed_id {feed_id!r}"
+        return f"enabled {feed['feed_id']}: {feed['name']} ({feed['url']})"
 
     @mcp.tool()
     def find_relevant(query: str, project: str = "", detail: str = "brief") -> str:
