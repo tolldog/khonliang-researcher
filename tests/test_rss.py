@@ -126,7 +126,10 @@ def test_rssengine_loads_and_seeds_from_explicit_db_path(tmp_path, monkeypatch):
     db_path = str(tmp_path / "feeds.db")
     engine = RSSEngine(db_path=db_path)
     assert len(engine.feeds) == len(DEFAULT_FEEDS)
-    assert set(engine.feeds) == set(DEFAULT_FEEDS)
+    # Store-backed feeds are always keyed by feed_id (the DB's real,
+    # permanent primary key), not the human slug -- see _load_feeds_from_store.
+    assert all(k == cfg.feed_id for k, cfg in engine.feeds.items())
+    assert {cfg.source for cfg in engine.feeds.values()} == {cfg.source for cfg in DEFAULT_FEEDS.values()}
 
     # A feed registered after the seed is picked up by a fresh engine
     # reading the same store (runtime add, no restart needed).
@@ -138,12 +141,12 @@ def test_rssengine_loads_and_seeds_from_explicit_db_path(tmp_path, monkeypatch):
     assert "new" in {cfg.source for cfg in engine2.feeds.values()}
 
 
-def test_load_feeds_from_store_untrusted_seed_slug_does_not_collide(tmp_path, monkeypatch):
-    # Copilot finding on PR #71 round 4: a custom feed whose caller-supplied
-    # metadata happens to set seed_slug to a real default's slug (e.g.
-    # "anthropic") must not displace that default in the returned dict —
-    # only a row whose url genuinely matches DEFAULT_FEEDS[slug].url may
-    # use the slug as its key.
+def test_load_feeds_from_store_custom_feed_does_not_collide_with_a_default(tmp_path, monkeypatch):
+    # A custom feed whose caller-supplied metadata happens to set
+    # seed_slug to a real default's slug (e.g. "anthropic") can no longer
+    # collide with anything -- feed_id is the only dict key, and slug is
+    # just a filter alias multiple entries may legitimately share
+    # (codex findings on PR #71, rounds 4-6).
     monkeypatch.chdir(tmp_path)  # away from the repo root's real feeds.opml
     from researcher.feed_store import FeedStore
 
@@ -159,39 +162,34 @@ def test_load_feeds_from_store_untrusted_seed_slug_does_not_collide(tmp_path, mo
 
     engine = RSSEngine(db_path=db_path)
 
-    assert engine.feeds["anthropic"].url == DEFAULT_FEEDS["anthropic"].url
-    assert any(cfg.source == "impersonator" for cfg in engine.feeds.values())
     assert len(engine.feeds) == len(DEFAULT_FEEDS) + 1
+    real_anthropic = next(cfg for cfg in engine.feeds.values() if cfg.source == "anthropic")
+    impersonator = next(cfg for cfg in engine.feeds.values() if cfg.source == "impersonator")
+    assert real_anthropic.url == DEFAULT_FEEDS["anthropic"].url
+    assert real_anthropic.slug == "anthropic"
+    assert impersonator.slug == "anthropic"  # both alias the same filter name; neither is displaced
 
 
 @pytest.mark.asyncio
-async def test_feed_names_filter_resolves_seeded_default_by_feed_id(tmp_path, monkeypatch):
-    # Codex finding on PR #71 (post-merge check): list_feeds/get_feed (the
-    # persistent-registry management tools) only ever return feed_id, but a
-    # seeded default's engine.feeds dict key is its human slug — so passing
-    # that feed_id back into browse_feeds(feeds=...) matched nothing for
-    # every seeded default feed. feed_names must resolve via FeedConfig.feed_id
-    # too, not just the dict key.
+async def test_feed_names_filter_resolves_by_feed_id_or_slug(tmp_path, monkeypatch):
+    # list_feeds/get_feed (the persistent-registry management tools) only
+    # ever return feed_id; browse_feeds(feeds=...) must resolve either that
+    # id or the original human slug.
     monkeypatch.chdir(tmp_path)  # away from the repo root's real feeds.opml
     db_path = str(tmp_path / "feeds.db")
     engine = RSSEngine(db_path=db_path)
-    anthropic_feed_id = engine.feeds["anthropic"].feed_id
-    assert anthropic_feed_id  # populated for store-backed feeds
+    anthropic_cfg = next(cfg for cfg in engine.feeds.values() if cfg.source == "anthropic")
 
     monkeypatch.setattr(RSSEngine, "_fetch_feed", lambda self, session, cfg: _noop())
 
-    await engine._refresh_cache(feed_names=[anthropic_feed_id])
-
-    # No exception means the filter didn't silently fetch zero feeds; verify
-    # the dict-comprehension inside _refresh_cache actually matched by
-    # checking the filter logic directly (feed_id resolves alongside slug).
-    names = {anthropic_feed_id}
-    matched = {
-        k: v for k, v in engine.feeds.items()
-        if k in names or (v.feed_id and v.feed_id in names)
-    }
-    assert len(matched) == 1
-    assert next(iter(matched.values())).source == "anthropic"
+    for filter_value in (anthropic_cfg.feed_id, anthropic_cfg.slug):
+        await engine._refresh_cache(feed_names=[filter_value])
+        matched = {
+            k: v for k, v in engine.feeds.items()
+            if k in {filter_value} or (v.slug and v.slug in {filter_value})
+        }
+        assert len(matched) == 1
+        assert next(iter(matched.values())).source == "anthropic"
 
 
 def test_rssengine_falls_back_to_default_feeds_on_unreadable_db_path(tmp_path):
@@ -232,25 +230,34 @@ def test_seed_source_falls_back_to_default_feeds_without_opml(tmp_path, monkeypa
     assert _seed_source() == DEFAULT_FEEDS
 
 
-def test_opml_only_slug_survives_a_store_reload(tmp_path, monkeypatch):
-    # codex finding on PR #71, round 4 of the final pre-merge check:
-    # _feed_dict_key checked seed slugs against a hardcoded DEFAULT_FEEDS,
-    # so an OPML-only feed (present in feeds.opml but not DEFAULT_FEEDS,
-    # e.g. Simon Willison / Papers With Code) got re-keyed to its feed_id
-    # on every reload, breaking browse_feeds(feeds=["that_slug"]).
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "feeds.opml").write_text(
+def test_opml_only_feed_survives_a_reload_from_a_different_cwd(tmp_path, monkeypatch):
+    # codex findings on PR #71, rounds 4 and 6: earlier revisions re-derived
+    # "is this slug trustworthy" from the CURRENT environment's _seed_source()
+    # on every load. A row seeded while feeds.opml was visible, then reloaded
+    # from a process whose cwd doesn't have that file, would silently lose
+    # its slug-based filterability even though nothing about the row itself
+    # changed. Keying by feed_id (permanent, stored in the row) instead of a
+    # re-derived slug trust decision eliminates this class of bug outright:
+    # the feed's identity and filterability can't depend on cwd at read time.
+    opml_dir = tmp_path / "with_opml"
+    opml_dir.mkdir()
+    monkeypatch.chdir(opml_dir)
+    (opml_dir / "feeds.opml").write_text(
         '<?xml version="1.0"?><opml version="1.0"><body>'
         '<outline text="Only In OPML" xmlUrl="http://opml-only.example/feed"/>'
         "</body></opml>"
     )
     db_path = str(tmp_path / "feeds.db")
+    RSSEngine(db_path=db_path)  # seeds the store while feeds.opml is visible
 
-    engine = RSSEngine(db_path=db_path)  # first construction: seeds the store
-    engine2 = RSSEngine(db_path=db_path)  # second construction: reloads it
+    no_opml_dir = tmp_path / "without_opml"
+    no_opml_dir.mkdir()
+    monkeypatch.chdir(no_opml_dir)  # feeds.opml is NOT visible from here
+    engine2 = RSSEngine(db_path=db_path)  # reload from a different cwd
 
-    assert "only_in_opml" in engine2.feeds
-    assert engine2.feeds["only_in_opml"].url == "http://opml-only.example/feed"
+    cfg = next(c for c in engine2.feeds.values() if c.url == "http://opml-only.example/feed")
+    assert cfg.slug == "only_in_opml"
+    assert engine2.feeds[cfg.feed_id] is cfg
 
 
 def test_rssengine_disabling_all_feeds_yields_empty_not_defaults(tmp_path, monkeypatch):

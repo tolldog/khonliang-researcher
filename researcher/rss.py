@@ -40,11 +40,17 @@ class FeedConfig:
     name: str
     url: str
     source: str  # tag for EngineResult.source
-    # Set only for feeds loaded from the persistent registry (feed_store.py)
-    # — lets browse_feeds's feeds= filter match on the id list_feeds/
-    # get_feed hand back, even for seeded defaults whose dict key is the
-    # human slug rather than feed_id (codex finding on PR #71).
+    # Both set only for feeds loaded from the persistent registry
+    # (feed_store.py). ``feed_id`` is the store's real, permanent primary
+    # key — also the ``RSSEngine.feeds`` dict key for store-backed feeds
+    # (see ``_load_feeds_from_store``). ``slug`` is the human-readable
+    # seed name (e.g. "anthropic") recorded at seed time, surfaced purely
+    # as a filter alias in ``_refresh_cache`` — never a dict key, so a
+    # collision or a slug that's since become untrustworthy just widens
+    # or narrows the filter match, it can never silently displace another
+    # feed (codex finding on PR #71, rounds 4-6).
     feed_id: str = ""
+    slug: str = ""
 
 
 # Pre-configured feeds for AI research blogs
@@ -273,6 +279,20 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
     ``_seed_source()`` on first use (fr_researcher_b8b5c008). Falls back
     to DEFAULT_FEEDS directly if the store can't be opened (e.g. read-only
     filesystem in a test sandbox) so callers never see zero feeds.
+
+    Always keyed by ``feed_id`` — the DB's real primary key, guaranteed
+    unique and stable regardless of environment (cwd, feeds.opml
+    presence, ...) at read time. Earlier revisions tried to key by the
+    human-readable seed slug when "trustworthy", re-deriving that trust
+    from environment state on every load; that repeatedly produced edge
+    cases (a custom feed's caller-supplied slug colliding with a real
+    default's key; OPML-only slugs getting spuriously untrusted; the same
+    row's key flipping across processes with different cwds — three
+    separate PR #71 review rounds). The seed slug is still recorded in
+    each row's ``metadata`` and surfaced via ``FeedConfig.slug`` purely as
+    a filter alias (see ``RSSEngine._refresh_cache``), where a collision
+    or missing-file just means the alias matches more/fewer entries —
+    never silent displacement.
     """
     import sqlite3
 
@@ -280,8 +300,7 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
 
     try:
         store = FeedStore(db_path)
-        seed_source = _seed_source()
-        store.seed_if_empty(seed_source)
+        store.seed_if_empty(_seed_source())
         rows = store.list_feeds(enabled_only=True)
     except (sqlite3.Error, OSError):
         # Narrowed to database/filesystem-open failures only — a bare
@@ -296,32 +315,12 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
     # intentionally disabled everything. Only the exception path above
     # falls back to DEFAULT_FEEDS.
     return {
-        _feed_dict_key(row, seed_source): FeedConfig(
-            name=row["name"], url=row["url"], source=row["source"], feed_id=row["feed_id"],
+        row["feed_id"]: FeedConfig(
+            name=row["name"], url=row["url"], source=row["source"],
+            feed_id=row["feed_id"], slug=row["metadata"].get("seed_slug", ""),
         )
         for row in rows
     }
-
-
-def _feed_dict_key(row: dict, seed_source: Dict[str, FeedConfig]) -> str:
-    """Pick the dict key for a feed row: the seed slug for genuine seeded
-    entries, ``feed_id`` for everything else.
-
-    ``metadata`` is caller-supplied for any feed registered via
-    ``register_feed`` — trusting a caller-set ``seed_slug`` verbatim would
-    let a custom feed collide with (and silently displace) a real seeded
-    feed's key, which callers use to filter by name (Copilot finding on
-    PR #71 round 4). Only trust it when the row's url actually matches
-    that slug's url in ``seed_source`` (whichever seeded THIS store —
-    feeds.opml or DEFAULT_FEEDS, see ``_seed_source()``), i.e. it really
-    is the seeded row. Checking against a hardcoded DEFAULT_FEEDS here
-    would wrongly reject every OPML-only slug (codex finding on PR #71,
-    round 4 of the final pre-merge check).
-    """
-    slug = row["metadata"].get("seed_slug")
-    if slug and slug in seed_source and seed_source[slug].url == row["url"]:
-        return slug
-    return row["feed_id"]
 
 
 class RSSEngine(BaseEngine):
@@ -397,13 +396,15 @@ class RSSEngine(BaseEngine):
         feeds_to_fetch = self.feeds
         if feed_names:
             names = set(feed_names)
-            # Match on the dict key (slug or feed_id, whichever this feed
-            # is keyed by) OR the feed's feed_id alias — a caller passing
-            # back the id list_feeds/get_feed returned must resolve even
-            # for a seeded default, whose dict key is the human slug.
+            # Match on the dict key (feed_id for store-backed feeds, the
+            # DEFAULT_FEEDS/OPML slug otherwise) OR the feed's own slug
+            # alias — lets callers filter by either the id list_feeds/
+            # get_feed returned, or the human name from browse_feeds's
+            # docs/history, without either identifier being a dict key
+            # that could collide.
             feeds_to_fetch = {
                 k: v for k, v in self.feeds.items()
-                if k in names or (v.feed_id and v.feed_id in names)
+                if k in names or (v.slug and v.slug in names)
             }
 
         all_entries = []
