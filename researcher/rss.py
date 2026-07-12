@@ -246,10 +246,32 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
+def _seed_source() -> Dict[str, FeedConfig]:
+    """The feed set a fresh/incomplete registry seeds from.
+
+    Prefers the checked-in ``feeds.opml`` (this repo's real, curated,
+    26-feed production list) over the much smaller in-code DEFAULT_FEEDS
+    (13 feeds) — seeding from DEFAULT_FEEDS alone when an OPML file with
+    real content sits right there would silently drop every OPML-only
+    feed (Simon Willison, Papers With Code, HN, Reddit, GitHub topic/
+    release feeds, ...) the first time a caller's db_path takes priority
+    over the old implicit-OPML-autodiscovery path (codex finding on
+    PR #71, round 3 of the final pre-merge check).
+    """
+    from pathlib import Path
+
+    opml_path = Path("feeds.opml")
+    if opml_path.exists():
+        loaded = load_opml(str(opml_path))
+        if loaded:
+            return loaded
+    return DEFAULT_FEEDS
+
+
 def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
     """Load enabled feeds from the persistent registry, seeding it from
-    DEFAULT_FEEDS on first use (fr_researcher_b8b5c008). Falls back to
-    DEFAULT_FEEDS directly if the store can't be opened (e.g. read-only
+    ``_seed_source()`` on first use (fr_researcher_b8b5c008). Falls back
+    to DEFAULT_FEEDS directly if the store can't be opened (e.g. read-only
     filesystem in a test sandbox) so callers never see zero feeds.
     """
     import sqlite3
@@ -258,7 +280,7 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
 
     try:
         store = FeedStore(db_path)
-        store.seed_if_empty(DEFAULT_FEEDS)
+        store.seed_if_empty(_seed_source())
         rows = store.list_feeds(enabled_only=True)
     except (sqlite3.Error, OSError):
         # Narrowed to database/filesystem-open failures only — a bare

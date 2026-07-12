@@ -119,7 +119,10 @@ def test_rssengine_defaults_to_default_feeds_without_db_path():
     assert engine.feeds == DEFAULT_FEEDS
 
 
-def test_rssengine_loads_and_seeds_from_explicit_db_path(tmp_path):
+def test_rssengine_loads_and_seeds_from_explicit_db_path(tmp_path, monkeypatch):
+    # chdir away from the repo root's real feeds.opml (26 feeds) so this
+    # test exercises the DEFAULT_FEEDS fallback path specifically.
+    monkeypatch.chdir(tmp_path)
     db_path = str(tmp_path / "feeds.db")
     engine = RSSEngine(db_path=db_path)
     assert len(engine.feeds) == len(DEFAULT_FEEDS)
@@ -135,12 +138,13 @@ def test_rssengine_loads_and_seeds_from_explicit_db_path(tmp_path):
     assert "new" in {cfg.source for cfg in engine2.feeds.values()}
 
 
-def test_load_feeds_from_store_untrusted_seed_slug_does_not_collide(tmp_path):
+def test_load_feeds_from_store_untrusted_seed_slug_does_not_collide(tmp_path, monkeypatch):
     # Copilot finding on PR #71 round 4: a custom feed whose caller-supplied
     # metadata happens to set seed_slug to a real default's slug (e.g.
     # "anthropic") must not displace that default in the returned dict —
     # only a row whose url genuinely matches DEFAULT_FEEDS[slug].url may
     # use the slug as its key.
+    monkeypatch.chdir(tmp_path)  # away from the repo root's real feeds.opml
     from researcher.feed_store import FeedStore
 
     db_path = str(tmp_path / "feeds.db")
@@ -168,6 +172,7 @@ async def test_feed_names_filter_resolves_seeded_default_by_feed_id(tmp_path, mo
     # that feed_id back into browse_feeds(feeds=...) matched nothing for
     # every seeded default feed. feed_names must resolve via FeedConfig.feed_id
     # too, not just the dict key.
+    monkeypatch.chdir(tmp_path)  # away from the repo root's real feeds.opml
     db_path = str(tmp_path / "feeds.db")
     engine = RSSEngine(db_path=db_path)
     anthropic_feed_id = engine.feeds["anthropic"].feed_id
@@ -199,10 +204,39 @@ def test_rssengine_falls_back_to_default_feeds_on_unreadable_db_path(tmp_path):
     assert engine.feeds == DEFAULT_FEEDS
 
 
-def test_rssengine_disabling_all_feeds_yields_empty_not_defaults(tmp_path):
+def test_seed_source_prefers_real_opml_over_default_feeds(tmp_path, monkeypatch):
+    # codex finding on PR #71 (final pre-merge check, round 3): seeding a
+    # fresh registry from DEFAULT_FEEDS alone silently drops every feed
+    # that's only in the checked-in feeds.opml (26 feeds vs 13 in
+    # DEFAULT_FEEDS) the first time db_path takes priority over implicit
+    # OPML autodiscovery.
+    from researcher.rss import _seed_source
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "feeds.opml").write_text(
+        '<?xml version="1.0"?><opml version="1.0"><body>'
+        '<outline text="Only In OPML" xmlUrl="http://opml-only.example/feed"/>'
+        "</body></opml>"
+    )
+
+    seeded = _seed_source()
+
+    assert len(seeded) == 1
+    assert next(iter(seeded.values())).url == "http://opml-only.example/feed"
+
+
+def test_seed_source_falls_back_to_default_feeds_without_opml(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # no feeds.opml here
+    from researcher.rss import _seed_source
+
+    assert _seed_source() == DEFAULT_FEEDS
+
+
+def test_rssengine_disabling_all_feeds_yields_empty_not_defaults(tmp_path, monkeypatch):
     # Copilot finding on PR #71: an intentionally-empty enabled set (every
     # feed disabled) must not be reinterpreted as "store unavailable" and
     # silently repopulated with DEFAULT_FEEDS.
+    monkeypatch.chdir(tmp_path)  # away from the repo root's real feeds.opml
     from researcher.feed_store import FeedStore
 
     db_path = str(tmp_path / "feeds.db")
