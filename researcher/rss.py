@@ -280,7 +280,8 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
 
     try:
         store = FeedStore(db_path)
-        store.seed_if_empty(_seed_source())
+        seed_source = _seed_source()
+        store.seed_if_empty(seed_source)
         rows = store.list_feeds(enabled_only=True)
     except (sqlite3.Error, OSError):
         # Narrowed to database/filesystem-open failures only — a bare
@@ -295,26 +296,30 @@ def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
     # intentionally disabled everything. Only the exception path above
     # falls back to DEFAULT_FEEDS.
     return {
-        _feed_dict_key(row): FeedConfig(
+        _feed_dict_key(row, seed_source): FeedConfig(
             name=row["name"], url=row["url"], source=row["source"], feed_id=row["feed_id"],
         )
         for row in rows
     }
 
 
-def _feed_dict_key(row: dict) -> str:
+def _feed_dict_key(row: dict, seed_source: Dict[str, FeedConfig]) -> str:
     """Pick the dict key for a feed row: the seed slug for genuine seeded
-    defaults, ``feed_id`` for everything else.
+    entries, ``feed_id`` for everything else.
 
     ``metadata`` is caller-supplied for any feed registered via
     ``register_feed`` — trusting a caller-set ``seed_slug`` verbatim would
-    let a custom feed collide with (and silently displace) a real default
+    let a custom feed collide with (and silently displace) a real seeded
     feed's key, which callers use to filter by name (Copilot finding on
     PR #71 round 4). Only trust it when the row's url actually matches
-    that DEFAULT_FEEDS slug's url, i.e. it really is the seeded row.
+    that slug's url in ``seed_source`` (whichever seeded THIS store —
+    feeds.opml or DEFAULT_FEEDS, see ``_seed_source()``), i.e. it really
+    is the seeded row. Checking against a hardcoded DEFAULT_FEEDS here
+    would wrongly reject every OPML-only slug (codex finding on PR #71,
+    round 4 of the final pre-merge check).
     """
     slug = row["metadata"].get("seed_slug")
-    if slug and slug in DEFAULT_FEEDS and DEFAULT_FEEDS[slug].url == row["url"]:
+    if slug and slug in seed_source and seed_source[slug].url == row["url"]:
         return slug
     return row["feed_id"]
 

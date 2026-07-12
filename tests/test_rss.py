@@ -232,6 +232,27 @@ def test_seed_source_falls_back_to_default_feeds_without_opml(tmp_path, monkeypa
     assert _seed_source() == DEFAULT_FEEDS
 
 
+def test_opml_only_slug_survives_a_store_reload(tmp_path, monkeypatch):
+    # codex finding on PR #71, round 4 of the final pre-merge check:
+    # _feed_dict_key checked seed slugs against a hardcoded DEFAULT_FEEDS,
+    # so an OPML-only feed (present in feeds.opml but not DEFAULT_FEEDS,
+    # e.g. Simon Willison / Papers With Code) got re-keyed to its feed_id
+    # on every reload, breaking browse_feeds(feeds=["that_slug"]).
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "feeds.opml").write_text(
+        '<?xml version="1.0"?><opml version="1.0"><body>'
+        '<outline text="Only In OPML" xmlUrl="http://opml-only.example/feed"/>'
+        "</body></opml>"
+    )
+    db_path = str(tmp_path / "feeds.db")
+
+    engine = RSSEngine(db_path=db_path)  # first construction: seeds the store
+    engine2 = RSSEngine(db_path=db_path)  # second construction: reloads it
+
+    assert "only_in_opml" in engine2.feeds
+    assert engine2.feeds["only_in_opml"].url == "http://opml-only.example/feed"
+
+
 def test_rssengine_disabling_all_feeds_yields_empty_not_defaults(tmp_path, monkeypatch):
     # Copilot finding on PR #71: an intentionally-empty enabled set (every
     # feed disabled) must not be reinterpreted as "store unavailable" and

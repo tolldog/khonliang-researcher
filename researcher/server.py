@@ -733,7 +733,7 @@ Most tools accept detail="compact|brief|full":
         # (Copilot finding on PR #71 round 5).
         if not _feed_store_cache:
             from researcher.feed_store import FeedStore
-            from researcher.rss import DEFAULT_FEEDS
+            from researcher.rss import _seed_source
 
             # No literal-path fallback here: pipeline.config["db_path"] is
             # always populated with a real, absolute path by create_pipeline.
@@ -746,8 +746,13 @@ Most tools accept detail="compact|brief|full":
             # leaves list_feeds/get_feed/update_feed/disable_feed operating
             # on an empty registry until some unrelated call path like
             # browse_feeds happens to trigger _load_feeds_from_store's own
-            # seeding first (codex finding on PR #71).
-            store.seed_if_empty(DEFAULT_FEEDS)
+            # seeding first (codex finding on PR #71). Use the SAME seed
+            # source rss.py's loader uses (feeds.opml when present, else
+            # DEFAULT_FEEDS) — seeding from DEFAULT_FEEDS here regardless
+            # would make the registry's initial contents depend on which
+            # tool happens to run first (codex finding on PR #71, round 4
+            # of the final pre-merge check).
+            store.seed_if_empty(_seed_source())
             _feed_store_cache.append(store)
         return _feed_store_cache[0]
 
