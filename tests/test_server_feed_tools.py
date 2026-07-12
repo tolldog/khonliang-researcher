@@ -128,3 +128,31 @@ async def test_enable_feed_reverses_disable_feed(mcp):
 async def test_enable_feed_unknown_id(mcp):
     result = await _call(mcp, "enable_feed", {"feed_id": "feed_doesnotexist"})
     assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_feed_tools_return_clean_error_without_db_path(tmp_path, monkeypatch):
+    # codex finding on PR #71, round 7 of the final pre-merge check:
+    # a pipeline/config shim without db_path (a real, existing shape --
+    # tests/test_brief_on.py's _FakePipeline) made every feed-registry
+    # tool raise an uncaught KeyError instead of returning "error: ...".
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"db_path: {tmp_path / 'test.db'}\n")
+
+    from researcher.pipeline import create_pipeline
+
+    pipeline = create_pipeline(str(config_path))
+    del pipeline.config["db_path"]  # simulate a config shim lacking it
+    mcp = create_research_server(pipeline)
+
+    for name, args in [
+        ("list_feeds", {}),
+        ("get_feed", {"feed_id": "feed_x"}),
+        ("register_feed", {"name": "n", "url": "http://x", "source": "s"}),
+        ("update_feed", {"feed_id": "feed_x", "name": "n"}),
+        ("disable_feed", {"feed_id": "feed_x"}),
+        ("enable_feed", {"feed_id": "feed_x"}),
+    ]:
+        result = await _call(mcp, name, args)
+        assert result.startswith("error:"), f"{name} did not return a clean error: {result!r}"

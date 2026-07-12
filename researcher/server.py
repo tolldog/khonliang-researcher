@@ -733,23 +733,30 @@ Most tools accept detail="compact|brief|full":
 
     _feed_store_cache: list = []
 
+    _FEED_REGISTRY_UNAVAILABLE = "error: feed registry unavailable (no db_path configured on this pipeline)"
+
     def _feed_store():
         # Cached across calls in this process — FeedStore.__init__ runs
         # _init_schema() (CREATE TABLE/INDEX) and opens/closes a connection
         # on every construction, which is unnecessary overhead for a
         # register/list/get/update/disable sequence in the same process
         # (Copilot finding on PR #71 round 5).
+        #
+        # Returns None when pipeline.config has no db_path, rather than
+        # raising — a pipeline/config shim without one is a real, existing
+        # shape in this codebase (tests/test_brief_on.py's _FakePipeline);
+        # every caller below must return a clean "error: ..." envelope for
+        # that case rather than crash with an uncaught KeyError (codex
+        # finding on PR #71, round 7 of the final pre-merge check).
         if not _feed_store_cache:
+            db_path = pipeline.config.get("db_path")
+            if not db_path:
+                return None
+
             from researcher.feed_store import FeedStore
             from researcher.rss import _seed_source
 
-            # No literal-path fallback here: pipeline.config["db_path"] is
-            # always populated with a real, absolute path by create_pipeline.
-            # A missing key means this was constructed unusually and should
-            # fail loudly rather than silently opening/seeding a guessed
-            # relative path (the earlier live-prod-DB near-miss on this
-            # same FR).
-            store = FeedStore(str(pipeline.config["db_path"]))
+            store = FeedStore(str(db_path))
             # Seed on first use here too — otherwise a brand-new db_path
             # leaves list_feeds/get_feed/update_feed/disable_feed operating
             # on an empty registry until some unrelated call path like
@@ -772,13 +779,16 @@ Most tools accept detail="compact|brief|full":
         """
         from researcher.feed_store import FeedError
 
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
         meta = {}
         if metadata:
             meta, err = _parse_feed_metadata(metadata)
             if err:
                 return f"error: {err}"
         try:
-            feed = _feed_store().register_feed(name=name, url=url, source=source, metadata=meta)
+            feed = store.register_feed(name=name, url=url, source=source, metadata=meta)
         except FeedError as e:
             return f"error: {e}"
         return f"registered {feed['feed_id']}: {feed['name']} ({feed['url']})"
@@ -786,7 +796,10 @@ Most tools accept detail="compact|brief|full":
     @mcp.tool()
     def list_feeds(enabled_only: bool = True) -> str:
         """List feeds in the persistent registry."""
-        feeds = _feed_store().list_feeds(enabled_only=enabled_only)
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
+        feeds = store.list_feeds(enabled_only=enabled_only)
         if not feeds:
             return "No feeds registered."
         lines = [f"{len(feeds)} feed(s)"]
@@ -798,7 +811,10 @@ Most tools accept detail="compact|brief|full":
     @mcp.tool()
     def get_feed(feed_id: str) -> str:
         """Look up a single feed by id."""
-        feed = _feed_store().get_feed(feed_id)
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
+        feed = store.get_feed(feed_id)
         if feed is None:
             return f"error: unknown feed_id {feed_id!r}"
         status = "enabled" if feed["enabled"] else "disabled"
@@ -807,6 +823,9 @@ Most tools accept detail="compact|brief|full":
     @mcp.tool()
     def update_feed(feed_id: str, name: str = "", url: str = "", source: str = "", metadata: str = "") -> str:
         """Edit a feed's fields in place. Omitted args are left unchanged."""
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
         fields: dict = {}
         if name:
             fields["name"] = name
@@ -824,7 +843,7 @@ Most tools accept detail="compact|brief|full":
         from researcher.feed_store import FeedError
 
         try:
-            feed = _feed_store().update_feed(feed_id, **fields)
+            feed = store.update_feed(feed_id, **fields)
         except FeedError as e:
             return f"error: {e}"
         if feed is None:
@@ -837,7 +856,10 @@ Most tools accept detail="compact|brief|full":
         and list_feeds(enabled_only=True) stop returning it. Reversible
         via enable_feed.
         """
-        ok = _feed_store().disable_feed(feed_id)
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
+        ok = store.disable_feed(feed_id)
         if not ok:
             return f"error: unknown feed_id {feed_id!r}"
         return f"disabled {feed_id}"
@@ -851,8 +873,11 @@ Most tools accept detail="compact|brief|full":
         """
         from researcher.feed_store import FeedError
 
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
         try:
-            feed = _feed_store().update_feed(feed_id, enabled=True)
+            feed = store.update_feed(feed_id, enabled=True)
         except FeedError as e:
             return f"error: {e}"
         if feed is None:
