@@ -713,6 +713,52 @@ def test_create_pipeline_succeeds_with_a_valid_db_path(tmp_path):
     assert Path(pipeline.config["db_path"]).exists()
 
 
+def test_create_pipeline_boot_probe_catches_readonly_existing_db_file(tmp_path):
+    # codex P2 round 8: a read-only-mounted EXISTING db file passes a
+    # read-only "SELECT 1" probe fine (the directory is writable, the file
+    # opens and reads) — only a probe that exercises an actual WRITE catches
+    # this before create_pipeline() reports success and the failure surfaces
+    # later, mid-distill, as "attempt to write a readonly database".
+    db_file = tmp_path / "researcher.db"
+    sqlite3.connect(str(db_file)).close()  # create it first, writable
+    db_file.chmod(0o444)  # then make the FILE itself read-only
+
+    config = {"db_path": str(db_file), "models": {}, "projects": {}}
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+
+    try:
+        with pytest.raises(RuntimeError, match="not usable at startup"):
+            create_pipeline(str(config_path))
+    finally:
+        db_file.chmod(0o644)  # restore so tmp_path cleanup can remove it
+
+
+def test_create_pipeline_boot_probe_leaves_no_schema_residue(tmp_path):
+    # The write probe round-trips PRAGMA user_version rather than creating a
+    # throwaway table — confirm it leaves user_version untouched (0, the
+    # sqlite default for a fresh file) and no stray tables behind.
+    db_path = tmp_path / "researcher.db"
+    config = {"db_path": str(db_path), "models": {}, "projects": {}}
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+
+    create_pipeline(str(config_path))
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+    assert not any(t.startswith("_boot") for t in tables)
+    assert user_version == 0
+
+
 @pytest.mark.asyncio
 async def test_distill_entry_lookup_non_transient_operational_error_propagates(tmp_path):
     pipeline = create_pipeline(_make_config(tmp_path))
@@ -818,3 +864,48 @@ async def test_distill_pending_mcp_tool_reports_errored_distinctly_from_failed(t
 
     assert "[error]" in text
     assert "FAILED" not in text
+
+
+@pytest.mark.asyncio
+async def test_distill_paper_mcp_tool_surfaces_stuck_even_on_success(tmp_path, monkeypatch):
+    # codex P2 round 8: `stuck` is orthogonal to `success` — a leaked lock on
+    # the FINAL release can happen even after an otherwise-successful
+    # distill, and distill_paper() must not silently report a clean success
+    # in that case.
+    monkeypatch.setattr("researcher.pipeline.asyncio.sleep", _fast_sleep)
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.summarizer = SimpleNamespace(handle=_ok_summary)
+    pipeline.extractor = SimpleNamespace(handle=_ok_extract)
+
+    def boom_release(entry_id):
+        raise sqlite3.OperationalError("unable to open database file")
+    pipeline.locks.release = boom_release
+
+    mcp = create_research_server(pipeline)
+    result = await mcp.call_tool("distill_paper", {"entry_id": "p1"})
+    text = result[-1]["result"]
+
+    assert "# p1" in text  # the success (markdown title) rendering still happened
+    assert "stuck" in text.lower()  # but the leaked lock is surfaced too
+
+
+@pytest.mark.asyncio
+async def test_distill_pending_mcp_tool_marks_stuck_on_otherwise_ok_entry(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("researcher.pipeline.asyncio.sleep", _fast_sleep)
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.summarizer = SimpleNamespace(handle=_ok_summary)
+    pipeline.extractor = SimpleNamespace(handle=_ok_extract)
+
+    def boom_release(entry_id):
+        raise sqlite3.OperationalError("unable to open database file")
+    pipeline.locks.release = boom_release
+
+    mcp = create_research_server(pipeline)
+    result = await mcp.call_tool("distill_pending", {})
+    text = result[-1]["result"]
+
+    assert "[ok+stuck]" in text

@@ -169,11 +169,16 @@ def distill(ctx, entry_id, distill_all):
                 if getattr(r, "skipped", False):
                     status = "skip"  # held by another drainer, not a failure
                 elif getattr(r, "errored", False):
-                    status = "error"  # transient DB error, not a content failure
+                    status = "stuck" if getattr(r, "stuck", False) else "error"
                 elif r.success:
                     status = "ok"
                 else:
                     status = "FAILED"
+                # `stuck` is orthogonal to success/errored (codex P2 round 8)
+                # — mark it even when the outcome is otherwise "ok"/"FAILED",
+                # not just the dedicated "stuck" errored status above.
+                if status not in ("skip", "stuck") and getattr(r, "stuck", False):
+                    status = f"{status}+stuck"
                 click.echo(f"  [{status}] {r.title}")
                 if r.success and r.triples:
                     click.echo(f"         {len(r.triples)} triples extracted")
@@ -196,6 +201,16 @@ def distill(ctx, entry_id, distill_all):
                     for proj, assess in result.assessments.items():
                         if isinstance(assess, dict):
                             click.echo(f"  {proj}: {assess.get('score', 0):.0%}")
+                # `stuck` is orthogonal to success (codex P2 round 8) — a
+                # leaked lock can happen on the final release even after an
+                # otherwise-successful distill; don't silently hide it.
+                if getattr(result, "stuck", False):
+                    click.echo(
+                        "\nWarning: the distill lock could not be released "
+                        "and is now stuck — skipped on every future drain "
+                        "attempt until this process restarts.",
+                        err=True,
+                    )
             elif getattr(result, "skipped", False):
                 click.echo(
                     f"Distillation already in progress (held by another "
@@ -218,6 +233,13 @@ def distill(ctx, entry_id, distill_all):
                 sys.exit(1)
             else:
                 click.echo(f"Distillation failed: {result.title}", err=True)
+                if getattr(result, "stuck", False):
+                    click.echo(
+                        "Warning: the distill lock is also stuck — skipped "
+                        "on every future drain attempt until this process "
+                        "restarts.",
+                        err=True,
+                    )
                 sys.exit(1)
         else:
             click.echo("Provide an ENTRY_ID or use --all", err=True)

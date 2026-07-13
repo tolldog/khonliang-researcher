@@ -3320,11 +3320,29 @@ def create_pipeline(config_path: str = "config.yaml") -> ResearchPipeline:
     # Open-then-close a real connection so sqlite3's own error surfaces
     # directly, rather than reimplementing its file-open logic with
     # os.access (which can't catch every way a path can be unusable — e.g.
-    # a component of the path being a file, not a directory).
+    # a component of the path being a file, not a directory). Also exercise
+    # WRITE access (codex P2 round 8), not just a read — an existing db file
+    # on a read-only mount/filesystem would otherwise pass a read-only
+    # "SELECT 1" probe here and only fail later, mid-distill, on the first
+    # real write ("attempt to write a readonly database"), which is exactly
+    # the deferred-discovery gap this whole guard exists to close.
+    #
+    # Round-the-trip ``PRAGMA user_version`` (read it, then write the SAME
+    # value back) rather than CREATE TABLE + rollback: DDL statements get an
+    # implicit commit from Python's sqlite3 module regardless of an explicit
+    # ``rollback()`` call afterward (confirmed empirically — a
+    # CREATE-TABLE-then-rollback here left the table behind), so that
+    # approach would litter every fresh db with a stray ``_boot_write_check``
+    # table. Setting ``user_version`` to its own current value writes to the
+    # database file header (a real write requiring the same file permissions
+    # as any other write) without touching the schema at all — no residue,
+    # no reliance on transaction rollback semantics.
     try:
         _boot_conn = sqlite3.connect(db_path, timeout=5)
         try:
             _boot_conn.execute("SELECT 1")
+            current_version = _boot_conn.execute("PRAGMA user_version").fetchone()[0]
+            _boot_conn.execute(f"PRAGMA user_version = {int(current_version)}")
         finally:
             _boot_conn.close()
     except sqlite3.OperationalError as exc:
