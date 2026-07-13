@@ -108,6 +108,18 @@ class DistillWorker(BaseQueueWorker):
                 triples,
                 list(result.assessments.keys()),
             )
+        # `stuck` is orthogonal to `success` (codex P2 round 9) — a leaked
+        # lock on the FINAL release can happen even after an otherwise-
+        # successful distill, and the plain "OK" log above would otherwise
+        # silently hide it. This entry is live-locked to this process now,
+        # same as the errored+stuck case above, just reached via a different
+        # path (post-distill release failure vs. pre-LLM PROCESSING-flip
+        # failure) — log it just as loudly regardless of `success`.
+        if getattr(result, "stuck", False):
+            logger.error(
+                "  STUCK (lock leaked despite result.success=%s, needs "
+                "process restart): %s", result.success, entry.title[:60]
+            )
         return result.success
 
 

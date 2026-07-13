@@ -3337,8 +3337,24 @@ def create_pipeline(config_path: str = "config.yaml") -> ResearchPipeline:
     # database file header (a real write requiring the same file permissions
     # as any other write) without touching the schema at all — no residue,
     # no reliance on transaction rollback semantics.
+    #
+    # A generous 30s busy_timeout (codex P2 round 9), not the 5s used
+    # elsewhere: this repo's architecture starts multiple independent
+    # processes against the SAME db_path (the bus agent, a standalone
+    # `researcher.worker`, an MCP-stdio `researcher.server`), so ordinary
+    # write contention from a sibling process starting around the same
+    # moment is expected, not a misconfiguration — a 5s timeout could
+    # false-positive on a slow-but-healthy DB and report a perfectly good
+    # path as "not usable at startup". 30s comfortably outlasts any
+    # ordinary transaction (milliseconds) while still failing loudly for a
+    # GENUINE problem, since a bad path or broken permissions never
+    # resolves no matter how long this waits — time-outlasting is what
+    # distinguishes contention from misconfiguration here, not a message
+    # heuristic. This runs once at boot, so the extra headroom costs
+    # nothing on the happy path (the connection returns as soon as the
+    # lock is free) and is bounded on the unhappy path.
     try:
-        _boot_conn = sqlite3.connect(db_path, timeout=5)
+        _boot_conn = sqlite3.connect(db_path, timeout=30)
         try:
             _boot_conn.execute("SELECT 1")
             current_version = _boot_conn.execute("PRAGMA user_version").fetchone()[0]

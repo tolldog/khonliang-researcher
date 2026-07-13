@@ -12,6 +12,8 @@ import asyncio
 import logging
 import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -514,6 +516,36 @@ async def test_worker_process_item_logs_stuck_distinctly(tmp_path, monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_worker_process_item_logs_stuck_even_on_success(tmp_path, monkeypatch, caplog):
+    # codex P2 round 9: `stuck` is orthogonal to `success` — a leaked lock on
+    # the FINAL release can happen even after an otherwise-successful
+    # distill, and the worker's plain "OK" log must not silently hide it.
+    monkeypatch.setattr("researcher.pipeline.asyncio.sleep", _fast_sleep)
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.summarizer = SimpleNamespace(handle=_ok_summary)
+    pipeline.extractor = SimpleNamespace(handle=_ok_extract)
+
+    def boom_release(entry_id):
+        raise sqlite3.OperationalError("unable to open database file")
+    pipeline.locks.release = boom_release
+
+    async def not_irrelevant(entry_id):
+        return False
+    pipeline.filter_irrelevant = not_irrelevant
+    worker = DistillWorker(pipeline)
+
+    with caplog.at_level(logging.INFO):
+        ok = await worker.process_item(pipeline.knowledge.get("p1"))
+
+    assert ok is True  # distillation itself succeeded
+    assert any(
+        rec.levelno >= logging.ERROR and "STUCK" in rec.message
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_distill_lock_release_failure_does_not_mask_success_result(
     tmp_path, monkeypatch, caplog
 ):
@@ -757,6 +789,35 @@ def test_create_pipeline_boot_probe_leaves_no_schema_residue(tmp_path):
         conn.close()
     assert not any(t.startswith("_boot") for t in tables)
     assert user_version == 0
+
+
+def test_create_pipeline_boot_probe_tolerates_brief_sibling_write_contention(tmp_path):
+    # codex P2 round 9: this architecture starts multiple independent
+    # processes against the SAME db_path (bus agent, standalone worker,
+    # MCP-stdio server) — a sibling briefly holding a write transaction at
+    # the exact moment another process boots is ordinary contention, not a
+    # misconfiguration, and must NOT make create_pipeline() raise. A short
+    # busy_timeout would false-positive here; the widened one must not.
+    db_path = tmp_path / "researcher.db"
+    sqlite3.connect(str(db_path)).close()  # create the file first
+
+    blocker = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
+    blocker.execute("BEGIN IMMEDIATE")  # hold the write lock
+
+    def _release_after_a_moment():
+        time.sleep(0.3)
+        blocker.commit()
+        blocker.close()
+    releaser = threading.Thread(target=_release_after_a_moment)
+    releaser.start()
+    try:
+        config = {"db_path": str(db_path), "models": {}, "projects": {}}
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+
+        create_pipeline(str(config_path))  # must not raise — waits it out
+    finally:
+        releaser.join()
 
 
 @pytest.mark.asyncio
