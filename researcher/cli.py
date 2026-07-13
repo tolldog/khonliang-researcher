@@ -305,9 +305,19 @@ def browse_feeds(ctx, query, feeds, ingest):
 
     pipeline = _get_pipeline(ctx)
     feed_list = [f.strip() for f in feeds.split(",") if f.strip()] or None
+    # .get, not bracket-index: this CLI command must keep working for a
+    # pipeline/config shim with no db_path (RSS browsing itself doesn't
+    # need the knowledge DB) -- fetch_all_feeds already treats db_path=None
+    # as "no persistent registry, use DEFAULT_FEEDS/implicit OPML" (codex
+    # finding on PR #71, round 6 -- mirrors the same fix already applied
+    # to server.py's browse_feeds in round 5). No literal-path fallback
+    # either way: guessing a relative default risks silently opening/
+    # seeding whatever file sits at that path in the cwd.
+    raw_db_path = pipeline.config.get("db_path")
+    db_path = str(raw_db_path) if raw_db_path else None
 
     async def _browse():
-        entries = await fetch_all_feeds(feed_list)
+        entries = await fetch_all_feeds(feed_list, db_path=db_path)
 
         if query:
             keywords = query.lower().split()

@@ -14,7 +14,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from khonliang.knowledge.store import Tier, EntryStatus
 from khonliang.mcp import KhonliangMCPServer, compact_list, compact_entry, truncate, brief_or_full, format_response
@@ -157,6 +157,24 @@ def _filter_taxonomy(taxonomy: dict[str, Any], audience: str = "") -> tuple[list
             if rel.get("source") in selected_codes and rel.get("target") in selected_codes
         ],
     )
+
+
+def _parse_feed_metadata(metadata: str) -> tuple[Optional[dict], Optional[str]]:
+    """Parse a caller-supplied JSON-object string for the feed-registry tools.
+
+    Returns ``(parsed_dict, error_message)`` — exactly one is non-None. A
+    plain ``{"error": ...}`` sentinel dict would misfire on a legitimate
+    caller metadata payload that happens to have an "error" key (Copilot
+    finding on PR #71), so the parse-failure signal is carried out-of-band
+    instead.
+    """
+    try:
+        parsed = json.loads(metadata)
+    except (TypeError, ValueError) as e:
+        return None, f"metadata must be valid JSON: {e}"
+    if not isinstance(parsed, dict):
+        return None, "metadata must be a JSON object"
+    return parsed, None
 
 
 def _format_concept_taxonomy_limited(
@@ -670,7 +688,15 @@ Most tools accept detail="compact|brief|full":
         from researcher.rss import fetch_all_feeds
 
         feed_list = [f.strip() for f in feeds.split(",") if f.strip()] or None
-        entries = await fetch_all_feeds(feed_list)
+        # .get, not bracket-index: browse_feeds must keep working for a
+        # pipeline/config shim that has no db_path (RSS browsing itself
+        # doesn't need the knowledge DB) -- fetch_all_feeds already treats
+        # db_path=None as "no persistent registry, use DEFAULT_FEEDS/
+        # implicit OPML" (codex finding on PR #71, round 5).
+        raw_db_path = pipeline.config.get("db_path")
+        entries = await fetch_all_feeds(
+            feed_list, db_path=str(raw_db_path) if raw_db_path else None,
+        )
 
         if query:
             keywords = query.lower().split()
@@ -704,6 +730,159 @@ Most tools accept detail="compact|brief|full":
             lines.append(f"... +{len(entries) - 30} more")
 
         return "\n".join(lines)
+
+    _feed_store_cache: list = []
+
+    _FEED_REGISTRY_UNAVAILABLE = "error: feed registry unavailable (no db_path configured on this pipeline)"
+
+    def _feed_store():
+        # Cached across calls in this process — FeedStore.__init__ runs
+        # _init_schema() (CREATE TABLE/INDEX) and opens/closes a connection
+        # on every construction, which is unnecessary overhead for a
+        # register/list/get/update/disable sequence in the same process
+        # (Copilot finding on PR #71 round 5).
+        #
+        # Returns None when pipeline.config has no db_path, rather than
+        # raising — a pipeline/config shim without one is a real, existing
+        # shape in this codebase (tests/test_brief_on.py's _FakePipeline);
+        # every caller below must return a clean "error: ..." envelope for
+        # that case rather than crash with an uncaught KeyError (codex
+        # finding on PR #71, round 7 of the final pre-merge check).
+        if not _feed_store_cache:
+            db_path = pipeline.config.get("db_path")
+            if not db_path:
+                return None
+
+            from researcher.feed_store import FeedStore
+            from researcher.rss import _seed_source
+
+            store = FeedStore(str(db_path))
+            # Seed on first use here too — otherwise a brand-new db_path
+            # leaves list_feeds/get_feed/update_feed/disable_feed operating
+            # on an empty registry until some unrelated call path like
+            # browse_feeds happens to trigger _load_feeds_from_store's own
+            # seeding first (codex finding on PR #71). Use the SAME seed
+            # source rss.py's loader uses (feeds.opml when present, else
+            # DEFAULT_FEEDS) — seeding from DEFAULT_FEEDS here regardless
+            # would make the registry's initial contents depend on which
+            # tool happens to run first (codex finding on PR #71, round 4
+            # of the final pre-merge check).
+            store.seed_if_empty(_seed_source())
+            _feed_store_cache.append(store)
+        return _feed_store_cache[0]
+
+    @mcp.tool()
+    def register_feed(name: str, url: str, source: str, metadata: str = "") -> str:
+        """Add a feed to the persistent registry (fr_researcher_b8b5c008).
+        No PR/restart needed — browse_feeds picks it up on the next call.
+        metadata is an optional JSON object string.
+        """
+        from researcher.feed_store import FeedError
+
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
+        meta = {}
+        if metadata:
+            meta, err = _parse_feed_metadata(metadata)
+            if err:
+                return f"error: {err}"
+        try:
+            feed = store.register_feed(name=name, url=url, source=source, metadata=meta)
+        except FeedError as e:
+            return f"error: {e}"
+        return f"registered {feed['feed_id']}: {feed['name']} ({feed['url']})"
+
+    @mcp.tool()
+    def list_feeds(enabled_only: bool = True) -> str:
+        """List feeds in the persistent registry."""
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
+        feeds = store.list_feeds(enabled_only=enabled_only)
+        if not feeds:
+            return "No feeds registered."
+        lines = [f"{len(feeds)} feed(s)"]
+        for f in feeds:
+            status = "enabled" if f["enabled"] else "disabled"
+            lines.append(f"{f['feed_id']} | {f['name']} | {f['source']} | {status} | {f['url']}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    def get_feed(feed_id: str) -> str:
+        """Look up a single feed by id."""
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
+        feed = store.get_feed(feed_id)
+        if feed is None:
+            return f"error: unknown feed_id {feed_id!r}"
+        status = "enabled" if feed["enabled"] else "disabled"
+        return f"{feed['feed_id']} | {feed['name']} | {feed['source']} | {status} | {feed['url']}"
+
+    @mcp.tool()
+    def update_feed(feed_id: str, name: str = "", url: str = "", source: str = "", metadata: str = "") -> str:
+        """Edit a feed's fields in place. Omitted args are left unchanged."""
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
+        fields: dict = {}
+        if name:
+            fields["name"] = name
+        if url:
+            fields["url"] = url
+        if source:
+            fields["source"] = source
+        if metadata:
+            meta, err = _parse_feed_metadata(metadata)
+            if err:
+                return f"error: {err}"
+            fields["metadata"] = meta
+        if not fields:
+            return "error: no fields to update"
+        from researcher.feed_store import FeedError
+
+        try:
+            feed = store.update_feed(feed_id, **fields)
+        except FeedError as e:
+            return f"error: {e}"
+        if feed is None:
+            return f"error: unknown feed_id {feed_id!r}"
+        return f"updated {feed['feed_id']}: {feed['name']} ({feed['url']})"
+
+    @mcp.tool()
+    def disable_feed(feed_id: str) -> str:
+        """Soft-delete a feed (enabled=0). Preserves history; browse_feeds
+        and list_feeds(enabled_only=True) stop returning it. Reversible
+        via enable_feed.
+        """
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
+        ok = store.disable_feed(feed_id)
+        if not ok:
+            return f"error: unknown feed_id {feed_id!r}"
+        return f"disabled {feed_id}"
+
+    @mcp.tool()
+    def enable_feed(feed_id: str) -> str:
+        """Re-enable a feed previously disabled via disable_feed. Without
+        this, disabling was irreversible through the public tools -- the
+        row stays under the unique url index, so register_feed can't be
+        used to add it back either (codex finding on PR #71, round 5).
+        """
+        from researcher.feed_store import FeedError
+
+        store = _feed_store()
+        if store is None:
+            return _FEED_REGISTRY_UNAVAILABLE
+        try:
+            feed = store.update_feed(feed_id, enabled=True)
+        except FeedError as e:
+            return f"error: {e}"
+        if feed is None:
+            return f"error: unknown feed_id {feed_id!r}"
+        return f"enabled {feed['feed_id']}: {feed['name']} ({feed['url']})"
 
     @mcp.tool()
     def find_relevant(query: str, project: str = "", detail: str = "brief") -> str:

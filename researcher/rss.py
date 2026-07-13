@@ -40,6 +40,17 @@ class FeedConfig:
     name: str
     url: str
     source: str  # tag for EngineResult.source
+    # Both set only for feeds loaded from the persistent registry
+    # (feed_store.py). ``feed_id`` is the store's real, permanent primary
+    # key — also the ``RSSEngine.feeds`` dict key for store-backed feeds
+    # (see ``_load_feeds_from_store``). ``slug`` is the human-readable
+    # seed name (e.g. "anthropic") recorded at seed time, surfaced purely
+    # as a filter alias in ``_refresh_cache`` — never a dict key, so a
+    # collision or a slug that's since become untrustworthy just widens
+    # or narrows the filter match, it can never silently displace another
+    # feed (codex finding on PR #71, rounds 4-6).
+    feed_id: str = ""
+    slug: str = ""
 
 
 # Pre-configured feeds for AI research blogs
@@ -241,10 +252,87 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
+def _seed_source() -> Dict[str, FeedConfig]:
+    """The feed set a fresh/incomplete registry seeds from.
+
+    Prefers the checked-in ``feeds.opml`` (this repo's real, curated,
+    26-feed production list) over the much smaller in-code DEFAULT_FEEDS
+    (13 feeds) — seeding from DEFAULT_FEEDS alone when an OPML file with
+    real content sits right there would silently drop every OPML-only
+    feed (Simon Willison, Papers With Code, HN, Reddit, GitHub topic/
+    release feeds, ...) the first time a caller's db_path takes priority
+    over the old implicit-OPML-autodiscovery path (codex finding on
+    PR #71, round 3 of the final pre-merge check).
+    """
+    from pathlib import Path
+
+    opml_path = Path("feeds.opml")
+    if opml_path.exists():
+        loaded = load_opml(str(opml_path))
+        if loaded:
+            return loaded
+    return DEFAULT_FEEDS
+
+
+def _load_feeds_from_store(db_path: str) -> Dict[str, FeedConfig]:
+    """Load enabled feeds from the persistent registry, seeding it from
+    ``_seed_source()`` on first use (fr_researcher_b8b5c008). Falls back
+    to DEFAULT_FEEDS directly if the store can't be opened (e.g. read-only
+    filesystem in a test sandbox) so callers never see zero feeds.
+
+    Always keyed by ``feed_id`` — the DB's real primary key, guaranteed
+    unique and stable regardless of environment (cwd, feeds.opml
+    presence, ...) at read time. Earlier revisions tried to key by the
+    human-readable seed slug when "trustworthy", re-deriving that trust
+    from environment state on every load; that repeatedly produced edge
+    cases (a custom feed's caller-supplied slug colliding with a real
+    default's key; OPML-only slugs getting spuriously untrusted; the same
+    row's key flipping across processes with different cwds — three
+    separate PR #71 review rounds). The seed slug is still recorded in
+    each row's ``metadata`` and surfaced via ``FeedConfig.slug`` purely as
+    a filter alias (see ``RSSEngine._refresh_cache``), where a collision
+    or missing-file just means the alias matches more/fewer entries —
+    never silent displacement.
+    """
+    import sqlite3
+
+    from researcher.feed_store import FeedStore
+
+    try:
+        store = FeedStore(db_path)
+        store.seed_if_empty(_seed_source())
+        rows = store.list_feeds(enabled_only=True)
+    except (sqlite3.Error, OSError):
+        # Narrowed to database/filesystem-open failures only — a bare
+        # `except Exception` would also swallow programmer errors
+        # (KeyError/AttributeError from a schema mismatch, etc.) and mask
+        # real regressions behind a silent DEFAULT_FEEDS fallback.
+        logger.warning("feed store unavailable at %s; falling back to DEFAULT_FEEDS", db_path, exc_info=True)
+        return DEFAULT_FEEDS
+    # An empty result here is a legitimate state (every feed disabled via
+    # disable_feed) and must NOT be reinterpreted as "store unavailable" —
+    # doing so would silently resurrect DEFAULT_FEEDS after a caller
+    # intentionally disabled everything. Only the exception path above
+    # falls back to DEFAULT_FEEDS.
+    return {
+        row["feed_id"]: FeedConfig(
+            name=row["name"], url=row["url"], source=row["source"],
+            feed_id=row["feed_id"], slug=row["metadata"].get("seed_slug", ""),
+        )
+        for row in rows
+    }
+
+
 class RSSEngine(BaseEngine):
     """Search engine that fetches and searches RSS/Atom feeds.
 
-    Loads feeds from OPML file if available, falls back to DEFAULT_FEEDS.
+    Feeds default to the in-code DEFAULT_FEEDS unless a caller explicitly
+    opts into the persistent feed registry (``feed_store.FeedStore``) by
+    passing ``db_path`` — this engine has no business guessing a real
+    database path (and every caller that constructs one with no args, e.g.
+    a test, must not silently open/seed whatever file happens to sit at a
+    default relative path in the working directory).  ``feeds``/``opml_path``
+    take priority over ``db_path`` when given.
     """
 
     name = "rss"
@@ -252,12 +340,19 @@ class RSSEngine(BaseEngine):
     rate_limit = 1.0
     timeout = 15.0
 
-    def __init__(self, feeds: Optional[Dict[str, FeedConfig]] = None, opml_path: Optional[str] = None):
+    def __init__(
+        self,
+        feeds: Optional[Dict[str, FeedConfig]] = None,
+        opml_path: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ):
         super().__init__()
         if feeds:
             self.feeds = feeds
         elif opml_path:
             self.feeds = load_opml(opml_path) or DEFAULT_FEEDS
+        elif db_path:
+            self.feeds = _load_feeds_from_store(db_path)
         else:
             self.feeds = DEFAULT_FEEDS
         self._cache: List[EngineResult] = []
@@ -300,7 +395,17 @@ class RSSEngine(BaseEngine):
         """Fetch all configured feeds and update cache."""
         feeds_to_fetch = self.feeds
         if feed_names:
-            feeds_to_fetch = {k: v for k, v in self.feeds.items() if k in feed_names}
+            names = set(feed_names)
+            # Match on the dict key (feed_id for store-backed feeds, the
+            # DEFAULT_FEEDS/OPML slug otherwise) OR the feed's own slug
+            # alias — lets callers filter by either the id list_feeds/
+            # get_feed returned, or the human name from browse_feeds's
+            # docs/history, without either identifier being a dict key
+            # that could collide.
+            feeds_to_fetch = {
+                k: v for k, v in self.feeds.items()
+                if k in names or (v.slug and v.slug in names)
+            }
 
         all_entries = []
         async with aiohttp.ClientSession(headers=_HEADERS) as session:
@@ -340,23 +445,41 @@ class RSSEngine(BaseEngine):
 async def fetch_all_feeds(
     feeds: Optional[List[str]] = None,
     opml_path: Optional[str] = None,
+    db_path: Optional[str] = None,
 ) -> List[EngineResult]:
     """Fetch and return all entries from configured RSS feeds.
 
     Args:
-        feeds: Optional list of feed names to fetch (default: all)
-        opml_path: Optional path to OPML file (default: feeds.opml)
+        feeds: Optional list of feed identifiers to fetch (default: all).
+            These are the keys of the resulting ``RSSEngine.feeds`` dict —
+            the OPML/DEFAULT_FEEDS slug (e.g. "anthropic") for feeds loaded
+            from OPML or DEFAULT_FEEDS directly, or the seed slug / feed_id
+            for feeds loaded from the persistent registry (db_path given):
+            seeded defaults keep their slug, feeds added via register_feed
+            are addressed by their feed_id (see list_feeds).
+        opml_path: Explicit path to an OPML file. Takes priority over
+            everything, including db_path, when given.
+        db_path: Feed registry DB path. Only pass this when the caller
+            has a real, configured path (e.g. from ``pipeline.config``) —
+            omitting it (the default) uses DEFAULT_FEEDS rather than
+            guessing a path relative to the working directory.
 
     Returns:
         All feed entries as EngineResults.
     """
-    if opml_path is None:
+    if opml_path is None and db_path is None:
+        # Implicit feeds.opml auto-discovery is only a convenience for the
+        # no-config, no-registry case. It must not run when a caller passed
+        # db_path — this repo ships a checked-in feeds.opml, and letting
+        # auto-discovery win here would silently defeat the persistent
+        # registry (register_feed additions never surfacing) any time this
+        # ran from the repo root (Copilot P1 finding on PR #71).
         from pathlib import Path
         default_opml = Path("feeds.opml")
         if default_opml.exists():
             opml_path = str(default_opml)
 
-    engine = RSSEngine(opml_path=opml_path)
+    engine = RSSEngine(opml_path=opml_path, db_path=db_path)
     await engine._refresh_cache(feeds)
     return engine._cache
 
