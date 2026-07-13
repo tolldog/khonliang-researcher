@@ -54,21 +54,27 @@ logger = logging.getLogger(__name__)
 #   - "unable to open database file": the literal error this bug hit (a
 #     wedged/duplicate agent process contending for the file) — direct
 #     operational evidence this one is transient here.
-#   - "database is locked" / "database is busy": SQLite's own lock-contention
-#     messages, transient BY DEFINITION (another connection holds the write
-#     lock right now; it always clears once that connection finishes).
+#   - "database is locked" / "database is busy" / "database table is locked"
+#     / "database schema is locked": SQLite's own lock-contention messages,
+#     transient BY DEFINITION (another connection holds the relevant lock
+#     right now; it always clears once that connection finishes — codex P1
+#     round 4 added the table/schema-lock variants alongside the
+#     whole-database one, same category).
 # Deliberately EXCLUDED (codex P1 round 3): "disk I/O error" and "attempt to
 # write a readonly database" — both can just as easily indicate a permanent
 # environment regression (failing disk, a misconfigured permission/mount)
 # as a transient blip, and misclassifying persistent-as-transient means the
 # entry silently retries forever instead of surfacing the outage — a worse
 # failure mode than the loud crash this whole guard exists to soften. When
-# in doubt, raise loudly; only whitelist messages with a concrete, known-here
-# transient cause.
+# in doubt, raise loudly; only whitelist messages that are EITHER a known
+# lock-contention message (transient by SQLite's own definition) OR have a
+# concrete, known-here transient cause (the file-open error this bug hit).
 _TRANSIENT_SQLITE_MESSAGES = (
     "unable to open database file",
     "database is locked",
     "database is busy",
+    "database table is locked",
+    "database schema is locked",
 )
 
 

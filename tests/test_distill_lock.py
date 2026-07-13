@@ -541,6 +541,12 @@ def test_is_transient_sqlite_error_classifies_known_messages():
         sqlite3.OperationalError("database is busy")
     ) is True
     assert _is_transient_sqlite_error(
+        sqlite3.OperationalError("database table is locked")
+    ) is True
+    assert _is_transient_sqlite_error(
+        sqlite3.OperationalError("database schema is locked: knowledge")
+    ) is True
+    assert _is_transient_sqlite_error(
         sqlite3.OperationalError("no such table: knowledge")
     ) is False
     assert _is_transient_sqlite_error(
