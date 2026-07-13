@@ -203,7 +203,10 @@ def distill(ctx, entry_id, distill_all):
                             click.echo(f"  {proj}: {assess.get('score', 0):.0%}")
                 # `stuck` is orthogonal to success (codex P2 round 8) — a
                 # leaked lock can happen on the final release even after an
-                # otherwise-successful distill; don't silently hide it.
+                # otherwise-successful distill; don't silently hide it, and
+                # exit non-zero (codex P2 round 10) so a cron job / operator
+                # driving this CLI notices the condition needing manual
+                # recovery rather than reading "exit 0" as fully healthy.
                 if getattr(result, "stuck", False):
                     click.echo(
                         "\nWarning: the distill lock could not be released "
@@ -211,6 +214,7 @@ def distill(ctx, entry_id, distill_all):
                         "attempt until this process restarts.",
                         err=True,
                     )
+                    sys.exit(1)
             elif getattr(result, "skipped", False):
                 click.echo(
                     f"Distillation already in progress (held by another "
