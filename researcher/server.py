@@ -513,6 +513,10 @@ Most tools accept detail="compact|brief|full":
             return (f"Distillation already in progress for {entry_id} "
                     f"(held by another drainer): {result.title}")
         if getattr(result, "errored", False):
+            if getattr(result, "stuck", False):
+                return (f"Distillation hit a transient DB error for {entry_id} "
+                        f"and the distill lock itself is stuck — needs a "
+                        f"process restart to recover, not just a retry.")
             return (f"Distillation hit a transient DB error for {entry_id} "
                     f"— left pending, retry shortly.")
         if not result.success:

@@ -88,7 +88,18 @@ class DistillWorker(BaseQueueWorker):
             # 706df96b) — the entry's status was left untouched (not FAILED),
             # so treat this the same as a live-lock skip: don't burn a retry,
             # just come back around next drain cycle once the DB recovers.
-            logger.info("  SKIPPED (transient DB error): %s", entry.title[:60])
+            # ``stuck`` (codex P2 round 5) means the lock itself couldn't be
+            # released either — get_next()'s live-lock filter will keep
+            # skipping this entry until THIS PROCESS restarts, not just until
+            # the DB recovers, so log that distinctly (still SKIP either way:
+            # the live-lock check makes the outcome the same from the
+            # worker's perspective, but ops/monitoring needs the distinction).
+            if getattr(result, "stuck", False):
+                logger.error(
+                    "  STUCK (lock leaked, needs process restart): %s", entry.title[:60]
+                )
+            else:
+                logger.info("  SKIPPED (transient DB error): %s", entry.title[:60])
             return SKIP
         if result.success:
             triples = len(result.triples) if result.triples else 0

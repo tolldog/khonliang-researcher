@@ -202,11 +202,19 @@ def distill(ctx, entry_id, distill_all):
                     f"drainer): {result.title}"
                 )
             elif getattr(result, "errored", False):
-                click.echo(
-                    f"Distillation hit a transient DB error and was left "
-                    f"pending for retry: {result.title}",
-                    err=True,
-                )
+                if getattr(result, "stuck", False):
+                    click.echo(
+                        f"Distillation hit a transient DB error AND the "
+                        f"distill lock is stuck — needs a process restart, "
+                        f"not just a retry: {result.title}",
+                        err=True,
+                    )
+                else:
+                    click.echo(
+                        f"Distillation hit a transient DB error and was left "
+                        f"pending for retry: {result.title}",
+                        err=True,
+                    )
                 sys.exit(1)
             else:
                 click.echo(f"Distillation failed: {result.title}", err=True)

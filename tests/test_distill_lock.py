@@ -8,6 +8,7 @@ recycled PID (new start time) isn't mistaken for the original.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -414,10 +415,100 @@ async def test_distill_processing_flip_failure_releases_lock_and_is_graceful(tmp
     assert result.errored is True
     assert result.success is False
     assert result.skipped is False
+    assert result.stuck is False  # release succeeded — not the compounded-failure case
     # Lock claimed then released — not leaked/stuck to this still-live process.
     assert pipeline.locks.is_locked_live("p1") is False
     # Status was never durably flipped away from INGESTED — still retryable.
     assert pipeline.knowledge.get("p1").status == EntryStatus.INGESTED
+
+
+@pytest.mark.asyncio
+async def test_distill_processing_flip_and_release_both_fail_reports_stuck(
+    tmp_path, monkeypatch
+):
+    # codex P2 round 5: the compounded-failure case (PROCESSING flip AND the
+    # subsequent release both hit a transient DB outage) must report
+    # stuck=True, not just errored=True — the lock is genuinely leaked to
+    # this still-live process, not "will retry soon" like a plain errored.
+    monkeypatch.setattr("researcher.pipeline.asyncio.sleep", _fast_sleep)
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def flaky_set_status(entry_id, status):
+        if status == EntryStatus.PROCESSING:
+            raise sqlite3.OperationalError("unable to open database file")
+        raise AssertionError("should not reach a non-PROCESSING set_status")
+    pipeline.knowledge.set_status = flaky_set_status
+
+    def boom_release(entry_id):
+        raise sqlite3.OperationalError("database is locked")
+    pipeline.locks.release = boom_release
+
+    result = await pipeline.distill("p1")  # must not raise
+
+    assert result.errored is True
+    assert result.stuck is True
+    assert pipeline.locks.is_locked_live("p1") is True  # genuinely still held
+
+
+@pytest.mark.asyncio
+async def test_safe_release_lock_cancellation_during_backoff_still_releases(tmp_path):
+    # codex P2 round 5: a cancellation arriving mid-backoff (e.g. process
+    # shutdown) must not skip an already-due release retry — make one
+    # best-effort synchronous attempt before letting the cancellation win.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.locks.claim("p1")
+
+    real_release = pipeline.locks.release
+    calls = {"n": 0}
+    def flaky_release(entry_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_release(entry_id)
+    pipeline.locks.release = flaky_release
+
+    async def cancel_immediately(_seconds):
+        raise asyncio.CancelledError()
+    import researcher.pipeline as pipeline_module
+    orig_sleep = pipeline_module.asyncio.sleep
+    pipeline_module.asyncio.sleep = cancel_immediately
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await pipeline._safe_release_lock("p1")
+    finally:
+        pipeline_module.asyncio.sleep = orig_sleep
+
+    assert calls["n"] == 2  # the best-effort retry ran despite the cancellation
+    assert pipeline.locks.is_locked_live("p1") is False  # actually released
+
+
+@pytest.mark.asyncio
+async def test_worker_process_item_logs_stuck_distinctly(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr("researcher.pipeline.asyncio.sleep", _fast_sleep)
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def boom_claim(entry_id):
+        raise sqlite3.OperationalError("unable to open database file")
+    pipeline.locks.claim = boom_claim
+
+    async def not_irrelevant(entry_id):
+        return False
+    pipeline.filter_irrelevant = not_irrelevant
+    worker = DistillWorker(pipeline)
+
+    from khonliang_researcher.worker import SKIP
+    # claim() itself fails (not the PROCESSING-flip path), so no lock is ever
+    # claimed and result.stuck stays False — assert the plain (non-stuck)
+    # log path fires, distinctly from the stuck-lock error log.
+    with caplog.at_level(logging.INFO):
+        ok = await worker.process_item(pipeline.knowledge.get("p1"))
+
+    assert ok is SKIP
+    assert any("transient DB error" in rec.message for rec in caplog.records)
+    assert not any(rec.levelno >= logging.ERROR for rec in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -442,6 +533,7 @@ async def test_distill_lock_release_failure_does_not_mask_success_result(
         result = await pipeline.distill("p1")  # must not raise
 
     assert result.success is True
+    assert result.stuck is True  # success can co-occur with a leaked lock
     assert pipeline.knowledge.get("p1").status == EntryStatus.DISTILLED
     assert any("STUCK LOCK" in rec.message for rec in caplog.records)
 

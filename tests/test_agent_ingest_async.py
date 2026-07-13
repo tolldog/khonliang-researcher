@@ -857,7 +857,7 @@ async def test_distill_paper_async_happy_path_reaches_done_with_result():
     # Compact result: counts, not the full triple/assessment payloads.
     assert status["result"] == {
         "entry_id": "e1", "title": "A Paper", "success": True, "skipped": False,
-        "errored": False, "triples": 2, "assessments": 1,
+        "errored": False, "stuck": False, "triples": 2, "assessments": 1,
     }
     phases = [h["phase"] for h in status["history"]]
     assert phases[0] == "started"

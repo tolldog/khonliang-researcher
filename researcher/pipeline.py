@@ -105,6 +105,17 @@ class DistillResult:
     # falling out of automatic retry the way a FAILED status would
     # (bug_khonliang-researcher_706df96b).
     errored: bool = False
+    # True when the distill lock itself could not be released (release()
+    # exhausted its transient-failure retries) — the lock row is still held
+    # by this (still-live) process, so the entry will be skipped by every
+    # live-lock check until this process restarts. Usually accompanies
+    # ``errored=True`` (the PROCESSING-flip failure path), but can also occur
+    # on an otherwise-successful distill if only the final release fails —
+    # ``success``/``errored`` describe whether distillation itself worked;
+    # ``stuck`` is an orthogonal signal about lock hygiene, so a caller/
+    # monitor can tell "will retry soon" from "needs a process restart to
+    # recover" (codex P2 round 5, 706df96b).
+    stuck: bool = False
 
 
 def is_paper_entry(entry: KnowledgeEntry) -> bool:
@@ -750,9 +761,15 @@ class ResearchPipeline:
 
     async def _safe_release_lock(
         self, entry_id: str, retries: int = 3, backoff_s: float = 0.2
-    ) -> None:
+    ) -> bool:
         """Release the distill lock, retrying a transient DB outage before
         giving up — and logging loudly + distinctly if every attempt fails.
+
+        Returns True once the lock is confirmed no longer held by us, False
+        if every retry was exhausted and it's still stuck (codex P2 round 5)
+        — callers use this to set ``DistillResult.stuck`` so a caller/monitor
+        can tell "will retry soon" from "needs a process restart to recover",
+        rather than reporting a leaked lock as an ordinary retryable outcome.
 
         An unguarded ``release()`` raising here would mask whatever result
         ``distill()`` already computed (success, FAILED, or the pre-LLM
@@ -774,12 +791,21 @@ class ResearchPipeline:
         (e.g. a genuine schema bug) is not retried — it's re-raised
         immediately (codex P1 round 2) so it surfaces loudly instead of
         masquerading as a stuck-but-benign lock.
+
+        If cancelled while backing off (e.g. process shutdown mid-retry —
+        codex P2 round 5), the backoff sleep's ``CancelledError`` would
+        otherwise propagate straight out of this coroutine (and out of
+        ``distill()``'s ``finally``) before ever attempting the lock delete
+        again, stranding it needlessly. Make one best-effort synchronous
+        release attempt first, then let the cancellation propagate as normal
+        — this coroutine must still honor cancellation, just not at the cost
+        of skipping an already-due retry that was right there.
         """
         last_exc: Optional[Exception] = None
         for attempt in range(retries):
             try:
                 self.locks.release(entry_id)
-                return
+                return True
             except sqlite3.OperationalError as exc:
                 if not _is_transient_sqlite_error(exc):
                     logger.error(
@@ -790,7 +816,18 @@ class ResearchPipeline:
                     raise
                 last_exc = exc
                 if attempt < retries - 1:
-                    await asyncio.sleep(backoff_s)
+                    try:
+                        await asyncio.sleep(backoff_s)
+                    except asyncio.CancelledError:
+                        # Never swallow CancelledError — that would break
+                        # task-cancellation semantics. Best-effort release
+                        # attempt, then always propagate the cancellation
+                        # regardless of whether the release succeeded.
+                        try:
+                            self.locks.release(entry_id)
+                        except Exception:
+                            pass
+                        raise
         logger.error(
             "distill: STUCK LOCK for %s — lock release failed %d/%d attempts; "
             "this paper's distill lock is now held by a still-live owner and "
@@ -798,6 +835,7 @@ class ResearchPipeline:
             "restarts (codex P1, bug 706df96b): %s",
             entry_id, retries, retries, last_exc,
         )
+        return False
 
     async def distill(self, entry_id: str) -> DistillResult:
         """Run full distillation pipeline on a stored paper.
@@ -862,8 +900,9 @@ class ResearchPipeline:
                 await self._safe_release_lock(entry_id)
                 raise
             logger.warning("distill: PROCESSING flip failed for %s", entry_id, exc_info=True)
-            await self._safe_release_lock(entry_id)
+            released = await self._safe_release_lock(entry_id)
             result.errored = True
+            result.stuck = not released
             return result
 
         try:
@@ -918,7 +957,12 @@ class ResearchPipeline:
             self.knowledge.set_status(entry_id, EntryStatus.FAILED)
             return result
         finally:
-            await self._safe_release_lock(entry_id)
+            # Runs before the enclosing return actually hands control back, so
+            # mutating ``result`` here is visible on both the success path
+            # (falls through below) and the FAILED path (``return result``
+            # above already holds this same object by reference).
+            if not await self._safe_release_lock(entry_id):
+                result.stuck = True
 
         # Past here the entry is persisted + DISTILLED and the lock is released.
         # Recording the relevance signal is best-effort telemetry — a failure

@@ -1343,6 +1343,10 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 # errored == a transient DB-open failure in distill()'s pre-LLM
                 # window; the entry was left retryable (not FAILED) — bug 706df96b.
                 "errored": getattr(result, "errored", False),
+                # stuck == the distill lock itself couldn't be released either;
+                # needs a process restart to clear, not just a retry — bug
+                # 706df96b codex P2 round 5.
+                "stuck": getattr(result, "stuck", False),
                 "triples": len(result.triples),
                 "assessments": len(result.assessments),
             }
