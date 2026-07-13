@@ -53,7 +53,16 @@ logger = logging.getLogger(__name__)
 # SQLite message. Two categories only:
 #   - "unable to open database file": the literal error this bug hit (a
 #     wedged/duplicate agent process contending for the file) — direct
-#     operational evidence this one is transient here.
+#     operational evidence this one is transient here. Trustworthy as
+#     transient-in-practice (not just "usually"): ``create_pipeline()`` now
+#     validates ``db_path`` is actually openable at boot (a real
+#     open-then-close connection, not just an ``os.access`` check) and
+#     raises loudly if it isn't (codex round 6, bug 706df96b) — so a
+#     misconfigured path (bad path, missing directory, broken permissions)
+#     fails immediately at process startup instead of ever reaching this
+#     message mid-``distill()``. Any occurrence of this message here,
+#     after boot, is therefore a real runtime hiccup on a path already
+#     proven to work, not a masked misconfiguration.
 #   - "database is locked" / "database is busy" / "database table is locked"
 #     / "database schema is locked": SQLite's own lock-contention messages,
 #     transient BY DEFINITION (another connection holds the relevant lock
@@ -3298,6 +3307,33 @@ def create_pipeline(config_path: str = "config.yaml") -> ResearchPipeline:
     if not Path(db_path).is_absolute():
         db_path = str(config_dir / db_path)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Fail loudly HERE if db_path is misconfigured (bad path, missing
+    # directory that couldn't be created, broken filesystem permissions)
+    # rather than deferring discovery to whenever some code path first
+    # happens to touch the DB. That deferred discovery is exactly what made
+    # a genuine misconfiguration indistinguishable from a transient
+    # "unable to open database file" outage inside distill()'s pre-LLM
+    # guards (codex round 6, bug 706df96b): those guards trust that message
+    # as transient-in-practice specifically BECAUSE a bad db_path would
+    # already have failed here, at boot, instead of surfacing later.
+    # Open-then-close a real connection so sqlite3's own error surfaces
+    # directly, rather than reimplementing its file-open logic with
+    # os.access (which can't catch every way a path can be unusable — e.g.
+    # a component of the path being a file, not a directory).
+    try:
+        _boot_conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            _boot_conn.execute("SELECT 1")
+        finally:
+            _boot_conn.close()
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            f"create_pipeline: db_path {db_path!r} is not usable at "
+            f"startup ({exc}) — check the path, its parent directory, "
+            f"and filesystem permissions before retrying."
+        ) from exc
+
     # Write resolved path back so ResearchPipeline (and any downstream
     # consumer that reads config["db_path"]) sees the absolute version.
     config["db_path"] = db_path

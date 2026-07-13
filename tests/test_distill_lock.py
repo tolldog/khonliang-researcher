@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -659,6 +660,57 @@ def test_is_transient_sqlite_error_excludes_ambiguous_environment_messages():
     assert _is_transient_sqlite_error(
         sqlite3.OperationalError("attempt to write a readonly database")
     ) is False
+
+
+# --------------------------------- create_pipeline() boot-time db_path guard (round 7) ----
+#
+# codex round 6 P1: "unable to open database file" is whitelisted as
+# transient in _is_transient_sqlite_error, but that same message ALSO covers
+# a genuine misconfiguration (bad db_path, missing directory, broken
+# permissions) — a message-text heuristic alone can't tell those apart.
+# Resolved via a boot-time guard instead of further message-classification:
+# create_pipeline() now validates db_path is actually openable right after
+# resolving it to absolute, and raises loudly if not, so a bad config fails
+# at process startup rather than ever reaching distill()'s pre-LLM guards
+# disguised as a transient outage.
+
+def test_create_pipeline_raises_loudly_on_unopenable_db_path(tmp_path):
+    # A directory with no write permission: mkdir(parents=True,
+    # exist_ok=True) is a no-op (it already exists as a directory, so
+    # exist_ok short-circuits before any permission check), but sqlite3
+    # then can't create the actual db file inside it — this is exactly the
+    # class of misconfiguration (broken filesystem permissions) the boot
+    # guard exists to catch instead of deferring to a later, ambiguous
+    # mid-distill failure.
+    readonly_dir = tmp_path / "readonly"
+    readonly_dir.mkdir()
+    readonly_dir.chmod(0o555)  # read + execute, no write
+    bad_db_path = str(readonly_dir / "researcher.db")
+
+    config = {"db_path": bad_db_path, "models": {}, "projects": {}}
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+
+    try:
+        with pytest.raises(RuntimeError, match="not usable at startup"):
+            create_pipeline(str(config_path))
+    finally:
+        readonly_dir.chmod(0o755)  # restore so tmp_path cleanup can remove it
+
+
+def test_create_pipeline_succeeds_with_a_valid_db_path(tmp_path):
+    # Sanity check the guard doesn't false-positive on an ordinary, valid
+    # (fresh, not-yet-existing) db_path — the common case must keep working.
+    config = {
+        "db_path": str(tmp_path / "fresh" / "researcher.db"),
+        "models": {}, "projects": {},
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+
+    pipeline = create_pipeline(str(config_path))  # must not raise
+
+    assert Path(pipeline.config["db_path"]).exists()
 
 
 @pytest.mark.asyncio
