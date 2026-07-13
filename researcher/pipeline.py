@@ -42,6 +42,29 @@ from researcher.self_catalog import build_self_catalog, idea_index_record, paper
 
 logger = logging.getLogger(__name__)
 
+# Substrings of sqlite3.OperationalError messages that indicate a transient
+# DB-unavailable condition (can't open the file, it's locked, a disk hiccup)
+# as opposed to a persistent bug (missing table/column, malformed SQL, a
+# corrupt file) — sqlite3.OperationalError is raised for BOTH categories, so
+# catching the exception TYPE alone (codex P1 round 1, bug 706df96b) would
+# still swallow a real programming error into the retryable ``errored`` path
+# forever. There's no finer-grained exception type to distinguish these, so
+# this matches on the known transient message set; anything else re-raises.
+_TRANSIENT_SQLITE_MESSAGES = (
+    "unable to open database file",
+    "database is locked",
+    "disk i/o error",
+    "attempt to write a readonly database",
+    "database is busy",
+)
+
+
+def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    """True iff ``exc`` looks like a transient DB-unavailable condition
+    rather than a persistent schema/query bug (codex P1 round 2, 706df96b)."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_SQLITE_MESSAGES)
+
 
 @dataclass
 class DistillResult:
@@ -728,7 +751,10 @@ class ResearchPipeline:
         (transient DB-open failure) usually clears within milliseconds. If
         every attempt fails, log at ERROR with a "STUCK LOCK" marker so this
         specific unrecoverable state is grep/alert-distinguishable from the
-        normal "pending, will retry" case.
+        normal "pending, will retry" case. A NON-transient ``OperationalError``
+        (e.g. a genuine schema bug) is not retried — it's re-raised
+        immediately (codex P1 round 2) so it surfaces loudly instead of
+        masquerading as a stuck-but-benign lock.
         """
         last_exc: Optional[Exception] = None
         for attempt in range(retries):
@@ -736,6 +762,13 @@ class ResearchPipeline:
                 self.locks.release(entry_id)
                 return
             except sqlite3.OperationalError as exc:
+                if not _is_transient_sqlite_error(exc):
+                    logger.error(
+                        "distill: lock release for %s hit a NON-transient DB "
+                        "error — raising rather than retrying: %s",
+                        entry_id, exc,
+                    )
+                    raise
                 last_exc = exc
                 if attempt < retries - 1:
                     await asyncio.sleep(backoff_s)
@@ -762,16 +795,19 @@ class ResearchPipeline:
         # status untouched (normally still INGESTED) so the next drain cycle
         # naturally retries once the transient condition clears.
         #
-        # Narrowly ``sqlite3.OperationalError`` (codex P2, bug 706df96b), not
-        # bare ``Exception``: this path is specifically for a transient
-        # DB-unavailable condition (the wedged/duplicate-agent case this bug
-        # traced to). A genuine programming bug — a schema mismatch, a bad
-        # query, anything that ISN'T "the DB was briefly unopenable" — must
-        # keep propagating and surfacing loudly instead of being silently
+        # Narrowly ``sqlite3.OperationalError`` (codex P2 round 1, bug
+        # 706df96b), not bare ``Exception`` — but ``OperationalError`` ITSELF
+        # covers both transient conditions (can't open/lock the file) and
+        # persistent bugs (missing table/column, malformed SQL), so also
+        # check ``_is_transient_sqlite_error`` and re-raise anything that
+        # isn't (codex P1 round 2). A genuine programming bug must keep
+        # propagating and surfacing loudly instead of being silently
         # converted into an infinite skip-and-retry.
         try:
             entry = self.knowledge.get(entry_id)
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_sqlite_error(exc):
+                raise
             logger.warning("distill: entry lookup failed for %s", entry_id, exc_info=True)
             return DistillResult(entry_id=entry_id, title="ERROR", errored=True)
         if not entry:
@@ -783,7 +819,9 @@ class ResearchPipeline:
         # is on this paper — skip rather than double-distill (bug abfe679b).
         try:
             claimed = self.locks.claim(entry_id)
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_sqlite_error(exc):
+                raise
             logger.warning("distill: lock claim failed for %s", entry_id, exc_info=True)
             result.errored = True
             return result
@@ -800,7 +838,10 @@ class ResearchPipeline:
 
         try:
             self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_sqlite_error(exc):
+                await self._safe_release_lock(entry_id)
+                raise
             logger.warning("distill: PROCESSING flip failed for %s", entry_id, exc_info=True)
             await self._safe_release_lock(entry_id)
             result.errored = True

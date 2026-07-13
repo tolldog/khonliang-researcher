@@ -520,6 +520,95 @@ async def test_distill_processing_flip_non_sqlite_error_propagates(tmp_path):
     # here beyond "don't misreport it as errored/retryable".
 
 
+# ---------------------------------- non-transient OperationalError (codex P1 round 2) ----
+#
+# sqlite3.OperationalError is raised for BOTH "can't open/lock the DB right
+# now" (transient) AND "no such table" / malformed SQL (a persistent bug) —
+# matching on exception type alone still swallows a real bug into the
+# retryable errored path forever. These confirm a non-transient
+# OperationalError (e.g. a schema problem) propagates uncaught, same as any
+# other genuine programming error, rather than being treated as retryable.
+
+def test_is_transient_sqlite_error_classifies_known_messages():
+    from researcher.pipeline import _is_transient_sqlite_error
+    assert _is_transient_sqlite_error(
+        sqlite3.OperationalError("unable to open database file")
+    ) is True
+    assert _is_transient_sqlite_error(
+        sqlite3.OperationalError("database is locked")
+    ) is True
+    assert _is_transient_sqlite_error(
+        sqlite3.OperationalError("no such table: knowledge")
+    ) is False
+    assert _is_transient_sqlite_error(
+        sqlite3.OperationalError("near \"SELCT\": syntax error")
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_distill_entry_lookup_non_transient_operational_error_propagates(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def boom_get(entry_id):
+        raise sqlite3.OperationalError("no such table: knowledge")
+    pipeline.knowledge.get = boom_get
+
+    with pytest.raises(sqlite3.OperationalError):
+        await pipeline.distill("p1")
+
+
+@pytest.mark.asyncio
+async def test_distill_lock_claim_non_transient_operational_error_propagates(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def boom_claim(entry_id):
+        raise sqlite3.OperationalError("no such table: distill_locks")
+    pipeline.locks.claim = boom_claim
+
+    with pytest.raises(sqlite3.OperationalError):
+        await pipeline.distill("p1")
+
+
+@pytest.mark.asyncio
+async def test_distill_processing_flip_non_transient_operational_error_propagates_and_releases(
+    tmp_path,
+):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    real_set_status = pipeline.knowledge.set_status
+    def flaky_set_status(entry_id, status):
+        if status == EntryStatus.PROCESSING:
+            raise sqlite3.OperationalError("no such column: bogus")
+        return real_set_status(entry_id, status)
+    pipeline.knowledge.set_status = flaky_set_status
+
+    with pytest.raises(sqlite3.OperationalError):
+        await pipeline.distill("p1")
+    # Even on the non-transient (crash) path, the successfully-claimed lock
+    # is released rather than leaked.
+    assert pipeline.locks.is_locked_live("p1") is False
+
+
+@pytest.mark.asyncio
+async def test_safe_release_lock_non_transient_error_raises_immediately_no_retry(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.locks.claim("p1")
+
+    calls = {"n": 0}
+    def boom_release(entry_id):
+        calls["n"] += 1
+        raise sqlite3.OperationalError("no such table: distill_locks")
+    pipeline.locks.release = boom_release
+
+    with pytest.raises(sqlite3.OperationalError):
+        await pipeline._safe_release_lock("p1")
+    assert calls["n"] == 1  # no retry for a non-transient error
+
+
 @pytest.mark.asyncio
 async def test_worker_process_item_treats_errored_as_skip_not_failure(tmp_path):
     # An errored (transient DB) outcome must not burn the worker's retry
