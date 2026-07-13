@@ -538,10 +538,27 @@ def test_is_transient_sqlite_error_classifies_known_messages():
         sqlite3.OperationalError("database is locked")
     ) is True
     assert _is_transient_sqlite_error(
+        sqlite3.OperationalError("database is busy")
+    ) is True
+    assert _is_transient_sqlite_error(
         sqlite3.OperationalError("no such table: knowledge")
     ) is False
     assert _is_transient_sqlite_error(
         sqlite3.OperationalError("near \"SELCT\": syntax error")
+    ) is False
+
+
+def test_is_transient_sqlite_error_excludes_ambiguous_environment_messages():
+    # codex P1 round 3: "disk I/O error" and "readonly database" can just as
+    # easily be a permanent regression (failing disk, misconfigured
+    # permissions/mount) as a transient blip — deliberately NOT whitelisted,
+    # so they raise loudly rather than risk a silent forever-retry stall.
+    from researcher.pipeline import _is_transient_sqlite_error
+    assert _is_transient_sqlite_error(
+        sqlite3.OperationalError("disk I/O error")
+    ) is False
+    assert _is_transient_sqlite_error(
+        sqlite3.OperationalError("attempt to write a readonly database")
     ) is False
 
 

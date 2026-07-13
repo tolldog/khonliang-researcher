@@ -43,18 +43,31 @@ from researcher.self_catalog import build_self_catalog, idea_index_record, paper
 logger = logging.getLogger(__name__)
 
 # Substrings of sqlite3.OperationalError messages that indicate a transient
-# DB-unavailable condition (can't open the file, it's locked, a disk hiccup)
-# as opposed to a persistent bug (missing table/column, malformed SQL, a
-# corrupt file) — sqlite3.OperationalError is raised for BOTH categories, so
-# catching the exception TYPE alone (codex P1 round 1, bug 706df96b) would
-# still swallow a real programming error into the retryable ``errored`` path
-# forever. There's no finer-grained exception type to distinguish these, so
-# this matches on the known transient message set; anything else re-raises.
+# DB-unavailable condition, as opposed to a persistent bug (missing
+# table/column, malformed SQL, a corrupt file) — sqlite3.OperationalError is
+# raised for BOTH categories, so catching the exception TYPE alone (codex P1
+# round 1, bug 706df96b) would still swallow a real programming error into
+# the retryable ``errored`` path forever. There's no finer-grained exception
+# type to distinguish these, so this matches on message text instead —
+# deliberately a SHORT, conservative list, not every plausibly-transient
+# SQLite message. Two categories only:
+#   - "unable to open database file": the literal error this bug hit (a
+#     wedged/duplicate agent process contending for the file) — direct
+#     operational evidence this one is transient here.
+#   - "database is locked" / "database is busy": SQLite's own lock-contention
+#     messages, transient BY DEFINITION (another connection holds the write
+#     lock right now; it always clears once that connection finishes).
+# Deliberately EXCLUDED (codex P1 round 3): "disk I/O error" and "attempt to
+# write a readonly database" — both can just as easily indicate a permanent
+# environment regression (failing disk, a misconfigured permission/mount)
+# as a transient blip, and misclassifying persistent-as-transient means the
+# entry silently retries forever instead of surfacing the outage — a worse
+# failure mode than the loud crash this whole guard exists to soften. When
+# in doubt, raise loudly; only whitelist messages with a concrete, known-here
+# transient cause.
 _TRANSIENT_SQLITE_MESSAGES = (
     "unable to open database file",
     "database is locked",
-    "disk i/o error",
-    "attempt to write a readonly database",
     "database is busy",
 )
 
