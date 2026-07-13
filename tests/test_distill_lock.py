@@ -21,6 +21,7 @@ from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
 
 from researcher.distill_lock import DistillLockStore, owner_token_for
 from researcher.pipeline import create_pipeline
+from researcher.server import create_research_server
 from researcher.worker import DistillWorker
 
 # A token whose PID is not running (well above any live pid) -> owner is "dead".
@@ -744,3 +745,24 @@ async def test_worker_process_item_treats_errored_as_skip_not_failure(tmp_path):
     ok = await worker.process_item(pipeline.knowledge.get("p1"))
 
     assert ok is SKIP
+
+
+@pytest.mark.asyncio
+async def test_distill_pending_mcp_tool_reports_errored_distinctly_from_failed(tmp_path):
+    # codex P2 round 6: distill_pending() (the MCP batch tool) only
+    # special-cased `skipped`, so a transient DB outage was misreported as
+    # a terminal "FAILED" in batch mode even though distill_paper's
+    # single-entry tool already distinguished it via `errored`.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def boom_claim(entry_id):
+        raise sqlite3.OperationalError("unable to open database file")
+    pipeline.locks.claim = boom_claim
+
+    mcp = create_research_server(pipeline)
+    result = await mcp.call_tool("distill_pending", {})
+    text = result[-1]["result"]
+
+    assert "[error]" in text
+    assert "FAILED" not in text

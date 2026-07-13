@@ -573,6 +573,13 @@ Most tools accept detail="compact|brief|full":
         for r in results:
             if getattr(r, "skipped", False):
                 status = "skip"  # held by another drainer, not a failure
+            elif getattr(r, "errored", False):
+                # A transient DB outage in the pre-LLM window, not a content
+                # failure — reporting it as FAILED here (while distill_paper's
+                # single-entry tool distinguishes it) would misrepresent an
+                # infra hiccup as terminal in batch mode (codex P2 round 6,
+                # bug 706df96b).
+                status = "stuck" if getattr(r, "stuck", False) else "error"
             elif r.success:
                 status = "ok"
             else:
