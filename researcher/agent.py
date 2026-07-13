@@ -1340,6 +1340,9 @@ def _extend_with_native_handlers(agent: BaseAgent, pipeline) -> None:
                 # skipped == another drainer is already distilling this paper; a
                 # distinct, non-error outcome (not a failure) — bug abfe679b.
                 "skipped": getattr(result, "skipped", False),
+                # errored == a transient DB-open failure in distill()'s pre-LLM
+                # window; the entry was left retryable (not FAILED) — bug 706df96b.
+                "errored": getattr(result, "errored", False),
                 "triples": len(result.triples),
                 "assessments": len(result.assessments),
             }

@@ -54,6 +54,15 @@ class DistillResult:
     # True when distill was a no-op because a live owner already holds the lock
     # — a skip, NOT a failure (must not count against a worker's retry budget).
     skipped: bool = False
+    # True when a DB error hit the pre-LLM window (entry lookup / lock claim /
+    # PROCESSING flip) — a transient infra failure, NOT a content failure.
+    # Distinct from ``skipped`` (another live owner) and from an ordinary
+    # ``success=False`` (LLM/content failure, entry marked FAILED): the entry's
+    # status is left untouched (usually still INGESTED) so the embedded worker's
+    # normal INGESTED-status scan retries it on its own, rather than silently
+    # falling out of automatic retry the way a FAILED status would
+    # (bug_khonliang-researcher_706df96b).
+    errored: bool = False
 
 
 def is_paper_entry(entry: KnowledgeEntry) -> bool:
@@ -697,13 +706,43 @@ class ResearchPipeline:
     # Distillation
     # ------------------------------------------------------------------
 
+    def _safe_release_lock(self, entry_id: str) -> None:
+        """Release the distill lock, tolerating a transient DB-open failure.
+
+        An unguarded ``release()`` raising here would mask whatever result
+        ``distill()`` already computed (success, FAILED, or the pre-LLM
+        errored path) by propagating instead of returning it. Worst case a
+        release that fails here leaves the lock claimed by this (still-live)
+        process — harmless: it just makes the next distill attempt on this
+        entry report ``skipped`` instead of retrying, and is reclaimed the
+        moment this process exits (bug abfe679b's dead-owner reclaim).
+        """
+        try:
+            self.locks.release(entry_id)
+        except Exception:
+            logger.warning(
+                "distill: lock release failed for %s (non-fatal)", entry_id, exc_info=True
+            )
+
     async def distill(self, entry_id: str) -> DistillResult:
         """Run full distillation pipeline on a stored paper.
 
         Step 1: Summarize (7B model, sequential — needs raw paper)
         Step 2: Extract + Assess in parallel (3B model — both use summary)
         """
-        entry = self.knowledge.get(entry_id)
+        # Pre-LLM DB window (entry lookup, lock claim, PROCESSING flip): guard
+        # each step individually. A transient DB-open failure here must not
+        # propagate uncaught (that surfaced as an unhandled OperationalError
+        # crashing the ingest job at phase=error — bug 706df96b) and must not
+        # burn the entry to FAILED, since FAILED entries fall out of the
+        # embedded worker's INGESTED-status scan and stop being retried. Leave
+        # status untouched (normally still INGESTED) so the next drain cycle
+        # naturally retries once the transient condition clears.
+        try:
+            entry = self.knowledge.get(entry_id)
+        except Exception:
+            logger.warning("distill: entry lookup failed for %s", entry_id, exc_info=True)
+            return DistillResult(entry_id=entry_id, title="ERROR", errored=True)
         if not entry:
             return DistillResult(entry_id=entry_id, title="NOT FOUND")
 
@@ -711,7 +750,14 @@ class ResearchPipeline:
 
         # Take the distill lock. If a LIVE owner already holds it, another drainer
         # is on this paper — skip rather than double-distill (bug abfe679b).
-        if not self.locks.claim(entry_id):
+        try:
+            claimed = self.locks.claim(entry_id)
+        except Exception:
+            logger.warning("distill: lock claim failed for %s", entry_id, exc_info=True)
+            result.errored = True
+            return result
+
+        if not claimed:
             logger.info("Distill skipped for %s — held by a live owner", entry_id)
             # A skip is NOT a successful distill (no summary/triples produced) and
             # NOT a failure. success stays False so distilled-counters
@@ -721,7 +767,14 @@ class ResearchPipeline:
             result.skipped = True
             return result
 
-        self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)
+        try:
+            self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)
+        except Exception:
+            logger.warning("distill: PROCESSING flip failed for %s", entry_id, exc_info=True)
+            self._safe_release_lock(entry_id)
+            result.errored = True
+            return result
+
         try:
             # Step 1: Summarize (must complete before extraction/assessment)
             summary_resp = await self.summarizer.handle(entry.content)
@@ -774,7 +827,7 @@ class ResearchPipeline:
             self.knowledge.set_status(entry_id, EntryStatus.FAILED)
             return result
         finally:
-            self.locks.release(entry_id)
+            self._safe_release_lock(entry_id)
 
         # Past here the entry is persisted + DISTILLED and the lock is released.
         # Recording the relevance signal is best-effort telemetry — a failure

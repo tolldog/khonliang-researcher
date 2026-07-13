@@ -83,6 +83,13 @@ class DistillWorker(BaseQueueWorker):
             # finish or be recovered on that owner's crash (abfe679b).
             logger.info("  SKIPPED (locked by another drainer): %s", entry.title[:60])
             return SKIP
+        if getattr(result, "errored", False):
+            # A transient DB-open error in distill()'s pre-LLM window (bug
+            # 706df96b) — the entry's status was left untouched (not FAILED),
+            # so treat this the same as a live-lock skip: don't burn a retry,
+            # just come back around next drain cycle once the DB recovers.
+            logger.info("  SKIPPED (transient DB error): %s", entry.title[:60])
+            return SKIP
         if result.success:
             triples = len(result.triples) if result.triples else 0
             logger.info(

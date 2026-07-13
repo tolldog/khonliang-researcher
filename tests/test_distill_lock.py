@@ -343,3 +343,112 @@ async def test_distill_success_survives_digest_failure(tmp_path):
 
     assert result.success is True
     assert pipeline.knowledge.get("p1").status == EntryStatus.DISTILLED
+
+
+# ---------------------------------------------- pre-LLM DB window (706df96b) ----
+#
+# bug_khonliang-researcher_706df96b: distill_paper crashed instantly with
+# "OperationalError: unable to open database file" — an unhandled DB error in
+# the pre-LLM window (entry lookup / lock claim / PROCESSING flip) propagated
+# uncaught, crashing the ingest job at phase=error before any LLM call. These
+# guard each step so a transient DB-open failure there becomes a graceful,
+# retryable ``result.errored=True`` instead of an uncaught exception, and never
+# burns the entry to FAILED (which would fall out of the worker's INGESTED scan
+# and stop being retried).
+
+@pytest.mark.asyncio
+async def test_distill_entry_lookup_failure_is_graceful_not_raised(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def boom_get(entry_id):
+        raise sqlite3.OperationalError("unable to open database file")
+    pipeline.knowledge.get = boom_get
+
+    result = await pipeline.distill("p1")  # must not raise
+
+    assert result.errored is True
+    assert result.success is False
+    assert result.skipped is False
+
+
+@pytest.mark.asyncio
+async def test_distill_lock_claim_failure_is_graceful_not_raised(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def boom_claim(entry_id):
+        raise sqlite3.OperationalError("unable to open database file")
+    pipeline.locks.claim = boom_claim
+
+    result = await pipeline.distill("p1")  # must not raise
+
+    assert result.errored is True
+    assert result.success is False
+    assert result.skipped is False
+    # Entry status untouched — still retryable by the next drain cycle.
+    assert pipeline.knowledge.get("p1").status == EntryStatus.INGESTED
+
+
+@pytest.mark.asyncio
+async def test_distill_processing_flip_failure_releases_lock_and_is_graceful(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    real_set_status = pipeline.knowledge.set_status
+    def flaky_set_status(entry_id, status):
+        if status == EntryStatus.PROCESSING:
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_set_status(entry_id, status)
+    pipeline.knowledge.set_status = flaky_set_status
+
+    result = await pipeline.distill("p1")  # must not raise
+
+    assert result.errored is True
+    assert result.success is False
+    assert result.skipped is False
+    # Lock claimed then released — not leaked/stuck to this still-live process.
+    assert pipeline.locks.is_locked_live("p1") is False
+    # Status was never durably flipped away from INGESTED — still retryable.
+    assert pipeline.knowledge.get("p1").status == EntryStatus.INGESTED
+
+
+@pytest.mark.asyncio
+async def test_distill_lock_release_failure_does_not_mask_success_result(tmp_path):
+    # _safe_release_lock swallows a transient release() failure so it can't
+    # shadow the (already-computed) success result by raising in the finally.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.summarizer = SimpleNamespace(handle=_ok_summary)
+    pipeline.extractor = SimpleNamespace(handle=_ok_extract)
+
+    def boom_release(entry_id):
+        raise sqlite3.OperationalError("unable to open database file")
+    pipeline.locks.release = boom_release
+
+    result = await pipeline.distill("p1")  # must not raise
+
+    assert result.success is True
+    assert pipeline.knowledge.get("p1").status == EntryStatus.DISTILLED
+
+
+@pytest.mark.asyncio
+async def test_worker_process_item_treats_errored_as_skip_not_failure(tmp_path):
+    # An errored (transient DB) outcome must not burn the worker's retry
+    # budget the way a genuine content failure would — treat it like a skip.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def boom_claim(entry_id):
+        raise sqlite3.OperationalError("unable to open database file")
+    pipeline.locks.claim = boom_claim
+
+    async def not_irrelevant(entry_id):
+        return False
+    pipeline.filter_irrelevant = not_irrelevant
+    worker = DistillWorker(pipeline)
+
+    from khonliang_researcher.worker import SKIP
+    ok = await worker.process_item(pipeline.knowledge.get("p1"))
+
+    assert ok is SKIP

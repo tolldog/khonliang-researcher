@@ -168,6 +168,8 @@ def distill(ctx, entry_id, distill_all):
             for r in results:
                 if getattr(r, "skipped", False):
                     status = "skip"  # held by another drainer, not a failure
+                elif getattr(r, "errored", False):
+                    status = "error"  # transient DB error, not a content failure
                 elif r.success:
                     status = "ok"
                 else:
@@ -199,6 +201,13 @@ def distill(ctx, entry_id, distill_all):
                     f"Distillation already in progress (held by another "
                     f"drainer): {result.title}"
                 )
+            elif getattr(result, "errored", False):
+                click.echo(
+                    f"Distillation hit a transient DB error and was left "
+                    f"pending for retry: {result.title}",
+                    err=True,
+                )
+                sys.exit(1)
             else:
                 click.echo(f"Distillation failed: {result.title}", err=True)
                 sys.exit(1)

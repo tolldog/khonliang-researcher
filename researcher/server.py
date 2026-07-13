@@ -512,6 +512,9 @@ Most tools accept detail="compact|brief|full":
         if getattr(result, "skipped", False):
             return (f"Distillation already in progress for {entry_id} "
                     f"(held by another drainer): {result.title}")
+        if getattr(result, "errored", False):
+            return (f"Distillation hit a transient DB error for {entry_id} "
+                    f"— left pending, retry shortly.")
         if not result.success:
             return f"Distillation failed for {entry_id}: {result.title}"
 
