@@ -83,12 +83,42 @@ class DistillWorker(BaseQueueWorker):
             # finish or be recovered on that owner's crash (abfe679b).
             logger.info("  SKIPPED (locked by another drainer): %s", entry.title[:60])
             return SKIP
+        if getattr(result, "errored", False):
+            # A transient DB-open error in distill()'s pre-LLM window (bug
+            # 706df96b) — the entry's status was left untouched (not FAILED),
+            # so treat this the same as a live-lock skip: don't burn a retry,
+            # just come back around next drain cycle once the DB recovers.
+            # ``stuck`` (codex P2 round 5) means the lock itself couldn't be
+            # released either — get_next()'s live-lock filter will keep
+            # skipping this entry until THIS PROCESS restarts, not just until
+            # the DB recovers, so log that distinctly (still SKIP either way:
+            # the live-lock check makes the outcome the same from the
+            # worker's perspective, but ops/monitoring needs the distinction).
+            if getattr(result, "stuck", False):
+                logger.error(
+                    "  STUCK (lock leaked, needs process restart): %s", entry.title[:60]
+                )
+            else:
+                logger.info("  SKIPPED (transient DB error): %s", entry.title[:60])
+            return SKIP
         if result.success:
             triples = len(result.triples) if result.triples else 0
             logger.info(
                 "  OK: %d triples, assessments: %s",
                 triples,
                 list(result.assessments.keys()),
+            )
+        # `stuck` is orthogonal to `success` (codex P2 round 9) — a leaked
+        # lock on the FINAL release can happen even after an otherwise-
+        # successful distill, and the plain "OK" log above would otherwise
+        # silently hide it. This entry is live-locked to this process now,
+        # same as the errored+stuck case above, just reached via a different
+        # path (post-distill release failure vs. pre-LLM PROCESSING-flip
+        # failure) — log it just as loudly regardless of `success`.
+        if getattr(result, "stuck", False):
+            logger.error(
+                "  STUCK (lock leaked despite result.success=%s, needs "
+                "process restart): %s", result.success, entry.title[:60]
             )
         return result.success
 

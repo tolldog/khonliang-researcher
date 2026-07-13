@@ -56,6 +56,24 @@ def test_distill_failure_branch_exits_nonzero(monkeypatch):
     assert "Distillation failed" in _all_output(result)
 
 
+def test_distill_success_but_stuck_exits_nonzero(monkeypatch):
+    # codex P2 round 10, bug_khonliang-researcher_706df96b: a distill that
+    # succeeded but leaked its lock (stuck=True) must not read as a clean
+    # exit 0 — that's how a cron job / operator would miss a condition that
+    # needs a manual process restart to recover.
+    async def distill(entry_id):
+        return SimpleNamespace(
+            success=True, skipped=False, errored=False, stuck=True,
+            title="ok-but-stuck", summary=None, triples=[], assessments={},
+        )
+
+    stub = SimpleNamespace(distill=distill)
+    runner = _runner(monkeypatch, stub)
+    result = runner.invoke(cli, ["distill", "entry-123"])
+    assert result.exit_code == 1
+    assert "stuck" in _all_output(result).lower()
+
+
 def test_idea_full_error_result_exits_clean_no_keyerror(monkeypatch):
     async def ingest_idea(text, source=""):
         return "idea1"

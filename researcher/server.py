@@ -512,8 +512,28 @@ Most tools accept detail="compact|brief|full":
         if getattr(result, "skipped", False):
             return (f"Distillation already in progress for {entry_id} "
                     f"(held by another drainer): {result.title}")
+
+        # `stuck` is orthogonal to success/errored (codex P2 round 8) — it can
+        # be True alongside success=True (distillation worked but the final
+        # lock release didn't) or alongside a plain content FAILED, not just
+        # the `errored` path. Append it to whichever branch below returns, so
+        # a leaked lock is never misreported as a clean/plain outcome.
+        stuck_suffix = (
+            f"\n\n**Warning:** the distill lock for {entry_id} could not be "
+            f"released and is now stuck — it will be skipped on every future "
+            f"drain attempt until this process restarts."
+            if getattr(result, "stuck", False) else ""
+        )
+
+        if getattr(result, "errored", False):
+            if getattr(result, "stuck", False):
+                return (f"Distillation hit a transient DB error for {entry_id} "
+                        f"and the distill lock itself is stuck — needs a "
+                        f"process restart to recover, not just a retry.")
+            return (f"Distillation hit a transient DB error for {entry_id} "
+                    f"— left pending, retry shortly.")
         if not result.success:
-            return f"Distillation failed for {entry_id}: {result.title}"
+            return f"Distillation failed for {entry_id}: {result.title}" + stuck_suffix
 
         parts = [f"# {result.title}\n"]
 
@@ -552,7 +572,7 @@ Most tools accept detail="compact|brief|full":
                         for idea in ideas:
                             parts.append(f"  - {idea}")
 
-        return "\n".join(parts)
+        return "\n".join(parts) + stuck_suffix
 
     @mcp.tool()
     async def distill_pending() -> str:
@@ -566,10 +586,25 @@ Most tools accept detail="compact|brief|full":
         for r in results:
             if getattr(r, "skipped", False):
                 status = "skip"  # held by another drainer, not a failure
+            elif getattr(r, "errored", False):
+                # A transient DB outage in the pre-LLM window, not a content
+                # failure — reporting it as FAILED here (while distill_paper's
+                # single-entry tool distinguishes it) would misrepresent an
+                # infra hiccup as terminal in batch mode (codex P2 round 6,
+                # bug 706df96b).
+                status = "stuck" if getattr(r, "stuck", False) else "error"
             elif r.success:
                 status = "ok"
             else:
                 status = "FAILED"
+            # `stuck` is orthogonal to success/errored (codex P2 round 8) —
+            # it can co-occur with an "ok" or "FAILED" status (the lock leak
+            # happens on the final release, independent of whether
+            # distillation itself succeeded), not just the `errored`/"stuck"
+            # status above. Mark it distinctly rather than silently
+            # reporting a leaked lock as a clean "ok".
+            if status not in ("skip", "stuck") and getattr(r, "stuck", False):
+                status = f"{status}+stuck"
             lines.append(f"  [{status}] {r.title}")
         return "\n".join(lines)
 

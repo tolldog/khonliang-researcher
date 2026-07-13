@@ -42,6 +42,57 @@ from researcher.self_catalog import build_self_catalog, idea_index_record, paper
 
 logger = logging.getLogger(__name__)
 
+# Substrings of sqlite3.OperationalError messages that indicate a transient
+# DB-unavailable condition, as opposed to a persistent bug (missing
+# table/column, malformed SQL, a corrupt file) — sqlite3.OperationalError is
+# raised for BOTH categories, so catching the exception TYPE alone (codex P1
+# round 1, bug 706df96b) would still swallow a real programming error into
+# the retryable ``errored`` path forever. There's no finer-grained exception
+# type to distinguish these, so this matches on message text instead —
+# deliberately a SHORT, conservative list, not every plausibly-transient
+# SQLite message. Two categories only:
+#   - "unable to open database file": the literal error this bug hit (a
+#     wedged/duplicate agent process contending for the file) — direct
+#     operational evidence this one is transient here. Trustworthy as
+#     transient-in-practice (not just "usually"): ``create_pipeline()`` now
+#     validates ``db_path`` is actually openable at boot (a real
+#     open-then-close connection, not just an ``os.access`` check) and
+#     raises loudly if it isn't (codex round 6, bug 706df96b) — so a
+#     misconfigured path (bad path, missing directory, broken permissions)
+#     fails immediately at process startup instead of ever reaching this
+#     message mid-``distill()``. Any occurrence of this message here,
+#     after boot, is therefore a real runtime hiccup on a path already
+#     proven to work, not a masked misconfiguration.
+#   - "database is locked" / "database is busy" / "database table is locked"
+#     / "database schema is locked": SQLite's own lock-contention messages,
+#     transient BY DEFINITION (another connection holds the relevant lock
+#     right now; it always clears once that connection finishes — codex P1
+#     round 4 added the table/schema-lock variants alongside the
+#     whole-database one, same category).
+# Deliberately EXCLUDED (codex P1 round 3): "disk I/O error" and "attempt to
+# write a readonly database" — both can just as easily indicate a permanent
+# environment regression (failing disk, a misconfigured permission/mount)
+# as a transient blip, and misclassifying persistent-as-transient means the
+# entry silently retries forever instead of surfacing the outage — a worse
+# failure mode than the loud crash this whole guard exists to soften. When
+# in doubt, raise loudly; only whitelist messages that are EITHER a known
+# lock-contention message (transient by SQLite's own definition) OR have a
+# concrete, known-here transient cause (the file-open error this bug hit).
+_TRANSIENT_SQLITE_MESSAGES = (
+    "unable to open database file",
+    "database is locked",
+    "database is busy",
+    "database table is locked",
+    "database schema is locked",
+)
+
+
+def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    """True iff ``exc`` looks like a transient DB-unavailable condition
+    rather than a persistent schema/query bug (codex P1 round 2, 706df96b)."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_SQLITE_MESSAGES)
+
 
 @dataclass
 class DistillResult:
@@ -54,6 +105,26 @@ class DistillResult:
     # True when distill was a no-op because a live owner already holds the lock
     # — a skip, NOT a failure (must not count against a worker's retry budget).
     skipped: bool = False
+    # True when a DB error hit the pre-LLM window (entry lookup / lock claim /
+    # PROCESSING flip) — a transient infra failure, NOT a content failure.
+    # Distinct from ``skipped`` (another live owner) and from an ordinary
+    # ``success=False`` (LLM/content failure, entry marked FAILED): the entry's
+    # status is left untouched (usually still INGESTED) so the embedded worker's
+    # normal INGESTED-status scan retries it on its own, rather than silently
+    # falling out of automatic retry the way a FAILED status would
+    # (bug_khonliang-researcher_706df96b).
+    errored: bool = False
+    # True when the distill lock itself could not be released (release()
+    # exhausted its transient-failure retries) — the lock row is still held
+    # by this (still-live) process, so the entry will be skipped by every
+    # live-lock check until this process restarts. Usually accompanies
+    # ``errored=True`` (the PROCESSING-flip failure path), but can also occur
+    # on an otherwise-successful distill if only the final release fails —
+    # ``success``/``errored`` describe whether distillation itself worked;
+    # ``stuck`` is an orthogonal signal about lock hygiene, so a caller/
+    # monitor can tell "will retry soon" from "needs a process restart to
+    # recover" (codex P2 round 5, 706df96b).
+    stuck: bool = False
 
 
 def is_paper_entry(entry: KnowledgeEntry) -> bool:
@@ -697,13 +768,123 @@ class ResearchPipeline:
     # Distillation
     # ------------------------------------------------------------------
 
+    async def _safe_release_lock(
+        self, entry_id: str, retries: int = 3, backoff_s: float = 0.2
+    ) -> bool:
+        """Release the distill lock, retrying a transient DB outage before
+        giving up — and logging loudly + distinctly if every attempt fails.
+
+        Returns True once the lock is confirmed no longer held by us, False
+        if every retry was exhausted and it's still stuck (codex P2 round 5)
+        — callers use this to set ``DistillResult.stuck`` so a caller/monitor
+        can tell "will retry soon" from "needs a process restart to recover",
+        rather than reporting a leaked lock as an ordinary retryable outcome.
+
+        An unguarded ``release()`` raising here would mask whatever result
+        ``distill()`` already computed (success, FAILED, or the pre-LLM
+        errored path) by propagating instead of returning it — so failures
+        are always swallowed. But swallowing silently is itself a hazard
+        (codex P1, bug 706df96b): if release never succeeds, the lock stays
+        claimed by this (still-live) process forever. ``DistillWorker.get_next``
+        skips live-locked entries, so a stuck lock is otherwise
+        indistinguishable from a healthy in-flight distill — the paper falls
+        out of the retry drain cycle until this process restarts, with no
+        signal that anything is wrong (worse than the pre-fix crash, which was
+        at least visible).
+
+        Retry with a short backoff first, since the underlying cause
+        (transient DB-open failure) usually clears within milliseconds. If
+        every attempt fails, log at ERROR with a "STUCK LOCK" marker so this
+        specific unrecoverable state is grep/alert-distinguishable from the
+        normal "pending, will retry" case. A NON-transient ``OperationalError``
+        (e.g. a genuine schema bug) is not retried — it's re-raised
+        immediately (codex P1 round 2) so it surfaces loudly instead of
+        masquerading as a stuck-but-benign lock.
+
+        If cancelled while backing off (e.g. process shutdown mid-retry —
+        codex P2 round 5), the backoff sleep's ``CancelledError`` would
+        otherwise propagate straight out of this coroutine (and out of
+        ``distill()``'s ``finally``) before ever attempting the lock delete
+        again, stranding it needlessly. Make one best-effort synchronous
+        release attempt first, then let the cancellation propagate as normal
+        — this coroutine must still honor cancellation, just not at the cost
+        of skipping an already-due retry that was right there.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(retries):
+            try:
+                self.locks.release(entry_id)
+                return True
+            except sqlite3.OperationalError as exc:
+                if not _is_transient_sqlite_error(exc):
+                    logger.error(
+                        "distill: lock release for %s hit a NON-transient DB "
+                        "error — raising rather than retrying: %s",
+                        entry_id, exc,
+                    )
+                    raise
+                last_exc = exc
+                if attempt < retries - 1:
+                    try:
+                        await asyncio.sleep(backoff_s)
+                    except asyncio.CancelledError:
+                        # Never swallow CancelledError — that would break
+                        # task-cancellation semantics. Best-effort release
+                        # attempt, then always propagate the cancellation
+                        # regardless of whether the release succeeded.
+                        try:
+                            self.locks.release(entry_id)
+                        except Exception:
+                            pass
+                        raise
+        logger.error(
+            "distill: STUCK LOCK for %s — lock release failed %d/%d attempts; "
+            "this paper's distill lock is now held by a still-live owner and "
+            "will NOT be retried by the embedded worker until this process "
+            "restarts (codex P1, bug 706df96b): %s",
+            entry_id, retries, retries, last_exc,
+        )
+        return False
+
     async def distill(self, entry_id: str) -> DistillResult:
         """Run full distillation pipeline on a stored paper.
 
         Step 1: Summarize (7B model, sequential — needs raw paper)
         Step 2: Extract + Assess in parallel (3B model — both use summary)
         """
-        entry = self.knowledge.get(entry_id)
+        # Pre-LLM DB window (entry lookup, lock claim, PROCESSING flip): guard
+        # each step individually. A transient DB-open failure here must not
+        # propagate uncaught (that surfaced as an unhandled OperationalError
+        # crashing the ingest job at phase=error — bug 706df96b) and must not
+        # burn the entry to FAILED, since FAILED entries fall out of the
+        # embedded worker's INGESTED-status scan and stop being retried. Leave
+        # status untouched (normally still INGESTED) so the next drain cycle
+        # naturally retries once the transient condition clears.
+        #
+        # Narrowly ``sqlite3.OperationalError`` (codex P2 round 1, bug
+        # 706df96b), not bare ``Exception`` — but ``OperationalError`` ITSELF
+        # covers both transient conditions (can't open/lock the file) and
+        # persistent bugs (missing table/column, malformed SQL), so also
+        # check ``_is_transient_sqlite_error`` and re-raise anything that
+        # isn't (codex P1 round 2). A genuine programming bug must keep
+        # propagating and surfacing loudly instead of being silently
+        # converted into an infinite skip-and-retry.
+        try:
+            entry = self.knowledge.get(entry_id)
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_sqlite_error(exc):
+                raise
+            logger.warning("distill: entry lookup failed for %s", entry_id, exc_info=True)
+            # Carry the real entry_id/title through rather than a literal
+            # "ERROR" (codex P3 round 11) — batch callers (distill_pending,
+            # `cli distill --all`) render this DistillResult's title
+            # directly (e.g. "[error] {title}"), and a hard-coded "ERROR"
+            # made it impossible to tell WHICH paper needs attention without
+            # digging through logs. The entry itself couldn't be looked up
+            # here, so there's no real title available — fall back to the
+            # entry_id itself (still identifies the paper) rather than a
+            # generic placeholder.
+            return DistillResult(entry_id=entry_id, title=entry_id, errored=True)
         if not entry:
             return DistillResult(entry_id=entry_id, title="NOT FOUND")
 
@@ -711,7 +892,16 @@ class ResearchPipeline:
 
         # Take the distill lock. If a LIVE owner already holds it, another drainer
         # is on this paper — skip rather than double-distill (bug abfe679b).
-        if not self.locks.claim(entry_id):
+        try:
+            claimed = self.locks.claim(entry_id)
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_sqlite_error(exc):
+                raise
+            logger.warning("distill: lock claim failed for %s", entry_id, exc_info=True)
+            result.errored = True
+            return result
+
+        if not claimed:
             logger.info("Distill skipped for %s — held by a live owner", entry_id)
             # A skip is NOT a successful distill (no summary/triples produced) and
             # NOT a failure. success stays False so distilled-counters
@@ -721,7 +911,18 @@ class ResearchPipeline:
             result.skipped = True
             return result
 
-        self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)
+        try:
+            self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_sqlite_error(exc):
+                await self._safe_release_lock(entry_id)
+                raise
+            logger.warning("distill: PROCESSING flip failed for %s", entry_id, exc_info=True)
+            released = await self._safe_release_lock(entry_id)
+            result.errored = True
+            result.stuck = not released
+            return result
+
         try:
             # Step 1: Summarize (must complete before extraction/assessment)
             summary_resp = await self.summarizer.handle(entry.content)
@@ -774,7 +975,12 @@ class ResearchPipeline:
             self.knowledge.set_status(entry_id, EntryStatus.FAILED)
             return result
         finally:
-            self.locks.release(entry_id)
+            # Runs before the enclosing return actually hands control back, so
+            # mutating ``result`` here is visible on both the success path
+            # (falls through below) and the FAILED path (``return result``
+            # above already holds this same object by reference).
+            if not await self._safe_release_lock(entry_id):
+                result.stuck = True
 
         # Past here the entry is persisted + DISTILLED and the lock is released.
         # Recording the relevance signal is best-effort telemetry — a failure
@@ -3110,6 +3316,67 @@ def create_pipeline(config_path: str = "config.yaml") -> ResearchPipeline:
     if not Path(db_path).is_absolute():
         db_path = str(config_dir / db_path)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Fail loudly HERE if db_path is misconfigured (bad path, missing
+    # directory that couldn't be created, broken filesystem permissions)
+    # rather than deferring discovery to whenever some code path first
+    # happens to touch the DB. That deferred discovery is exactly what made
+    # a genuine misconfiguration indistinguishable from a transient
+    # "unable to open database file" outage inside distill()'s pre-LLM
+    # guards (codex round 6, bug 706df96b): those guards trust that message
+    # as transient-in-practice specifically BECAUSE a bad db_path would
+    # already have failed here, at boot, instead of surfacing later.
+    # Open-then-close a real connection so sqlite3's own error surfaces
+    # directly, rather than reimplementing its file-open logic with
+    # os.access (which can't catch every way a path can be unusable — e.g.
+    # a component of the path being a file, not a directory). Also exercise
+    # WRITE access (codex P2 round 8), not just a read — an existing db file
+    # on a read-only mount/filesystem would otherwise pass a read-only
+    # "SELECT 1" probe here and only fail later, mid-distill, on the first
+    # real write ("attempt to write a readonly database"), which is exactly
+    # the deferred-discovery gap this whole guard exists to close.
+    #
+    # Round-the-trip ``PRAGMA user_version`` (read it, then write the SAME
+    # value back) rather than CREATE TABLE + rollback: DDL statements get an
+    # implicit commit from Python's sqlite3 module regardless of an explicit
+    # ``rollback()`` call afterward (confirmed empirically — a
+    # CREATE-TABLE-then-rollback here left the table behind), so that
+    # approach would litter every fresh db with a stray ``_boot_write_check``
+    # table. Setting ``user_version`` to its own current value writes to the
+    # database file header (a real write requiring the same file permissions
+    # as any other write) without touching the schema at all — no residue,
+    # no reliance on transaction rollback semantics.
+    #
+    # A generous 30s busy_timeout (codex P2 round 9), not the 5s used
+    # elsewhere: this repo's architecture starts multiple independent
+    # processes against the SAME db_path (the bus agent, a standalone
+    # `researcher.worker`, an MCP-stdio `researcher.server`), so ordinary
+    # write contention from a sibling process starting around the same
+    # moment is expected, not a misconfiguration — a 5s timeout could
+    # false-positive on a slow-but-healthy DB and report a perfectly good
+    # path as "not usable at startup". 30s comfortably outlasts any
+    # ordinary transaction (milliseconds) while still failing loudly for a
+    # GENUINE problem, since a bad path or broken permissions never
+    # resolves no matter how long this waits — time-outlasting is what
+    # distinguishes contention from misconfiguration here, not a message
+    # heuristic. This runs once at boot, so the extra headroom costs
+    # nothing on the happy path (the connection returns as soon as the
+    # lock is free) and is bounded on the unhappy path.
+    try:
+        _boot_conn = sqlite3.connect(db_path, timeout=30)
+        try:
+            _boot_conn.execute("SELECT 1")
+            current_version = _boot_conn.execute("PRAGMA user_version").fetchone()[0]
+            _boot_conn.execute(f"PRAGMA user_version = {int(current_version)}")
+        finally:
+            _boot_conn.close()
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            f"create_pipeline: db_path {db_path!r} is not usable at "
+            f"startup ({exc}) — check the path, its parent directory, "
+            f"and filesystem permissions before retrying."
+        ) from exc
+
     # Write resolved path back so ResearchPipeline (and any downstream
     # consumer that reads config["db_path"]) sees the absolute version.
     config["db_path"] = db_path
