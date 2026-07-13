@@ -706,23 +706,46 @@ class ResearchPipeline:
     # Distillation
     # ------------------------------------------------------------------
 
-    def _safe_release_lock(self, entry_id: str) -> None:
-        """Release the distill lock, tolerating a transient DB-open failure.
+    async def _safe_release_lock(
+        self, entry_id: str, retries: int = 3, backoff_s: float = 0.2
+    ) -> None:
+        """Release the distill lock, retrying a transient DB outage before
+        giving up — and logging loudly + distinctly if every attempt fails.
 
         An unguarded ``release()`` raising here would mask whatever result
         ``distill()`` already computed (success, FAILED, or the pre-LLM
-        errored path) by propagating instead of returning it. Worst case a
-        release that fails here leaves the lock claimed by this (still-live)
-        process — harmless: it just makes the next distill attempt on this
-        entry report ``skipped`` instead of retrying, and is reclaimed the
-        moment this process exits (bug abfe679b's dead-owner reclaim).
+        errored path) by propagating instead of returning it — so failures
+        are always swallowed. But swallowing silently is itself a hazard
+        (codex P1, bug 706df96b): if release never succeeds, the lock stays
+        claimed by this (still-live) process forever. ``DistillWorker.get_next``
+        skips live-locked entries, so a stuck lock is otherwise
+        indistinguishable from a healthy in-flight distill — the paper falls
+        out of the retry drain cycle until this process restarts, with no
+        signal that anything is wrong (worse than the pre-fix crash, which was
+        at least visible).
+
+        Retry with a short backoff first, since the underlying cause
+        (transient DB-open failure) usually clears within milliseconds. If
+        every attempt fails, log at ERROR with a "STUCK LOCK" marker so this
+        specific unrecoverable state is grep/alert-distinguishable from the
+        normal "pending, will retry" case.
         """
-        try:
-            self.locks.release(entry_id)
-        except Exception:
-            logger.warning(
-                "distill: lock release failed for %s (non-fatal)", entry_id, exc_info=True
-            )
+        last_exc: Optional[Exception] = None
+        for attempt in range(retries):
+            try:
+                self.locks.release(entry_id)
+                return
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                if attempt < retries - 1:
+                    await asyncio.sleep(backoff_s)
+        logger.error(
+            "distill: STUCK LOCK for %s — lock release failed %d/%d attempts; "
+            "this paper's distill lock is now held by a still-live owner and "
+            "will NOT be retried by the embedded worker until this process "
+            "restarts (codex P1, bug 706df96b): %s",
+            entry_id, retries, retries, last_exc,
+        )
 
     async def distill(self, entry_id: str) -> DistillResult:
         """Run full distillation pipeline on a stored paper.
@@ -738,9 +761,17 @@ class ResearchPipeline:
         # embedded worker's INGESTED-status scan and stop being retried. Leave
         # status untouched (normally still INGESTED) so the next drain cycle
         # naturally retries once the transient condition clears.
+        #
+        # Narrowly ``sqlite3.OperationalError`` (codex P2, bug 706df96b), not
+        # bare ``Exception``: this path is specifically for a transient
+        # DB-unavailable condition (the wedged/duplicate-agent case this bug
+        # traced to). A genuine programming bug — a schema mismatch, a bad
+        # query, anything that ISN'T "the DB was briefly unopenable" — must
+        # keep propagating and surfacing loudly instead of being silently
+        # converted into an infinite skip-and-retry.
         try:
             entry = self.knowledge.get(entry_id)
-        except Exception:
+        except sqlite3.OperationalError:
             logger.warning("distill: entry lookup failed for %s", entry_id, exc_info=True)
             return DistillResult(entry_id=entry_id, title="ERROR", errored=True)
         if not entry:
@@ -752,7 +783,7 @@ class ResearchPipeline:
         # is on this paper — skip rather than double-distill (bug abfe679b).
         try:
             claimed = self.locks.claim(entry_id)
-        except Exception:
+        except sqlite3.OperationalError:
             logger.warning("distill: lock claim failed for %s", entry_id, exc_info=True)
             result.errored = True
             return result
@@ -769,9 +800,9 @@ class ResearchPipeline:
 
         try:
             self.knowledge.set_status(entry_id, EntryStatus.PROCESSING)
-        except Exception:
+        except sqlite3.OperationalError:
             logger.warning("distill: PROCESSING flip failed for %s", entry_id, exc_info=True)
-            self._safe_release_lock(entry_id)
+            await self._safe_release_lock(entry_id)
             result.errored = True
             return result
 
@@ -827,7 +858,7 @@ class ResearchPipeline:
             self.knowledge.set_status(entry_id, EntryStatus.FAILED)
             return result
         finally:
-            self._safe_release_lock(entry_id)
+            await self._safe_release_lock(entry_id)
 
         # Past here the entry is persisted + DISTILLED and the lock is released.
         # Recording the relevance signal is best-effort telemetry — a failure

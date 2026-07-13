@@ -8,6 +8,7 @@ recycled PID (new start time) isn't mistaken for the original.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from types import SimpleNamespace
@@ -23,6 +24,12 @@ from researcher.worker import DistillWorker
 
 # A token whose PID is not running (well above any live pid) -> owner is "dead".
 DEAD_OWNER = "20200101-000000_2147483646"
+
+
+async def _fast_sleep(_seconds: float) -> None:
+    """Drop-in for ``asyncio.sleep`` in tests exercising ``_safe_release_lock``'s
+    retry backoff — skips the real delay so fault-injection tests stay fast."""
+    return None
 
 
 def _make_config(tmp_path):
@@ -414,9 +421,14 @@ async def test_distill_processing_flip_failure_releases_lock_and_is_graceful(tmp
 
 
 @pytest.mark.asyncio
-async def test_distill_lock_release_failure_does_not_mask_success_result(tmp_path):
-    # _safe_release_lock swallows a transient release() failure so it can't
-    # shadow the (already-computed) success result by raising in the finally.
+async def test_distill_lock_release_failure_does_not_mask_success_result(
+    tmp_path, monkeypatch, caplog
+):
+    # _safe_release_lock retries then swallows a persistently-failing
+    # release() so it can't shadow the (already-computed) success result by
+    # raising in the finally — but it must log a loud, distinguishable
+    # STUCK LOCK marker (codex P1, 706df96b) since the lock is now leaked.
+    monkeypatch.setattr("researcher.pipeline.asyncio.sleep", _fast_sleep)
     pipeline = create_pipeline(_make_config(tmp_path))
     _add(pipeline, "p1", EntryStatus.INGESTED)
     pipeline.summarizer = SimpleNamespace(handle=_ok_summary)
@@ -426,10 +438,86 @@ async def test_distill_lock_release_failure_does_not_mask_success_result(tmp_pat
         raise sqlite3.OperationalError("unable to open database file")
     pipeline.locks.release = boom_release
 
-    result = await pipeline.distill("p1")  # must not raise
+    with caplog.at_level(logging.ERROR):
+        result = await pipeline.distill("p1")  # must not raise
 
     assert result.success is True
     assert pipeline.knowledge.get("p1").status == EntryStatus.DISTILLED
+    assert any("STUCK LOCK" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_safe_release_lock_recovers_after_transient_failure(tmp_path, monkeypatch, caplog):
+    # A release() that fails once then succeeds must NOT be reported as a
+    # stuck lock — retry actually clears it.
+    monkeypatch.setattr("researcher.pipeline.asyncio.sleep", _fast_sleep)
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+    pipeline.locks.claim("p1")
+
+    real_release = pipeline.locks.release
+    calls = {"n": 0}
+    def flaky_release(entry_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_release(entry_id)
+    pipeline.locks.release = flaky_release
+
+    with caplog.at_level(logging.ERROR):
+        await pipeline._safe_release_lock("p1")
+
+    assert calls["n"] == 2
+    assert pipeline.locks.is_locked_live("p1") is False  # actually released
+    assert not any("STUCK LOCK" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_distill_entry_lookup_non_sqlite_error_propagates(tmp_path):
+    # codex P2: only sqlite3.OperationalError (a transient DB-open failure)
+    # is swallowed into errored=True. A real programming bug must still
+    # surface loudly rather than retrying forever unnoticed.
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def boom_get(entry_id):
+        raise RuntimeError("not a transient DB error")
+    pipeline.knowledge.get = boom_get
+
+    with pytest.raises(RuntimeError):
+        await pipeline.distill("p1")
+
+
+@pytest.mark.asyncio
+async def test_distill_lock_claim_non_sqlite_error_propagates(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    def boom_claim(entry_id):
+        raise RuntimeError("not a transient DB error")
+    pipeline.locks.claim = boom_claim
+
+    with pytest.raises(RuntimeError):
+        await pipeline.distill("p1")
+
+
+@pytest.mark.asyncio
+async def test_distill_processing_flip_non_sqlite_error_propagates(tmp_path):
+    pipeline = create_pipeline(_make_config(tmp_path))
+    _add(pipeline, "p1", EntryStatus.INGESTED)
+
+    real_set_status = pipeline.knowledge.set_status
+    def flaky_set_status(entry_id, status):
+        if status == EntryStatus.PROCESSING:
+            raise RuntimeError("not a transient DB error")
+        return real_set_status(entry_id, status)
+    pipeline.knowledge.set_status = flaky_set_status
+
+    with pytest.raises(RuntimeError):
+        await pipeline.distill("p1")
+    # A real bug must not silently strand the lock either — it's a crash,
+    # not a "leave it retryable" outcome, so no cleanup guarantee is claimed
+    # here beyond "don't misreport it as errored/retryable".
 
 
 @pytest.mark.asyncio
