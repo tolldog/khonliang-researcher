@@ -875,7 +875,16 @@ class ResearchPipeline:
             if not _is_transient_sqlite_error(exc):
                 raise
             logger.warning("distill: entry lookup failed for %s", entry_id, exc_info=True)
-            return DistillResult(entry_id=entry_id, title="ERROR", errored=True)
+            # Carry the real entry_id/title through rather than a literal
+            # "ERROR" (codex P3 round 11) — batch callers (distill_pending,
+            # `cli distill --all`) render this DistillResult's title
+            # directly (e.g. "[error] {title}"), and a hard-coded "ERROR"
+            # made it impossible to tell WHICH paper needs attention without
+            # digging through logs. The entry itself couldn't be looked up
+            # here, so there's no real title available — fall back to the
+            # entry_id itself (still identifies the paper) rather than a
+            # generic placeholder.
+            return DistillResult(entry_id=entry_id, title=entry_id, errored=True)
         if not entry:
             return DistillResult(entry_id=entry_id, title="NOT FOUND")
 

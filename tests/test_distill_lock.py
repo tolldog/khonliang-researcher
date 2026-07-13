@@ -382,6 +382,12 @@ async def test_distill_entry_lookup_failure_is_graceful_not_raised(tmp_path):
     assert result.errored is True
     assert result.success is False
     assert result.skipped is False
+    # codex P3 round 11: the real entry_id must be identifiable from the
+    # result, not a generic "ERROR" placeholder — batch callers render
+    # `title` directly and need to know WHICH paper needs attention.
+    assert result.entry_id == "p1"
+    assert result.title != "ERROR"
+    assert "p1" in result.title
 
 
 @pytest.mark.asyncio
