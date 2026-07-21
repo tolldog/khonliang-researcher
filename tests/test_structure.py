@@ -216,3 +216,36 @@ async def test_schema_is_passed_to_generate_json_for_every_attempt():
     call = hot_client.calls[0]
     assert call["schema"] == PersonRecord.model_json_schema()
     assert call["model"] == "qwen2.5:7b"
+
+
+@pytest.mark.asyncio
+async def test_input_is_truncated_to_max_chars_before_prompting():
+    """Oversized input must not deterministically burn every attempt on a
+    context-window overflow that has nothing to do with extraction quality
+    (codex P2, PR #77 round 3)."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool, max_chars=100)
+
+    await role.structure(data="x" * 5000, schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    # The prompt wraps the (truncated) data with purpose/project framing —
+    # assert the truncated data run itself, not the whole prompt (which
+    # also contains incidental "x"s in its own scaffolding text).
+    assert "x" * 101 not in prompt
+    assert "x" * 100 in prompt
+
+
+@pytest.mark.asyncio
+async def test_input_is_sanitized_for_json_before_prompting():
+    """LaTeX/unicode-math reliably breaks JSON generation (same reasoning
+    as SummarizerRole's _clean_for_json) — structure() must apply the same
+    cleanup rather than pass raw technical text straight through."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(data=r"Ada's age is $\alpha$ years.", schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "$" not in prompt
+    assert r"\alpha" not in prompt

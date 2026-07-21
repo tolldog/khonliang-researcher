@@ -61,7 +61,19 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 
 from pydantic import BaseModel, ValidationError
 
+from researcher.roles import _clean_for_json
+
 logger = logging.getLogger(__name__)
+
+#: Conservative char cap applied to ``data`` before prompting, mirroring
+#: SummarizerRole's medium-tier truncation (researcher/roles.py
+#: MODEL_TIERS). Without this, a caller handing structure() a full paper
+#: or long web page deterministically overflows the model's context
+#: window, burning every retry/escalation attempt and returning
+#: needs_curation for input that was never actually malformed (codex P2,
+#: PR #77 round 3). Override via the StructureRole constructor for a
+#: caller with a known larger/smaller budget.
+DEFAULT_MAX_CHARS = 12_000
 
 #: Bump when the extraction contract (prompt shape, retry/escalation
 #: policy) changes materially enough that prior extractions should be
@@ -136,6 +148,8 @@ class StructureRole:
             Defaults to ``"reviewer"`` — already the heaviest local model
             configured in this repo (qwen2.5:32b by default), reused here
             rather than adding a second escalation-specific config key.
+        max_chars: Char cap applied to ``data`` before prompting (see
+            ``DEFAULT_MAX_CHARS``).
     """
 
     def __init__(
@@ -143,10 +157,12 @@ class StructureRole:
         model_pool: Any,
         hot_role: str = "structure",
         escalation_role: str = "reviewer",
+        max_chars: int = DEFAULT_MAX_CHARS,
     ):
         self._pool = model_pool
         self._hot_role = hot_role
         self._escalation_role = escalation_role
+        self._max_chars = max_chars
 
     async def structure(
         self,
@@ -174,7 +190,18 @@ class StructureRole:
         """
         schema_name = schema.__name__
         schema_json = schema.model_json_schema()
-        prompt = _build_prompt(data, purpose, project)
+
+        # Sanitize (strip LaTeX/unicode-math that reliably breaks JSON
+        # generation — same helper SummarizerRole uses) and truncate to a
+        # conservative char budget BEFORE prompting, not after a failed
+        # attempt: an oversized or math-heavy input would otherwise burn
+        # every hot-tier/escalation attempt and land in needs_curation for
+        # reasons that have nothing to do with the model's extraction
+        # quality (codex P2, PR #77 round 3).
+        text = _clean_for_json(data)
+        if len(text) > self._max_chars:
+            text = text[: self._max_chars]
+        prompt = _build_prompt(text, purpose, project)
         errors: List[str] = []
 
         hot_client = self._pool.get_client(self._hot_role)
