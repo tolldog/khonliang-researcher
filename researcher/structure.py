@@ -357,37 +357,103 @@ def _strip_latex_noise(text: str) -> str:
         TeX/Markdown-derived text (codex P2, PR #77 round 5). A command
         with TWO OR MORE brace-group arguments (``\\href{url}{title}``,
         ``\\frac{1}{2}``) is left COMPLETELY UNTOUCHED rather than
-        guessed at (codex P2, PR #77 round 7): unwrapping only the first
-        group turned ``\\href{url}{title}`` into the corrupted
-        ``url{title}`` — unambiguous data loss the model never gets a
-        chance to recover from. Under-stripping (leaving the whole
-        multi-arg command in the text verbatim) is a much smaller quality
-        hit than that — the model can generally still extract sensibly
-        from unstripped LaTeX. A bare, content-free command like
-        ``\\alpha`` has nothing to preserve and is dropped outright.
+        guessed at (codex P2, PR #77 round 7). A bare, content-free
+        command like ``\\alpha`` has nothing to preserve and is dropped
+        outright. Argument scanning is brace-BALANCED (see
+        ``_process_latex_commands``), so a nested brace inside a
+        single-arg command (``\\textit{Ada {Byron}}``) does not truncate
+        the argument early (codex P2, PR #77 round 8).
     """
     text = re.sub(r"\$\$.*?\$\$", "[math]", text, flags=re.DOTALL)
     text = re.sub(r"\$[^$]+\$", "[math]", text)
-
-    def _replace_command(match: "re.Match[str]") -> str:
-        # One pass, one callback — deliberately not two separate regexes
-        # (an earlier version of this used `(?!\{)` lookaheads in two
-        # passes; greedy `[a-zA-Z]+` backtracking made the second pass
-        # eat only PART of a multi-arg command's name, e.g. turning
-        # "\href{...}" into a stray "f{...}" — codex P2, PR #77 round 7
-        # follow-up). Match the command name plus ALL of its consecutive
-        # brace-group arguments in one go, then decide based on how many
-        # groups there actually are — no backtracking hazard.
-        args = re.findall(r"\{([^}]*)\}", match.group(2))
-        if not args:
-            return ""  # bare command, e.g. \alpha — nothing to preserve
-        if len(args) == 1:
-            return args[0]  # single-arg command — unwrap to its content
-        return match.group(0)  # 2+ args — leave the whole thing untouched
-
-    text = re.sub(r"\\([a-zA-Z]+)((?:\{[^}]*\})*)", _replace_command, text)
+    text = _process_latex_commands(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _process_latex_commands(text: str) -> str:
+    """Walk ``text``, stripping LaTeX commands with brace-BALANCED argument scanning.
+
+    Deliberately NOT regex-based for argument matching (codex P2, PR #77
+    round 8): a pattern like ``\\{[^}]*\\}`` can only ever match up to the
+    FIRST ``}``, so it can never handle nesting by construction — that's
+    the wrong tool, not a matter of degree. This instead walks the string
+    tracking an explicit brace-depth counter per argument
+    (``_read_balanced_brace_group``), so a nested brace
+    (``\\textit{Ada {Byron}}``) stays inside the argument instead of
+    ending it early and leaving a dangling ``}`` in the output.
+
+    Per command, after locating its name:
+      - 0 brace-group arguments (a bare command like ``\\alpha``) — drop
+        the command name, keep scanning.
+      - 1 argument — unwrap to its content, recursively processed (so a
+        nested single-arg command inside it, e.g.
+        ``\\textit{\\emph{X}}``, also gets unwrapped).
+      - 2+ arguments (``\\href{url}{title}``) — leave the ENTIRE command
+        (name + every argument, verbatim, including any nesting inside
+        them) untouched rather than guessed at.
+    An unbalanced/unterminated ``{`` (malformed input) stops argument
+    collection at that point rather than scanning to the end of the
+    string; whatever arguments were already validly collected are still
+    used, and the unterminated remainder is left as ordinary literal text.
+    """
+    name_re = re.compile(r"[a-zA-Z]+")
+    out: List[str] = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        if text[i] != "\\":
+            out.append(text[i])
+            i += 1
+            continue
+
+        m = name_re.match(text, i + 1)
+        if not m:
+            out.append(text[i])  # bare backslash, not a command -- literal
+            i += 1
+            continue
+
+        after_name = m.end()
+        args: List[str] = []
+        k = after_name
+        while k < n and text[k] == "{":
+            arg, end = _read_balanced_brace_group(text, k)
+            if arg is None:
+                break  # unterminated -- stop collecting, keep what we have
+            args.append(arg)
+            k = end
+
+        if not args:
+            i = after_name  # drop the bare command name only
+        elif len(args) == 1:
+            out.append(_process_latex_commands(args[0]))
+            i = k
+        else:
+            out.append(text[i:k])  # 2+ args -- leave the whole span untouched
+            i = k
+
+    return "".join(out)
+
+
+def _read_balanced_brace_group(text: str, start: int) -> Tuple[Optional[str], int]:
+    """Read one brace-balanced ``{...}`` group starting at ``text[start] == '{'``.
+
+    Tracks a depth counter (+1 on ``{``, -1 on ``}``) so a NESTED brace
+    inside the group stays part of its content instead of ending the
+    group at the first ``}`` encountered. Returns ``(content, end)`` with
+    ``end`` one past the matching closing brace, or ``(None, start)`` if
+    the braces never balance before the end of the string.
+    """
+    depth = 0
+    for idx in range(start, len(text)):
+        if text[idx] == "{":
+            depth += 1
+        elif text[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : idx], idx + 1
+    return None, start
 
 
 def _count_schema_fields(node: Any) -> int:

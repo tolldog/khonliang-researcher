@@ -331,6 +331,57 @@ async def test_multi_arg_latex_commands_are_left_untouched():
 
 
 @pytest.mark.asyncio
+async def test_nested_braces_in_single_arg_command_do_not_truncate_early():
+    """A regex like `\\{[^}]*\\}` can only ever match up to the FIRST
+    closing brace, so a nested brace inside a single-arg command
+    (\\textit{Ada {Byron}}) truncated the argument early and left a
+    dangling "}" in the output — real corruption on a realistic input (a
+    name/title with an internal aside). Brace-balanced scanning must
+    track nesting depth so the argument ends at the correctly MATCHING
+    closing brace (codex P2, PR #77 round 8)."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(
+        data=r"Author: \textit{Ada {Byron}}, Countess.",
+        schema=PersonRecord,
+        purpose="p",
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    # The command wrapper is gone; the argument's inner literal braces
+    # ("Ada {Byron}", a normal parenthetical-style aside once unwrapped)
+    # are legitimately preserved -- what must NOT happen is a dangling,
+    # UNMATCHED brace from an early-truncated argument scan.
+    assert "\\textit" not in prompt
+    assert "Ada {Byron}" in prompt
+    assert prompt.count("{") == prompt.count("}")
+    assert "Countess" in prompt
+
+
+@pytest.mark.asyncio
+async def test_nested_single_arg_command_is_recursively_unwrapped():
+    """A single-arg command nested inside another single-arg command
+    (\\textit{\\emph{Ada}}) should have BOTH layers unwrapped, not just
+    the outer one."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(
+        data=r"Name: \textit{\emph{Ada}}.",
+        schema=PersonRecord,
+        purpose="p",
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "Ada" in prompt
+    assert "\\textit" not in prompt
+    assert "\\emph" not in prompt
+    assert "{" not in prompt
+    assert "}" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_max_tokens_scales_with_schema_field_count():
     """A fixed max_tokens cap deterministically truncates output for any
     legitimately larger schema — a many-field record or a list-heavy
