@@ -303,3 +303,102 @@ async def test_non_ascii_text_survives_sanitization():
     prompt = pool.get_client("structure").calls[0]["prompt"]
     assert "édouard" in prompt
     assert "中文" in prompt
+
+
+@pytest.mark.asyncio
+async def test_multi_arg_latex_commands_are_left_untouched():
+    """Unwrapping only the FIRST brace-group of a multi-arg command
+    corrupts it (\\href{url}{title} -> "url{title}", \\frac{1}{2} ->
+    "1{2}") — unambiguous data loss the model never gets a chance to
+    recover from. A command with 2+ brace-group arguments must be left
+    completely untouched instead of guessed at; under-stripping is a much
+    smaller quality hit than mangling (codex P2, PR #77 round 7)."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(
+        data=r"See \href{https://example.com}{Paper Title} and \frac{1}{2}.",
+        schema=PersonRecord,
+        purpose="p",
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert r"\href{https://example.com}{Paper Title}" in prompt
+    assert r"\frac{1}{2}" in prompt
+    # And single-arg commands are still unwrapped as before.
+    assert "url{title}" not in prompt
+    assert "1{2}" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_scales_with_schema_field_count():
+    """A fixed max_tokens cap deterministically truncates output for any
+    legitimately larger schema — a many-field record or a list-heavy
+    RootModel — turning a correctly-extractable input into needs_curation
+    for reasons unrelated to extraction quality (codex P2, PR #77 round
+    7). The response budget must scale with the target schema's shape."""
+
+    class ManyFields(BaseModel):
+        f01: str
+        f02: str
+        f03: str
+        f04: str
+        f05: str
+        f06: str
+        f07: str
+        f08: str
+        f09: str
+        f10: str
+        f11: str
+        f12: str
+        f13: str
+        f14: str
+        f15: str
+        f16: str
+        f17: str
+        f18: str
+        f19: str
+        f20: str
+        f21: str
+        f22: str
+        f23: str
+        f24: str
+        f25: str
+        f26: str
+        f27: str
+        f28: str
+        f29: str
+        f30: str
+        f31: str
+        f32: str
+        f33: str
+        f34: str
+        f35: str
+        f36: str
+        f37: str
+        f38: str
+        f39: str
+        f40: str
+
+    small_pool = _pool([{"name": "Ada", "age": 36}])
+    small_role = StructureRole(small_pool)
+    await small_role.structure(data="text", schema=PersonRecord, purpose="p")
+    small_max_tokens = small_pool.get_client("structure").calls[0]["max_tokens"]
+
+    big_response = {f"f{i:02d}": "x" for i in range(1, 41)}
+    big_pool = _pool([big_response])
+    big_role = StructureRole(big_pool)
+    await big_role.structure(data="text", schema=ManyFields, purpose="p")
+    big_max_tokens = big_pool.get_client("structure").calls[0]["max_tokens"]
+
+    assert big_max_tokens > small_max_tokens
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_override_is_respected():
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool, max_tokens=999)
+
+    await role.structure(data="text", schema=PersonRecord, purpose="p")
+
+    assert pool.get_client("structure").calls[0]["max_tokens"] == 999

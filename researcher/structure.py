@@ -74,6 +74,13 @@ logger = logging.getLogger(__name__)
 #: caller with a known larger/smaller budget.
 DEFAULT_MAX_CHARS = 12_000
 
+#: Floor for the per-attempt response token budget (``num_predict``).
+#: Matches SummarizerRole's own ``max_tokens`` ceiling — a reasonable
+#: minimum for a single small-to-medium record. ``_estimate_max_tokens``
+#: below scales UP from this floor for schemas with many fields; it never
+#: goes lower, so a tiny schema still gets a comfortable budget.
+DEFAULT_MAX_TOKENS = 4000
+
 #: Bump when the extraction contract (prompt shape, retry/escalation
 #: policy) changes materially enough that prior extractions should be
 #: considered lower-quality than ones made under the new contract —
@@ -159,6 +166,15 @@ class StructureRole:
             rather than adding a second escalation-specific config key.
         max_chars: Char cap applied to ``data`` before prompting (see
             ``DEFAULT_MAX_CHARS``).
+        max_tokens: Fixed response token budget override. When ``None``
+            (the default), the budget is derived per call from the
+            target schema's shape via ``_estimate_max_tokens`` — a
+            hardcoded cap here would deterministically truncate any
+            legitimately larger schema (a list-heavy ``RootModel``, a
+            many-field nested record) on every attempt, landing in
+            ``needs_curation`` for reasons that have nothing to do with
+            extraction quality (codex P2, PR #77 round 7). Set this only
+            to pin an exact budget for every call regardless of schema.
     """
 
     def __init__(
@@ -167,11 +183,13 @@ class StructureRole:
         hot_role: str = "structure",
         escalation_role: str = "reviewer",
         max_chars: int = DEFAULT_MAX_CHARS,
+        max_tokens: Optional[int] = None,
     ):
         self._pool = model_pool
         self._hot_role = hot_role
         self._escalation_role = escalation_role
         self._max_chars = max_chars
+        self._max_tokens = max_tokens
 
     async def structure(
         self,
@@ -222,12 +240,14 @@ class StructureRole:
         prompt = _build_prompt(text, purpose, project)
         errors: List[str] = []
 
+        max_tokens = self._max_tokens or _estimate_max_tokens(schema_json)
+
         hot_client = self._pool.get_client(self._hot_role)
         hot_model = getattr(hot_client, "model", self._hot_role)
 
         for attempt in range(1, 3):  # hot tier: initial attempt + one same-tier retry
             record, err = await self._try_extract(
-                hot_client, hot_model, prompt, schema, schema_json
+                hot_client, hot_model, prompt, schema, schema_json, max_tokens
             )
             if record is not None:
                 return StructureResult(
@@ -246,7 +266,7 @@ class StructureRole:
         esc_client = self._pool.get_client(self._escalation_role)
         esc_model = getattr(esc_client, "model", self._escalation_role)
         record, err = await self._try_extract(
-            esc_client, esc_model, prompt, schema, schema_json
+            esc_client, esc_model, prompt, schema, schema_json, max_tokens
         )
         if record is not None:
             return StructureResult(
@@ -286,6 +306,7 @@ class StructureRole:
         prompt: str,
         schema: Type[BaseModel],
         schema_json: Dict[str, Any],
+        max_tokens: int,
     ) -> Tuple[Optional[BaseModel], Optional[str]]:
         """One generate+validate attempt. Never raises — errors come back as a string."""
         try:
@@ -294,7 +315,7 @@ class StructureRole:
                 schema=schema_json,
                 system=_SYSTEM_PROMPT,
                 temperature=0.1,
-                max_tokens=2000,
+                max_tokens=max_tokens,
                 model=model_name,
                 constrained=True,
             )
@@ -330,18 +351,82 @@ def _strip_latex_noise(text: str) -> str:
     summarization, which tolerates lossy compression):
       - Does NOT strip non-ASCII characters (a name/title with accents or
         CJK characters must survive unmodified).
-      - A braced command like ``\\textit{Ada Lovelace}`` keeps its BRACED
-        CONTENT and drops only the command wrapper — real field values
-        routinely live inside formatting commands in TeX/Markdown-derived
-        text (codex P2, PR #77 round 5); a bare, content-free command like
+      - A SINGLE-braced command like ``\\textit{Ada Lovelace}`` keeps its
+        BRACED CONTENT and drops only the command wrapper — real field
+        values routinely live inside formatting commands in
+        TeX/Markdown-derived text (codex P2, PR #77 round 5). A command
+        with TWO OR MORE brace-group arguments (``\\href{url}{title}``,
+        ``\\frac{1}{2}``) is left COMPLETELY UNTOUCHED rather than
+        guessed at (codex P2, PR #77 round 7): unwrapping only the first
+        group turned ``\\href{url}{title}`` into the corrupted
+        ``url{title}`` — unambiguous data loss the model never gets a
+        chance to recover from. Under-stripping (leaving the whole
+        multi-arg command in the text verbatim) is a much smaller quality
+        hit than that — the model can generally still extract sensibly
+        from unstripped LaTeX. A bare, content-free command like
         ``\\alpha`` has nothing to preserve and is dropped outright.
     """
     text = re.sub(r"\$\$.*?\$\$", "[math]", text, flags=re.DOTALL)
     text = re.sub(r"\$[^$]+\$", "[math]", text)
-    text = re.sub(r"\\[a-zA-Z]+\{([^}]*)\}", r"\1", text)
-    text = re.sub(r"\\[a-zA-Z]+", "", text)
+
+    def _replace_command(match: "re.Match[str]") -> str:
+        # One pass, one callback — deliberately not two separate regexes
+        # (an earlier version of this used `(?!\{)` lookaheads in two
+        # passes; greedy `[a-zA-Z]+` backtracking made the second pass
+        # eat only PART of a multi-arg command's name, e.g. turning
+        # "\href{...}" into a stray "f{...}" — codex P2, PR #77 round 7
+        # follow-up). Match the command name plus ALL of its consecutive
+        # brace-group arguments in one go, then decide based on how many
+        # groups there actually are — no backtracking hazard.
+        args = re.findall(r"\{([^}]*)\}", match.group(2))
+        if not args:
+            return ""  # bare command, e.g. \alpha — nothing to preserve
+        if len(args) == 1:
+            return args[0]  # single-arg command — unwrap to its content
+        return match.group(0)  # 2+ args — leave the whole thing untouched
+
+    text = re.sub(r"\\([a-zA-Z]+)((?:\{[^}]*\})*)", _replace_command, text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _count_schema_fields(node: Any) -> int:
+    """Recursively count fields in a JSON schema (properties + array item
+    fields + $defs/definitions), for ``_estimate_max_tokens``'s heuristic."""
+    if not isinstance(node, dict):
+        return 0
+    count = 0
+    props = node.get("properties")
+    if isinstance(props, dict):
+        count += len(props)
+        for sub in props.values():
+            count += _count_schema_fields(sub)
+    items = node.get("items")
+    if isinstance(items, dict):
+        count += _count_schema_fields(items) or 1
+    for key in ("$defs", "definitions"):
+        defs = node.get(key)
+        if isinstance(defs, dict):
+            for sub in defs.values():
+                count += _count_schema_fields(sub)
+    return count
+
+
+def _estimate_max_tokens(
+    schema_json: Dict[str, Any], floor: int = DEFAULT_MAX_TOKENS
+) -> int:
+    """Rough per-attempt response token budget for a schema, with headroom.
+
+    A fixed cap here silently truncates any legitimately larger schema on
+    every attempt — deterministic ``needs_curation`` for reasons that have
+    nothing to do with extraction quality (codex P2, PR #77 round 7). This
+    is a heuristic, not an exact token count: count schema fields
+    (recursively, including array-item and $defs/definitions shapes) and
+    budget generously per field, with ``floor`` as a minimum so small
+    schemas still get a comfortable budget.
+    """
+    fields = _count_schema_fields(schema_json) or 1
+    return max(floor, fields * 120 + 256)
 
 
 def _build_prompt(data: str, purpose: str, project: str) -> str:
