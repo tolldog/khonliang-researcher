@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel
 
 from researcher.structure import SPEC_VERSION, StructureRole, StructureResult
 
@@ -153,7 +153,10 @@ async def test_semantically_wrong_but_json_valid_output_is_rejected():
 
 
 @pytest.mark.asyncio
-async def test_non_object_json_response_is_treated_as_invalid():
+async def test_non_object_json_response_invalid_for_a_dict_schema():
+    """A dict-shaped schema (PersonRecord) still rejects a non-dict payload —
+    model_validate is the sole arbiter, and a list fails PersonRecord's
+    validation the same as any other schema-nonconforming shape."""
     pool = _pool(
         hot_responses=[["not", "an", "object"], ["still", "not"]],
         esc_responses=[{"name": "Ada", "age": 36}],
@@ -164,6 +167,27 @@ async def test_non_object_json_response_is_treated_as_invalid():
 
     assert result.success is True
     assert result.escalated is True
+
+
+@pytest.mark.asyncio
+async def test_non_object_json_response_valid_for_a_root_model_schema():
+    """A caller's schema may be a Pydantic RootModel wrapping a list/scalar
+    (e.g. RootModel[list[str]]) — a non-dict payload is then perfectly
+    valid, so structure() must not gate on isinstance(raw, dict) before
+    validating (codex P2, PR #77 round 1)."""
+
+    class Tags(RootModel[List[str]]):
+        pass
+
+    pool = _pool([["python", "async"]])
+    role = StructureRole(pool)
+
+    result = await role.structure(data="text", schema=Tags, purpose="p")
+
+    assert result.success is True
+    assert result.attempts == 1
+    assert result.escalated is False
+    assert result.record.root == ["python", "async"]
 
 
 @pytest.mark.asyncio

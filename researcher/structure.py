@@ -253,13 +253,19 @@ class StructureRole:
         except Exception as e:  # LLM transport failure (timeout, unavailable, etc.)
             return None, f"generation failed: {e}"
 
-        if not isinstance(raw, dict):
-            return None, f"non-object JSON response: {raw!r}"
-
+        # Don't gate on isinstance(raw, dict) before validating: a caller's
+        # schema may be a Pydantic RootModel wrapping a list/scalar (e.g.
+        # RootModel[list[Item]]), for which a non-dict payload is perfectly
+        # valid. Let model_validate be the single source of truth for
+        # "is this on-schema" (codex P2, PR #77 round 1) — non-dict/
+        # non-schema-conforming payloads still fail here and fall through
+        # to the same retry/escalate/needs_curation path.
         try:
             return schema.model_validate(raw), None
         except ValidationError as e:
             return None, f"schema validation failed: {e}"
+        except Exception as e:  # e.g. TypeError for a payload shape model_validate can't even attempt
+            return None, f"validation error: {e}"
 
 
 def _build_prompt(data: str, purpose: str, project: str) -> str:
