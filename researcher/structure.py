@@ -264,8 +264,14 @@ class StructureRole:
             return schema.model_validate(raw), None
         except ValidationError as e:
             return None, f"schema validation failed: {e}"
-        except Exception as e:  # e.g. TypeError for a payload shape model_validate can't even attempt
-            return None, f"validation error: {e}"
+        # Deliberately narrow to ValidationError only (codex P2, PR #77 round
+        # 2): a non-ValidationError here means the caller's schema itself is
+        # broken (e.g. a buggy custom validator raising TypeError/
+        # AttributeError) — a real application bug, not a data-quality
+        # problem with the model's output. Swallowing it into
+        # needs_curation would misclassify a deterministic bug as "bad
+        # extraction" and hide it in a curation queue across an entire
+        # batch instead of surfacing immediately. Let it propagate.
 
 
 def _build_prompt(data: str, purpose: str, project: str) -> str:
