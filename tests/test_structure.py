@@ -237,10 +237,9 @@ async def test_input_is_truncated_to_max_chars_before_prompting():
 
 
 @pytest.mark.asyncio
-async def test_input_is_sanitized_for_json_before_prompting():
-    """LaTeX/unicode-math reliably breaks JSON generation (same reasoning
-    as SummarizerRole's _clean_for_json) — structure() must apply the same
-    cleanup rather than pass raw technical text straight through."""
+async def test_latex_noise_is_stripped_before_prompting():
+    """LaTeX math reliably breaks JSON generation — structure() strips it
+    before prompting, same reasoning as SummarizerRole's _clean_for_json."""
     pool = _pool([{"name": "Ada", "age": 36}])
     role = StructureRole(pool)
 
@@ -249,3 +248,20 @@ async def test_input_is_sanitized_for_json_before_prompting():
     prompt = pool.get_client("structure").calls[0]["prompt"]
     assert "$" not in prompt
     assert r"\alpha" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_text_survives_sanitization():
+    """structure() promises exact typed fields (unlike lossy summarization),
+    so accented/CJK characters in the source text must NOT be stripped —
+    codex P2, PR #77 round 4: SummarizerRole's _clean_for_json strips ALL
+    non-ASCII, which would silently corrupt a name/title into a schema-valid
+    but wrong record without ever setting needs_curation."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(data="Author:édouard É 中文", schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "édouard" in prompt
+    assert "中文" in prompt

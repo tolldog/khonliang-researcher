@@ -55,13 +55,12 @@ once the client passthrough lands.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from pydantic import BaseModel, ValidationError
-
-from researcher.roles import _clean_for_json
 
 logger = logging.getLogger(__name__)
 
@@ -191,14 +190,22 @@ class StructureRole:
         schema_name = schema.__name__
         schema_json = schema.model_json_schema()
 
-        # Sanitize (strip LaTeX/unicode-math that reliably breaks JSON
-        # generation — same helper SummarizerRole uses) and truncate to a
-        # conservative char budget BEFORE prompting, not after a failed
-        # attempt: an oversized or math-heavy input would otherwise burn
-        # every hot-tier/escalation attempt and land in needs_curation for
-        # reasons that have nothing to do with the model's extraction
-        # quality (codex P2, PR #77 round 3).
-        text = _clean_for_json(data)
+        # Sanitize (strip LaTeX-only noise that reliably breaks JSON
+        # generation) and truncate to a conservative char budget BEFORE
+        # prompting, not after a failed attempt: an oversized or
+        # math-heavy input would otherwise burn every hot-tier/escalation
+        # attempt and land in needs_curation for reasons that have
+        # nothing to do with the model's extraction quality (codex P2,
+        # PR #77 round 3). Deliberately NOT SummarizerRole's
+        # ``_clean_for_json`` (codex P2, round 4): that helper also
+        # strips ALL non-ASCII text, which is fine for lossy summarization
+        # but wrong here — structure() promises exact typed fields, so
+        # silently dropping accented/CJK characters from a name or title
+        # would return a schema-valid but CORRUPTED record without ever
+        # setting needs_curation. ``_strip_latex_noise`` below targets
+        # only the LaTeX/math patterns and preserves every other
+        # character, including non-ASCII ones.
+        text = _strip_latex_noise(data)
         if len(text) > self._max_chars:
             text = text[: self._max_chars]
         prompt = _build_prompt(text, purpose, project)
@@ -299,6 +306,22 @@ class StructureRole:
         # needs_curation would misclassify a deterministic bug as "bad
         # extraction" and hide it in a curation queue across an entire
         # batch instead of surfacing immediately. Let it propagate.
+
+
+def _strip_latex_noise(text: str) -> str:
+    """Strip LaTeX math/commands that reliably break JSON generation.
+
+    Deliberately narrower than ``researcher.roles._clean_for_json``: this
+    does NOT strip non-ASCII characters. structure() promises exact typed
+    fields (unlike summarization, which tolerates lossy compression), so
+    a name/title with accents or CJK characters must survive unmodified.
+    """
+    text = re.sub(r"\$\$.*?\$\$", "[math]", text, flags=re.DOTALL)
+    text = re.sub(r"\$[^$]+\$", "[math]", text)
+    text = re.sub(r"\\[a-zA-Z]+\{[^}]*\}", "", text)
+    text = re.sub(r"\\[a-zA-Z]+", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def _build_prompt(data: str, purpose: str, project: str) -> str:
