@@ -226,7 +226,7 @@ async def test_input_is_truncated_to_max_chars_before_prompting():
     pool = _pool([{"name": "Ada", "age": 36}])
     role = StructureRole(pool, max_chars=100)
 
-    await role.structure(data="x" * 5000, schema=PersonRecord, purpose="p")
+    result = await role.structure(data="x" * 5000, schema=PersonRecord, purpose="p")
 
     prompt = pool.get_client("structure").calls[0]["prompt"]
     # The prompt wraps the (truncated) data with purpose/project framing —
@@ -234,6 +234,22 @@ async def test_input_is_truncated_to_max_chars_before_prompting():
     # also contains incidental "x"s in its own scaffolding text).
     assert "x" * 101 not in prompt
     assert "x" * 100 in prompt
+    # Truncation is stamped, not silent: a schema-valid success built from
+    # truncated input may still be an INCOMPLETE record (relevant fields
+    # can live past the cutoff) — callers doing anything
+    # completeness-sensitive must be able to see this (codex P2, round 5).
+    assert result.truncated is True
+    assert result.provenance()["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_truncated_flag_false_when_input_fits():
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool, max_chars=10_000)
+
+    result = await role.structure(data="short text", schema=PersonRecord, purpose="p")
+
+    assert result.truncated is False
 
 
 @pytest.mark.asyncio
@@ -248,6 +264,28 @@ async def test_latex_noise_is_stripped_before_prompting():
     prompt = pool.get_client("structure").calls[0]["prompt"]
     assert "$" not in prompt
     assert r"\alpha" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_latex_command_braced_content_is_preserved():
+    """A braced LaTeX command's CONTENT is a real field value in
+    TeX/Markdown-derived text (e.g. \\textit{Ada Lovelace}) — only the
+    command wrapper should be dropped, not the name/title inside it
+    (codex P2, PR #77 round 5)."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(
+        data=r"Author: \textit{Ada Lovelace}, age \textbf{36}.",
+        schema=PersonRecord,
+        purpose="p",
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "Ada Lovelace" in prompt
+    assert "36" in prompt
+    assert "\\textit" not in prompt
+    assert "\\textbf" not in prompt
 
 
 @pytest.mark.asyncio

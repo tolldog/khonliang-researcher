@@ -110,6 +110,15 @@ class StructureResult:
     schema_name: str = ""
     errors: List[str] = field(default_factory=list)
     stamped_at: float = field(default_factory=time.time)
+    # True when ``data`` exceeded ``max_chars`` and was truncated before
+    # prompting. A schema-valid ``success=True`` result built from
+    # truncated input may still be INCOMPLETE (relevant fields can live
+    # past the cutoff in a long paper/page) — this is NOT folded into
+    # ``needs_curation`` (the extraction mechanism itself didn't fail),
+    # but it must not be silent either: a caller doing anything
+    # completeness-sensitive should check this flag explicitly (codex P2,
+    # PR #77 round 5).
+    truncated: bool = False
 
     def provenance(self) -> Dict[str, Any]:
         """Provenance stamp: model id + spec version + schema identity.
@@ -122,6 +131,7 @@ class StructureResult:
             "spec_version": self.spec_version,
             "schema": self.schema_name,
             "escalated": self.escalated,
+            "truncated": self.truncated,
             "stamped_at": self.stamped_at,
         }
 
@@ -206,7 +216,8 @@ class StructureRole:
         # only the LaTeX/math patterns and preserves every other
         # character, including non-ASCII ones.
         text = _strip_latex_noise(data)
-        if len(text) > self._max_chars:
+        truncated = len(text) > self._max_chars
+        if truncated:
             text = text[: self._max_chars]
         prompt = _build_prompt(text, purpose, project)
         errors: List[str] = []
@@ -228,6 +239,7 @@ class StructureRole:
                     escalated=False,
                     model_used=hot_model,
                     schema_name=schema_name,
+                    truncated=truncated,
                 )
             errors.append(f"attempt {attempt} ({hot_model}): {err}")
 
@@ -246,6 +258,7 @@ class StructureRole:
                 escalated=True,
                 model_used=esc_model,
                 schema_name=schema_name,
+                truncated=truncated,
             )
         errors.append(f"escalation ({esc_model}): {err}")
 
@@ -262,6 +275,7 @@ class StructureRole:
             escalated=True,
             model_used=esc_model,
             schema_name=schema_name,
+            truncated=truncated,
             errors=errors,
         )
 
@@ -309,16 +323,22 @@ class StructureRole:
 
 
 def _strip_latex_noise(text: str) -> str:
-    """Strip LaTeX math/commands that reliably break JSON generation.
+    """Strip LaTeX markup that reliably breaks JSON generation, preserving content.
 
-    Deliberately narrower than ``researcher.roles._clean_for_json``: this
-    does NOT strip non-ASCII characters. structure() promises exact typed
-    fields (unlike summarization, which tolerates lossy compression), so
-    a name/title with accents or CJK characters must survive unmodified.
+    Deliberately narrower than ``researcher.roles._clean_for_json`` in two
+    ways, both because structure() promises exact typed fields (unlike
+    summarization, which tolerates lossy compression):
+      - Does NOT strip non-ASCII characters (a name/title with accents or
+        CJK characters must survive unmodified).
+      - A braced command like ``\\textit{Ada Lovelace}`` keeps its BRACED
+        CONTENT and drops only the command wrapper — real field values
+        routinely live inside formatting commands in TeX/Markdown-derived
+        text (codex P2, PR #77 round 5); a bare, content-free command like
+        ``\\alpha`` has nothing to preserve and is dropped outright.
     """
     text = re.sub(r"\$\$.*?\$\$", "[math]", text, flags=re.DOTALL)
     text = re.sub(r"\$[^$]+\$", "[math]", text)
-    text = re.sub(r"\\[a-zA-Z]+\{[^}]*\}", "", text)
+    text = re.sub(r"\\[a-zA-Z]+\{([^}]*)\}", r"\1", text)
     text = re.sub(r"\\[a-zA-Z]+", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
