@@ -19,6 +19,9 @@ dependencies = [
     "markdownify>=0.12",
     "mcp>=1.0.0",
     "khonliang-bus-lib>=0.5.0",  # >=0.5.0 for Welcome / WelcomeEntryPoint exports
+    "pydantic>=2.0",  # researcher/structure.py targets caller-supplied
+                      # Pydantic schemas directly (fr_researcher_d813ad52);
+                      # was previously only a transitive dep via mcp/bus-lib.
 ]
 
 # khonliang-librarian-lib (SelfCatalog knowledge-owner contract,

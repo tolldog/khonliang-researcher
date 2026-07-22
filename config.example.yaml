@@ -12,6 +12,10 @@ models:
   idea_parser: llama3.2:3b
   embedder: nomic-embed-text
   reviewer: qwen2.5:32b
+  # structure()'s hot tier (fr_researcher_d813ad52, schema-constrained
+  # extraction). Falls back to `summarizer`'s model when omitted.
+  # Escalation tier reuses `reviewer` above rather than adding a second key.
+  structure: qwen2.5:7b
 
 model_timeouts:
   llama3.2:3b: 120

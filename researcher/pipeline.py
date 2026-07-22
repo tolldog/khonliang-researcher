@@ -39,6 +39,7 @@ from researcher.roles import SummarizerRole, ExtractorRole, AssessorRole
 from researcher.distill_lock import DistillLockStore
 from researcher.search_engines import search_papers
 from researcher.self_catalog import build_self_catalog, idea_index_record, paper_index_record
+from researcher.structure import StructureRole
 
 logger = logging.getLogger(__name__)
 
@@ -410,6 +411,12 @@ class ResearchPipeline:
         self.extractor = ExtractorRole(pool, domain_rules=domain_rules_text)
         self.assessor = AssessorRole(pool, domain_rules=domain_rules_text)
         self.idea_parser = IdeaParserRole(pool)
+        # structure(): schema-constrained extraction, distill's typed
+        # sibling (fr_researcher_d813ad52). Hot tier defaults to the
+        # "structure" pool role (falls back to summarizer's model when
+        # unconfigured — see create_pipeline); escalation reuses the
+        # existing "reviewer" tier rather than adding a second config key.
+        self.structure = StructureRole(pool)
 
         # Persistent blackboard for relevance signal learning
         from khonliang.gateway.blackboard import Blackboard
@@ -3390,12 +3397,17 @@ def create_pipeline(config_path: str = "config.yaml") -> ResearchPipeline:
     triples = TripleStore(db_path, predicate_aliases=predicate_aliases)
     digest = DigestStore(db_path)
 
+    _models_cfg = config.get("models", {})
     role_model_map = {
-        "summarizer": config.get("models", {}).get("summarizer", "qwen2.5:7b"),
-        "extractor": config.get("models", {}).get("extractor", "llama3.2:3b"),
-        "assessor": config.get("models", {}).get("assessor", "llama3.2:3b"),
-        "idea_parser": config.get("models", {}).get("idea_parser", "llama3.2:3b"),
-        "reviewer": config.get("models", {}).get("reviewer", "qwen2.5:32b"),
+        "summarizer": _models_cfg.get("summarizer", "qwen2.5:7b"),
+        "extractor": _models_cfg.get("extractor", "llama3.2:3b"),
+        "assessor": _models_cfg.get("assessor", "llama3.2:3b"),
+        "idea_parser": _models_cfg.get("idea_parser", "llama3.2:3b"),
+        "reviewer": _models_cfg.get("reviewer", "qwen2.5:32b"),
+        # structure()'s hot tier (fr_researcher_d813ad52). Falls back to
+        # the summarizer's model when unconfigured — same size class as
+        # the other hot-tier roles above.
+        "structure": _models_cfg.get("structure", _models_cfg.get("summarizer", "qwen2.5:7b")),
     }
     ollama_url = config.get("ollama_url", "http://localhost:11434")
     model_timeouts = config.get("model_timeouts", {})
