@@ -376,13 +376,24 @@ _LATEX_STRUCTURAL_MARKERS = re.compile(
 )
 
 # Weaker signal: a backslash-letters run immediately followed by a brace
-# group (``\command{...}``) or inline ``$...$`` math. Either shape is
-# rare outside LaTeX (a Windows path or a regex has no braces after the
-# backslash run; a stray "$5...$10" price pair has no braces either), but
-# a SINGLE occurrence could still be incidental, so this signal only
-# counts once it reaches `_LATEX_MIN_WEAK_SIGNALS` hits combined.
+# group (``\command{...}``). Rare outside LaTeX (a Windows path or a
+# regex has no braces after the backslash run), but a SINGLE occurrence
+# could still be incidental, so this signal only counts once it reaches
+# `_LATEX_MIN_WEAK_SIGNALS` hits.
+#
+# Deliberately does NOT count bare ``$...$`` pairs as a weak signal
+# (codex P2, PR #77 round 11): ordinary prose mentioning two dollar
+# amounts in the same snippet ("costs $5, shipping is $10") forms two
+# non-overlapping ``$...$``-shaped spans by the same naive regex a real
+# inline-math detector would use, which met the >=2 threshold and
+# triggered sanitization on ordinary currency text — the false positive
+# this whole tri-state design exists to prevent. ``$$``/``\[``/``\]``
+# DISPLAY math stay in `_LATEX_STRUCTURAL_MARKERS` above (those don't
+# false-positive on currency), so real math-heavy LaTeX is still caught
+# via display math or the command-density signal below; bare single-$
+# inline math is simply not a reliable enough signal on its own to
+# justify the false-positive risk.
 _LATEX_COMMAND_WITH_ARGS = re.compile(r"\\[a-zA-Z]+\{[^}]*\}")
-_LATEX_INLINE_MATH = re.compile(r"\$[^$\n]{1,200}\$")
 _LATEX_MIN_WEAK_SIGNALS = 2
 
 
@@ -394,8 +405,8 @@ def _looks_like_latex(text: str) -> bool:
     than requiring every caller to know their content type in advance.
 
     Checked a maintained library first rather than hand-rolling another
-    regex (this exact file has had three straight review rounds of
-    regex-based LaTeX-handling bugs — codex P2, PR #77 rounds 3/7/8):
+    regex (this exact file has had multiple review rounds of regex-based
+    LaTeX-handling bugs — codex P2, PR #77 rounds 3/7/8/11):
       - ``python-magic``/libmagic: NOT installed in this repo or anywhere
         else in the khonliang ecosystem (only the system `libmagic1`
         shared library is present, not the Python binding or the
@@ -413,20 +424,17 @@ def _looks_like_latex(text: str) -> bool:
         one lightweight content sniff, which is disproportionate for
         this single call site.
     Neither fit cleanly, so this stays a small, conservative, dependency-
-    free heuristic — see module docstring notes on rounds 3/7/8/9 for why
-    "conservative" (bias away from triggering) matters more here than
+    free heuristic — see module docstring notes on rounds 3/7/8/9/11 for
+    why "conservative" (bias away from triggering) matters more here than
     catching every possible LaTeX shape: false negatives (falling back to
     raw, unsanitized text) are SAFE, a caller can still force
-    ``sanitize_latex=True``; false positives (sanitizing a Windows path
-    or regex-heavy string) are exactly what caused the bugs this
-    tri-state design exists to prevent.
+    ``sanitize_latex=True``; false positives (sanitizing a Windows path,
+    a regex-heavy string, or ordinary prose mentioning currency) are
+    exactly what caused the bugs this tri-state design exists to prevent.
     """
     if _LATEX_STRUCTURAL_MARKERS.search(text):
         return True
-    weak_signals = len(_LATEX_COMMAND_WITH_ARGS.findall(text)) + len(
-        _LATEX_INLINE_MATH.findall(text)
-    )
-    return weak_signals >= _LATEX_MIN_WEAK_SIGNALS
+    return len(_LATEX_COMMAND_WITH_ARGS.findall(text)) >= _LATEX_MIN_WEAK_SIGNALS
 
 
 def _strip_latex_noise(text: str) -> str:
@@ -480,23 +488,37 @@ def _process_latex_commands(text: str) -> str:
     FIRST ``}``, so it can never handle nesting by construction — that's
     the wrong tool, not a matter of degree. This instead walks the string
     tracking an explicit brace-depth counter per argument
-    (``_read_balanced_brace_group``), so a nested brace
+    (``_read_balanced_group``), so a nested brace
     (``\\textit{Ada {Byron}}``) stays inside the argument instead of
     ending it early and leaving a dangling ``}`` in the output.
 
     Per command, after locating its name:
+      - An optional ``*`` (starred variant, e.g. ``\\section*{...}``) and
+        an optional bracket-balanced ``[...]`` (LaTeX's optional-argument
+        syntax, e.g. ``\\section[Short]{Long}``) are SKIPPED — neither
+        counts as a required brace-group argument, and neither is kept in
+        the output — before looking for the real ``{...}`` argument(s)
+        (codex P2, PR #77 round 11). Without this, a command's argument
+        was assumed to start immediately with ``{``, so
+        ``\\section*{Biography}``/``\\section[Short]{Long}`` fell into the
+        "no args" branch below and were corrupted into a stray
+        ``*{Biography}``/``[Short]{Long}`` (the command name lost, but
+        the star/bracket wrongly left behind as if it were content).
       - 0 brace-group arguments (a bare command like ``\\alpha``) — drop
-        the command name, keep scanning.
+        the command name (and any star/bracket after it), keep scanning.
       - 1 argument — unwrap to its content, recursively processed (so a
         nested single-arg command inside it, e.g.
-        ``\\textit{\\emph{X}}``, also gets unwrapped).
+        ``\\textit{\\emph{X}}``, also gets unwrapped). Any skipped ``[...]``
+        optional-argument content is discarded, not appended — it's a
+        short-form alternate (e.g. a TOC entry), not the main value.
       - 2+ arguments (``\\href{url}{title}``) — leave the ENTIRE command
-        (name + every argument, verbatim, including any nesting inside
-        them) untouched rather than guessed at.
-    An unbalanced/unterminated ``{`` (malformed input) stops argument
-    collection at that point rather than scanning to the end of the
-    string; whatever arguments were already validly collected are still
-    used, and the unterminated remainder is left as ordinary literal text.
+        (name + star/bracket + every argument, verbatim, including any
+        nesting inside them) untouched rather than guessed at.
+    An unbalanced/unterminated ``{`` or ``[`` (malformed input) stops
+    argument collection at that point rather than scanning to the end of
+    the string; whatever arguments were already validly collected are
+    still used, and the unterminated remainder is left as ordinary
+    literal text.
     """
     name_re = re.compile(r"[a-zA-Z]+")
     out: List[str] = []
@@ -516,10 +538,19 @@ def _process_latex_commands(text: str) -> str:
             continue
 
         after_name = m.end()
-        args: List[str] = []
         k = after_name
+
+        if k < n and text[k] == "*":  # starred variant, e.g. \section*{...}
+            k += 1
+
+        if k < n and text[k] == "[":  # optional arg, e.g. \section[Short]{...}
+            _, bracket_end = _read_balanced_group(text, k, "[", "]")
+            if bracket_end != k:  # only advance if the brackets balanced
+                k = bracket_end
+
+        args: List[str] = []
         while k < n and text[k] == "{":
-            arg, end = _read_balanced_brace_group(text, k)
+            arg, end = _read_balanced_group(text, k, "{", "}")
             if arg is None:
                 break  # unterminated -- stop collecting, keep what we have
             args.append(arg)
@@ -537,20 +568,25 @@ def _process_latex_commands(text: str) -> str:
     return "".join(out)
 
 
-def _read_balanced_brace_group(text: str, start: int) -> Tuple[Optional[str], int]:
-    """Read one brace-balanced ``{...}`` group starting at ``text[start] == '{'``.
+def _read_balanced_group(
+    text: str, start: int, open_ch: str, close_ch: str
+) -> Tuple[Optional[str], int]:
+    """Read one ``open_ch...close_ch``-balanced group starting at ``text[start] == open_ch``.
 
-    Tracks a depth counter (+1 on ``{``, -1 on ``}``) so a NESTED brace
-    inside the group stays part of its content instead of ending the
-    group at the first ``}`` encountered. Returns ``(content, end)`` with
-    ``end`` one past the matching closing brace, or ``(None, start)`` if
-    the braces never balance before the end of the string.
+    Tracks a depth counter (+1 on ``open_ch``, -1 on ``close_ch``) so a
+    NESTED occurrence of ``open_ch`` inside the group stays part of its
+    content instead of ending the group at the first ``close_ch``
+    encountered. Returns ``(content, end)`` with ``end`` one past the
+    matching closing delimiter, or ``(None, start)`` if the delimiters
+    never balance before the end of the string. Used for both LaTeX's
+    required ``{...}`` arguments and its optional ``[...]`` arguments —
+    same balancing logic, different delimiter pair.
     """
     depth = 0
     for idx in range(start, len(text)):
-        if text[idx] == "{":
+        if text[idx] == open_ch:
             depth += 1
-        elif text[idx] == "}":
+        elif text[idx] == close_ch:
             depth -= 1
             if depth == 0:
                 return text[start + 1 : idx], idx + 1

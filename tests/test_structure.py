@@ -416,6 +416,77 @@ async def test_nested_single_arg_command_is_recursively_unwrapped():
     assert "}" not in prompt
 
 
+@pytest.mark.asyncio
+async def test_starred_command_unwraps_correctly():
+    """A command's argument was assumed to start immediately with `{`, so
+    a starred variant like \\section*{Biography} fell into the "no args"
+    branch and was corrupted into a stray "*{Biography}" -- the command
+    name lost, but the star wrongly left behind as if it were content
+    (codex P2, PR #77 round 11). The `*` must be skipped (and dropped,
+    not kept) before looking for the real argument."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(
+        data=r"\section*{Biography} Ada Lovelace, born 1815.",
+        schema=PersonRecord,
+        purpose="p",
+        sanitize_latex=True,
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "Biography" in prompt
+    assert "\\section" not in prompt
+    assert "*{" not in prompt
+    assert "*" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_optional_bracket_arg_command_unwraps_correctly():
+    """\\section[Short]{Long}'s argument was assumed to start immediately
+    with `{`, so the `[Short]` optional arg was wrongly left behind as if
+    it were content, corrupting the command into a stray "[Short]{Long}"
+    (codex P2, PR #77 round 11). The `[...]` optional arg must be skipped
+    AND discarded (it's a short-form alternate, not the main value) —
+    only the required `{Long}` argument is kept."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(
+        data=r"\section[Short]{Long Biography} Ada Lovelace, born 1815.",
+        schema=PersonRecord,
+        purpose="p",
+        sanitize_latex=True,
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "Long Biography" in prompt
+    assert "Short" not in prompt
+    assert "\\section" not in prompt
+    assert "[" not in prompt
+    assert "]" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_multi_arg_command_with_optional_bracket_left_untouched():
+    """A 2+-required-arg command with an optional bracket in front
+    (\\href[opt]{url}{title}) still follows the "leave the whole span
+    untouched" rule for 2+ args -- the bracket must be included in the
+    untouched span, not dropped separately."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(
+        data=r"\href[opt]{https://example.com}{Paper Title} end.",
+        schema=PersonRecord,
+        purpose="p",
+        sanitize_latex=True,
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert r"\href[opt]{https://example.com}{Paper Title}" in prompt
+
+
 # --- sanitize_latex tri-state: default (None) auto-detects; explicit True/
 # False overrides it either way (codex P2, PR #77 round 9 -> round 10) ---
 
@@ -500,6 +571,26 @@ async def test_default_does_not_sanitize_light_inline_math():
 
     prompt = pool.get_client("structure").calls[0]["prompt"]
     assert data in prompt
+
+
+@pytest.mark.asyncio
+async def test_default_does_not_sanitize_multiple_currency_mentions():
+    """Bare $...$ pairs are NOT counted as a weak LaTeX signal at all
+    (codex P2, PR #77 round 11): ordinary prose mentioning TWO OR MORE
+    dollar amounts in the same snippet forms multiple non-overlapping
+    $...$-shaped spans by the same naive regex a real inline-math
+    detector would use, which met the old >=2 threshold and triggered
+    sanitization -- replacing legitimate currency values with "[math]".
+    This must not happen regardless of how many $ amounts appear."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    data = "The item costs $5. Shipping is $10. Total varies between $15 and $20."
+    await role.structure(data=data, schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert data in prompt
+    assert "[math]" not in prompt
 
 
 @pytest.mark.asyncio
