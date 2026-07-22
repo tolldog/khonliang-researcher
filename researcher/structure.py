@@ -519,6 +519,19 @@ def _process_latex_commands(text: str) -> str:
     the string; whatever arguments were already validly collected are
     still used, and the unterminated remainder is left as ordinary
     literal text.
+
+    Known limitations (documented, not chased further — PR #77 round 12):
+    a command's ``*``/``[...]``/``{...}`` must follow the command name with
+    no intervening whitespace (``\\textit {Ada}`` is not recognized as
+    having an argument); a command with only a star/optional-bracket and
+    no required brace argument (``\\item[Pros]``) leaks the bracket content
+    back into the output instead of being discarded. LaTeX comments
+    (``% ...``) and verbatim/listing blocks (``\\begin{verbatim}``,
+    ``\\verb|...|``) are also not specially handled. All are real-LaTeX-
+    fidelity gaps (occasional stray syntax fragments reach the model), not
+    non-LaTeX-content-corruption bugs — the schema-validation retry/
+    escalate/``needs_curation`` loop in ``StructureRole`` remains the
+    correctness backstop regardless of sanitizer fidelity.
     """
     name_re = re.compile(r"[a-zA-Z]+")
     out: List[str] = []
