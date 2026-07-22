@@ -197,6 +197,7 @@ class StructureRole:
         schema: Type[BaseModel],
         purpose: str,
         project: str = "",
+        sanitize_latex: Optional[bool] = None,
     ) -> StructureResult:
         """Extract ``data`` into ``schema``, escalating through the tier ladder.
 
@@ -214,26 +215,47 @@ class StructureRole:
                 Kept as an explicit param (not smuggled into ``purpose``
                 text) so future few-shot support has a stable place to
                 read it from.
+            sanitize_latex: Tri-state control over LaTeX-only
+                preprocessing (see ``_strip_latex_noise``):
+                  - ``None`` (default) — AUTO-DETECT from ``data`` itself
+                    via ``_looks_like_latex`` and only sanitize when real
+                    LaTeX signals are present.
+                  - ``True`` — force sanitization on regardless of the
+                    heuristic (a caller who knows the source is
+                    TeX-derived but the heuristic is unsure, e.g. very
+                    short input).
+                  - ``False`` — force it off; ``data`` goes to the model
+                    completely unmodified.
+                This started as a plain opt-in (default off) after an
+                earlier version ran the equivalent cleanup
+                unconditionally on every call and silently mangled
+                non-LaTeX backslash content — a Windows path, a regex, an
+                escape sequence — for callers who never had TeX-derived
+                input (codex P2, PR #77 round 9). A plain opt-in flag
+                pushed the content-type judgment entirely onto the
+                caller, though, and LaTeX handling IS genuinely valuable
+                for sources that actually use it (arXiv abstracts, LaTeX
+                papers) — so detect-then-sanitize replaces "caller must
+                know in advance" with a conservative content sniff,
+                while keeping the explicit override for a caller who
+                knows better than the heuristic either way.
         """
         schema_name = schema.__name__
         schema_json = schema.model_json_schema()
 
-        # Sanitize (strip LaTeX-only noise that reliably breaks JSON
-        # generation) and truncate to a conservative char budget BEFORE
-        # prompting, not after a failed attempt: an oversized or
-        # math-heavy input would otherwise burn every hot-tier/escalation
-        # attempt and land in needs_curation for reasons that have
-        # nothing to do with the model's extraction quality (codex P2,
-        # PR #77 round 3). Deliberately NOT SummarizerRole's
-        # ``_clean_for_json`` (codex P2, round 4): that helper also
-        # strips ALL non-ASCII text, which is fine for lossy summarization
-        # but wrong here — structure() promises exact typed fields, so
-        # silently dropping accented/CJK characters from a name or title
-        # would return a schema-valid but CORRUPTED record without ever
-        # setting needs_curation. ``_strip_latex_noise`` below targets
-        # only the LaTeX/math patterns and preserves every other
-        # character, including non-ASCII ones.
-        text = _strip_latex_noise(data)
+        should_sanitize = (
+            _looks_like_latex(data) if sanitize_latex is None else sanitize_latex
+        )
+
+        # Truncate to a conservative char budget BEFORE prompting, not
+        # after a failed attempt: an oversized input would otherwise burn
+        # every hot-tier/escalation attempt and land in needs_curation for
+        # reasons that have nothing to do with the model's extraction
+        # quality (codex P2, PR #77 round 3). This always applies,
+        # independent of ``sanitize_latex`` — context-window overflow
+        # protection is unrelated to LaTeX and is not the thing that was
+        # made opt-in/auto-detected.
+        text = _strip_latex_noise(data) if should_sanitize else data
         truncated = len(text) > self._max_chars
         if truncated:
             text = text[: self._max_chars]
@@ -343,8 +365,87 @@ class StructureRole:
         # batch instead of surfacing immediately. Let it propagate.
 
 
+# Structural LaTeX markers: essentially never appear outside real TeX
+# source, so a SINGLE occurrence of any of these is sufficient evidence
+# on its own (codex P2, PR #77 round 9 follow-up — auto-detection).
+_LATEX_STRUCTURAL_MARKERS = re.compile(
+    r"\\begin\{|\\end\{|\\documentclass|\\usepackage"
+    r"|\\section\{|\\subsection\{|\\chapter\{"
+    r"|\\cite\{|\\ref\{|\\label\{"
+    r"|\$\$|\\\[|\\\]"
+)
+
+# Weaker signal: a backslash-letters run immediately followed by a brace
+# group (``\command{...}``) or inline ``$...$`` math. Either shape is
+# rare outside LaTeX (a Windows path or a regex has no braces after the
+# backslash run; a stray "$5...$10" price pair has no braces either), but
+# a SINGLE occurrence could still be incidental, so this signal only
+# counts once it reaches `_LATEX_MIN_WEAK_SIGNALS` hits combined.
+_LATEX_COMMAND_WITH_ARGS = re.compile(r"\\[a-zA-Z]+\{[^}]*\}")
+_LATEX_INLINE_MATH = re.compile(r"\$[^$\n]{1,200}\$")
+_LATEX_MIN_WEAK_SIGNALS = 2
+
+
+def _looks_like_latex(text: str) -> bool:
+    """Conservative content sniff: does ``text`` look like real LaTeX source?
+
+    Used by ``structure(..., sanitize_latex=None)`` (the default) to
+    auto-detect whether ``_strip_latex_noise`` should run at all, rather
+    than requiring every caller to know their content type in advance.
+
+    Checked a maintained library first rather than hand-rolling another
+    regex (this exact file has had three straight review rounds of
+    regex-based LaTeX-handling bugs — codex P2, PR #77 rounds 3/7/8):
+      - ``python-magic``/libmagic: NOT installed in this repo or anywhere
+        else in the khonliang ecosystem (only the system `libmagic1`
+        shared library is present, not the Python binding or the
+        `python-magic` package) — would be a new dependency for exactly
+        one call site.
+      - ``pygments`` (``guess_lexer``): present in this dev venv only as
+        an UNDECLARED transitive dependency of ``pytest``
+        (`pytest -> pygments>=2.7.2`) — not a production dependency of
+        this package, and not guaranteed present in a deployed agent
+        that doesn't install test tooling. Manually verified
+        ``guess_lexer`` correctly tags real LaTeX source as ``"TeX"`` and
+        (usefully) never mistags a Windows path or regex-heavy string as
+        ``"TeX"`` either — but making it a real production dependency
+        pulls in a full multi-language syntax-highlighting library for
+        one lightweight content sniff, which is disproportionate for
+        this single call site.
+    Neither fit cleanly, so this stays a small, conservative, dependency-
+    free heuristic — see module docstring notes on rounds 3/7/8/9 for why
+    "conservative" (bias away from triggering) matters more here than
+    catching every possible LaTeX shape: false negatives (falling back to
+    raw, unsanitized text) are SAFE, a caller can still force
+    ``sanitize_latex=True``; false positives (sanitizing a Windows path
+    or regex-heavy string) are exactly what caused the bugs this
+    tri-state design exists to prevent.
+    """
+    if _LATEX_STRUCTURAL_MARKERS.search(text):
+        return True
+    weak_signals = len(_LATEX_COMMAND_WITH_ARGS.findall(text)) + len(
+        _LATEX_INLINE_MATH.findall(text)
+    )
+    return weak_signals >= _LATEX_MIN_WEAK_SIGNALS
+
+
 def _strip_latex_noise(text: str) -> str:
     """Strip LaTeX markup that reliably breaks JSON generation, preserving content.
+
+    ONLY called when ``structure()`` decides ``should_sanitize`` is True —
+    either ``_looks_like_latex`` auto-detected real LaTeX signals (the
+    default, ``sanitize_latex=None``) or a caller forced it on explicitly
+    (``sanitize_latex=True``, codex P2, PR #77 rounds 9/10) — appropriate
+    ONLY for genuinely TeX-derived source text (LaTeX papers, arXiv
+    abstracts). Even the brace-balanced version here is not a safe
+    default for arbitrary text: it still unconditionally treats
+    ``$...$``/``$$...$$`` as math-mode delimiters and any ``\\<letters>``
+    run as a LaTeX command — both are common in non-LaTeX text that has
+    nothing to do with TeX (a price like ``$5`` next to another ``$10``,
+    a Windows path ``C:\\Users\\foo``, a regex escape like ``\\d+``), and
+    this function will still mangle those inputs if it's told to run on
+    them. That's why this is gated behind detection/an explicit override
+    rather than run unconditionally.
 
     Deliberately narrower than ``researcher.roles._clean_for_json`` in two
     ways, both because structure() promises exact typed fields (unlike

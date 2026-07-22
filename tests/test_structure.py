@@ -255,11 +255,20 @@ async def test_truncated_flag_false_when_input_fits():
 @pytest.mark.asyncio
 async def test_latex_noise_is_stripped_before_prompting():
     """LaTeX math reliably breaks JSON generation — structure() strips it
-    before prompting, same reasoning as SummarizerRole's _clean_for_json."""
+    before prompting, same reasoning as SummarizerRole's _clean_for_json.
+    Forces sanitize_latex=True: a single inline $...$ pair is below the
+    auto-detection heuristic's threshold on its own (codex P2, PR #77
+    round 10 -- auto-detect), so this test targets _strip_latex_noise's
+    mechanics directly rather than depending on heuristic tuning."""
     pool = _pool([{"name": "Ada", "age": 36}])
     role = StructureRole(pool)
 
-    await role.structure(data=r"Ada's age is $\alpha$ years.", schema=PersonRecord, purpose="p")
+    await role.structure(
+        data=r"Ada's age is $\alpha$ years.",
+        schema=PersonRecord,
+        purpose="p",
+        sanitize_latex=True,
+    )
 
     prompt = pool.get_client("structure").calls[0]["prompt"]
     assert "$" not in prompt
@@ -271,7 +280,10 @@ async def test_latex_command_braced_content_is_preserved():
     """A braced LaTeX command's CONTENT is a real field value in
     TeX/Markdown-derived text (e.g. \\textit{Ada Lovelace}) — only the
     command wrapper should be dropped, not the name/title inside it
-    (codex P2, PR #77 round 5)."""
+    (codex P2, PR #77 round 5). Forces sanitize_latex=True for a
+    deterministic test of _strip_latex_noise's mechanics rather than
+    depending on heuristic tuning (this input WOULD also auto-trigger,
+    since it has 2 braced commands, but explicit is clearer intent)."""
     pool = _pool([{"name": "Ada", "age": 36}])
     role = StructureRole(pool)
 
@@ -279,6 +291,7 @@ async def test_latex_command_braced_content_is_preserved():
         data=r"Author: \textit{Ada Lovelace}, age \textbf{36}.",
         schema=PersonRecord,
         purpose="p",
+        sanitize_latex=True,
     )
 
     prompt = pool.get_client("structure").calls[0]["prompt"]
@@ -294,11 +307,20 @@ async def test_non_ascii_text_survives_sanitization():
     so accented/CJK characters in the source text must NOT be stripped —
     codex P2, PR #77 round 4: SummarizerRole's _clean_for_json strips ALL
     non-ASCII, which would silently corrupt a name/title into a schema-valid
-    but wrong record without ever setting needs_curation."""
+    but wrong record without ever setting needs_curation. Forces
+    sanitize_latex=True: this plain-prose input has no LaTeX signals at
+    all and would NOT auto-trigger sanitization on its own -- this test
+    specifically targets _strip_latex_noise's non-ASCII-preserving
+    behavior, not the auto-detection heuristic."""
     pool = _pool([{"name": "Ada", "age": 36}])
     role = StructureRole(pool)
 
-    await role.structure(data="Author:édouard É 中文", schema=PersonRecord, purpose="p")
+    await role.structure(
+        data="Author:édouard É 中文",
+        schema=PersonRecord,
+        purpose="p",
+        sanitize_latex=True,
+    )
 
     prompt = pool.get_client("structure").calls[0]["prompt"]
     assert "édouard" in prompt
@@ -312,7 +334,10 @@ async def test_multi_arg_latex_commands_are_left_untouched():
     "1{2}") — unambiguous data loss the model never gets a chance to
     recover from. A command with 2+ brace-group arguments must be left
     completely untouched instead of guessed at; under-stripping is a much
-    smaller quality hit than mangling (codex P2, PR #77 round 7)."""
+    smaller quality hit than mangling (codex P2, PR #77 round 7). Forces
+    sanitize_latex=True for a deterministic test of _strip_latex_noise's
+    mechanics (this input would also auto-trigger, since it has 2
+    command-with-args matches, but explicit is clearer intent)."""
     pool = _pool([{"name": "Ada", "age": 36}])
     role = StructureRole(pool)
 
@@ -320,6 +345,7 @@ async def test_multi_arg_latex_commands_are_left_untouched():
         data=r"See \href{https://example.com}{Paper Title} and \frac{1}{2}.",
         schema=PersonRecord,
         purpose="p",
+        sanitize_latex=True,
     )
 
     prompt = pool.get_client("structure").calls[0]["prompt"]
@@ -338,7 +364,11 @@ async def test_nested_braces_in_single_arg_command_do_not_truncate_early():
     dangling "}" in the output — real corruption on a realistic input (a
     name/title with an internal aside). Brace-balanced scanning must
     track nesting depth so the argument ends at the correctly MATCHING
-    closing brace (codex P2, PR #77 round 8)."""
+    closing brace (codex P2, PR #77 round 8). Forces sanitize_latex=True:
+    this input has only one command-with-args match by regex count (the
+    nested brace means the naive count under-counts it), below the
+    auto-detection threshold on its own -- this test targets
+    _strip_latex_noise's mechanics directly."""
     pool = _pool([{"name": "Ada", "age": 36}])
     role = StructureRole(pool)
 
@@ -346,6 +376,7 @@ async def test_nested_braces_in_single_arg_command_do_not_truncate_early():
         data=r"Author: \textit{Ada {Byron}}, Countess.",
         schema=PersonRecord,
         purpose="p",
+        sanitize_latex=True,
     )
 
     prompt = pool.get_client("structure").calls[0]["prompt"]
@@ -363,7 +394,10 @@ async def test_nested_braces_in_single_arg_command_do_not_truncate_early():
 async def test_nested_single_arg_command_is_recursively_unwrapped():
     """A single-arg command nested inside another single-arg command
     (\\textit{\\emph{Ada}}) should have BOTH layers unwrapped, not just
-    the outer one."""
+    the outer one. Forces sanitize_latex=True: nested commands collapse
+    to a single regex match by count, below the auto-detection threshold
+    on its own -- this test targets _strip_latex_noise's mechanics
+    directly."""
     pool = _pool([{"name": "Ada", "age": 36}])
     role = StructureRole(pool)
 
@@ -371,6 +405,7 @@ async def test_nested_single_arg_command_is_recursively_unwrapped():
         data=r"Name: \textit{\emph{Ada}}.",
         schema=PersonRecord,
         purpose="p",
+        sanitize_latex=True,
     )
 
     prompt = pool.get_client("structure").calls[0]["prompt"]
@@ -379,6 +414,127 @@ async def test_nested_single_arg_command_is_recursively_unwrapped():
     assert "\\emph" not in prompt
     assert "{" not in prompt
     assert "}" not in prompt
+
+
+# --- sanitize_latex tri-state: default (None) auto-detects; explicit True/
+# False overrides it either way (codex P2, PR #77 round 9 -> round 10) ---
+
+
+@pytest.mark.asyncio
+async def test_default_auto_detects_real_latex_source_and_sanitizes():
+    """Real LaTeX-source-shaped input (structural markers: \\documentclass,
+    \\begin{document}, \\section{...}) auto-triggers sanitization with NO
+    explicit sanitize_latex argument -- the whole point of detect-then-
+    sanitize is that a caller with genuinely TeX-derived input doesn't
+    have to know to opt in."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    data = (
+        r"\documentclass{article}" "\n"
+        r"\begin{document}" "\n"
+        r"\section{Biography}" "\n"
+        r"\textit{Ada Lovelace} was born in 1815." "\n"
+        r"\end{document}"
+    )
+    await role.structure(data=data, schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "\\documentclass" not in prompt
+    assert "\\begin{document}" not in prompt
+    assert "\\section" not in prompt
+    assert "\\textit" not in prompt
+    assert "Ada Lovelace" in prompt
+
+
+@pytest.mark.asyncio
+async def test_default_does_not_sanitize_plain_prose():
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    data = "Ada Lovelace was born in London in 1815 and worked with Charles Babbage."
+    await role.structure(data=data, schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert data in prompt  # byte-for-byte untouched
+
+
+@pytest.mark.asyncio
+async def test_default_does_not_sanitize_windows_path():
+    """A Windows path is all backslashes and no braces -- exactly the
+    non-LaTeX content that got silently mangled when sanitization ran
+    unconditionally (codex P2, PR #77 round 9). Must not auto-trigger."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    data = r"See C:\Users\foo\bar.txt and C:\Windows\System32\drivers\etc\hosts."
+    await role.structure(data=data, schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert data in prompt
+
+
+@pytest.mark.asyncio
+async def test_default_does_not_sanitize_regex_heavy_text():
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    data = r"Pattern: \d+\s*\w+ matches identifiers like \b[A-Z]\w*\b in text."
+    await role.structure(data=data, schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert data in prompt
+
+
+@pytest.mark.asyncio
+async def test_default_does_not_sanitize_light_inline_math():
+    """A single incidental $...$ pair (e.g. a price range) is below the
+    auto-detection threshold -- real TeX source has MANY such patterns,
+    not one (codex P2, PR #77 round 9 finding: this exact shape of input
+    was being corrupted by unconditional sanitization)."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    data = "The price is $5 today and $10 tomorrow."
+    await role.structure(data=data, schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert data in prompt
+
+
+@pytest.mark.asyncio
+async def test_explicit_true_overrides_heuristic_on_ambiguous_input():
+    """A caller who knows better than the heuristic (e.g. short TeX
+    snippet with only one command) can force sanitization on."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    await role.structure(
+        data=r"\textit{Ada Lovelace}",
+        schema=PersonRecord,
+        purpose="p",
+        sanitize_latex=True,
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "\\textit" not in prompt
+    assert "Ada Lovelace" in prompt
+
+
+@pytest.mark.asyncio
+async def test_explicit_false_overrides_heuristic_on_real_latex():
+    """A caller who wants the raw text regardless (e.g. inspecting the
+    literal source) can force sanitization off even on real LaTeX."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    data = r"\begin{document}\textit{Ada Lovelace}\end{document}"
+    await role.structure(
+        data=data, schema=PersonRecord, purpose="p", sanitize_latex=False
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert data in prompt
 
 
 @pytest.mark.asyncio
