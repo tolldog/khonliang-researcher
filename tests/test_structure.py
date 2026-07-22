@@ -594,6 +594,48 @@ async def test_default_does_not_sanitize_multiple_currency_mentions():
 
 
 @pytest.mark.asyncio
+async def test_escaped_dollar_currency_survives_real_latex_sanitization():
+    """An escaped ``\\$`` is a literal currency sign in TeX, not a
+    math-mode delimiter -- the sanitizer must not treat the span between
+    two escaped dollar signs as inline math (codex P2, PR #77 round 13:
+    this was silently deleting legitimate currency values, e.g. "\\$5
+    ... \\$10" collapsing to "[math]", whenever real LaTeX also
+    happened to quote a price)."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    data = r"\section{Invoice} The item costs \$5 and shipping is \$10."
+    await role.structure(
+        data=data, schema=PersonRecord, purpose="p", sanitize_latex=True
+    )
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "[math]" not in prompt
+    assert r"\$5" in prompt
+    assert r"\$10" in prompt
+
+
+@pytest.mark.asyncio
+async def test_default_auto_detects_starred_and_optional_arg_sections():
+    """``\\section*{...}`` and ``\\section[Short]{...}`` are common,
+    valid LaTeX sectioning forms that ``_process_latex_commands`` already
+    cleans correctly -- but the structural-marker detector only matched
+    the bare ``\\section{`` form, so real LaTeX using these forms skipped
+    auto-detection entirely and sanitization never ran (codex P2, PR #77
+    round 13)."""
+    pool = _pool([{"name": "Ada", "age": 36}])
+    role = StructureRole(pool)
+
+    data = r"\section*{Biography} \textit{Ada Lovelace} was a mathematician."
+    await role.structure(data=data, schema=PersonRecord, purpose="p")
+
+    prompt = pool.get_client("structure").calls[0]["prompt"]
+    assert "\\section" not in prompt
+    assert "\\textit" not in prompt
+    assert "Ada Lovelace" in prompt
+
+
+@pytest.mark.asyncio
 async def test_explicit_true_overrides_heuristic_on_ambiguous_input():
     """A caller who knows better than the heuristic (e.g. short TeX
     snippet with only one command) can force sanitization on."""

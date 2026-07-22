@@ -368,9 +368,15 @@ class StructureRole:
 # Structural LaTeX markers: essentially never appear outside real TeX
 # source, so a SINGLE occurrence of any of these is sufficient evidence
 # on its own (codex P2, PR #77 round 9 follow-up — auto-detection).
+#
+# ``\*?(?:\[[^\]]*\])?`` after the sectioning commands allows the
+# starred (``\section*{``) and optional-arg (``\section[Short]{``) forms
+# that ``_process_latex_commands`` already knows how to clean (codex P2,
+# PR #77 round 13) — without it, real LaTeX using these common forms
+# skipped auto-detection and sanitization never ran.
 _LATEX_STRUCTURAL_MARKERS = re.compile(
     r"\\begin\{|\\end\{|\\documentclass|\\usepackage"
-    r"|\\section\{|\\subsection\{|\\chapter\{"
+    r"|\\section\*?(?:\[[^\]]*\])?\{|\\subsection\*?(?:\[[^\]]*\])?\{|\\chapter\*?(?:\[[^\]]*\])?\{"
     r"|\\cite\{|\\ref\{|\\label\{"
     r"|\$\$|\\\[|\\\]"
 )
@@ -473,8 +479,14 @@ def _strip_latex_noise(text: str) -> str:
         single-arg command (``\\textit{Ada {Byron}}``) does not truncate
         the argument early (codex P2, PR #77 round 8).
     """
-    text = re.sub(r"\$\$.*?\$\$", "[math]", text, flags=re.DOTALL)
-    text = re.sub(r"\$[^$]+\$", "[math]", text)
+    # Negative lookbehind on both delimiters: an escaped ``\$`` (a literal
+    # currency sign in real TeX, e.g. ``\$5 ... \$10``) must NOT be
+    # treated as a math-mode delimiter — without it, the span between two
+    # escaped dollar signs was replaced wholesale with "[math]",
+    # corrupting legitimate currency values in genuine LaTeX source
+    # (codex P2, PR #77 round 13).
+    text = re.sub(r"(?<!\\)\$\$.*?(?<!\\)\$\$", "[math]", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\\)\$[^$]+(?<!\\)\$", "[math]", text)
     text = _process_latex_commands(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
